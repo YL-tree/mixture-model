@@ -101,7 +101,9 @@ class mDPM_SemiSup(nn.Module):
 # Evaluation Utils
 # -----------------------
 def evaluate_model(model, loader, cfg):
-    """计算后验 Accuracy 和 NMI"""
+    """
+    改进版评估：使用多个时间步累积 Loss 来降低方差，提高分类准确率。
+    """
     try:
         from scipy.optimize import linear_sum_assignment
     except ImportError:
@@ -111,41 +113,59 @@ def evaluate_model(model, loader, cfg):
     model.eval()
     preds, ys_true = [], []
     
-    # 评估时使用固定的中间时间步
-    t_eval_val = cfg.timesteps // 2 
+    # [改进点] 使用多个时间步进行评估，而不是只用 t=500
+    # 选取能代表不同噪声程度的 5 个点
+    eval_timesteps = [100, 300, 500, 700, 900] 
     
+    print("Evaluating with robust multi-step strategy...")
+
     with torch.no_grad():
         for x_0, y_true in loader:
             x_0 = x_0.to(cfg.device)
             batch_size = x_0.size(0)
             
-            current_noise = torch.randn_like(x_0)
-            current_t = torch.full((batch_size,), t_eval_val, device=cfg.device, dtype=torch.long)
-            x_t = model.dpm_process.q_sample(x_0, current_t, current_noise)
+            # 初始化每个类别的累积 Loss (Log-Likelihood Proxy)
+            # shape: (Batch, Num_Classes)
+            cumulative_log_probs = torch.zeros(batch_size, cfg.num_classes, device=cfg.device)
             
-            log_pi = torch.log(model.registered_pi + 1e-8).unsqueeze(0).to(x_0.device)
-            dpm_loss_proxies = []
-
-            for k in range(cfg.num_classes):
-                y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
-                                       num_classes=cfg.num_classes).float()
+            # 对每个时间步进行循环计算
+            for t_val in eval_timesteps:
+                # 1. 在当前 t 采样加噪图片 x_t
+                current_noise = torch.randn_like(x_0)
+                current_t = torch.full((batch_size,), t_val, device=cfg.device, dtype=torch.long)
+                x_t = model.dpm_process.q_sample(x_0, current_t, current_noise)
                 
-                pred_noise_k = model.cond_denoiser(x_t, current_t, y_onehot_k)
-                dpm_loss_k = F.mse_loss(pred_noise_k, current_noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                dpm_loss_proxies.append((-dpm_loss_k).unsqueeze(1))
+                # 2. 计算所有类别的 MSE
+                for k in range(cfg.num_classes):
+                    y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
+                                           num_classes=cfg.num_classes).float()
+                    
+                    # 预测噪声
+                    pred_noise_k = model.cond_denoiser(x_t, current_t, y_onehot_k)
+                    
+                    # 计算 MSE (reduction='none' 保留每个样本的维度)
+                    # MSE 越小，Likelihood 越大
+                    # view(batch_size, -1).mean(dim=1) 对 (C, H, W) 求均值
+                    dpm_loss_k = F.mse_loss(pred_noise_k, current_noise, reduction='none').view(batch_size, -1).mean(dim=1)
+                    
+                    # 累积负 Loss (即 Log Probability)
+                    cumulative_log_probs[:, k] += -dpm_loss_k
+
+            # 加上先验 (Log Prior)，这里假设是均匀分布，其实可以省略
+            log_pi = torch.log(model.registered_pi + 1e-8).unsqueeze(0).to(x_0.device)
+            final_logits = cumulative_log_probs + log_pi 
             
-            logits = torch.cat(dpm_loss_proxies, dim=1) + log_pi 
-            pred_cluster = torch.argmax(logits, dim=1).cpu().numpy()
+            # 取最大概率对应的类别
+            pred_cluster = torch.argmax(final_logits, dim=1).cpu().numpy()
             preds.append(pred_cluster)
             ys_true.append(y_true.numpy())
 
     preds = np.concatenate(preds)
     ys_true = np.concatenate(ys_true)
     
-    # 计算 NMI
+    # --- 计算指标 ---
     nmi = NMI(ys_true, preds)
     
-    # 计算 Accuracy (匈牙利算法对齐)
     n_classes = cfg.num_classes
     cost_matrix = np.zeros((n_classes, n_classes))
     for i in range(n_classes):
@@ -270,7 +290,10 @@ def objective(trial):
     cfg.output_dir = "./mDPM_optuna_temp"
     
     # Hyperparameters to tune
-    cfg.unet_base_channels = trial.suggest_categorical("base_channels", [32, 64])
+    # cfg.unet_base_channels = trial.suggest_categorical("base_channels", [32, 64])
+    # 强制让维度为32
+    cfg.unet_base_channels = 32
+
     cfg.lambda_entropy = trial.suggest_float("lambda_entropy", 0.1, 5.0)
     cfg.lr = trial.suggest_float("lr", 1e-4, 1e-3, log=True)
     

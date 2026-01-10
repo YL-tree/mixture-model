@@ -24,8 +24,8 @@ class Config:
         # ---------------------
         # 自动检测可用设备
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.output_dir = "./mDPM_results"
-        self.batch_size = 128
+        self.output_dir = "./mDPM_results_supervised"
+        self.batch_size = 16
         self.final_epochs = 50 
         self.optuna_epochs = 10 
         self.lr = 2e-4                    # 学习率
@@ -34,7 +34,7 @@ class Config:
         # ---------------------
         # PVEM 框架权重
         # ---------------------
-        self.alpha_unlabeled = 1.0        # 无标签数据损失的权重
+        self.alpha_unlabeled = 0        # 无标签数据损失的权重
         self.lambda_entropy = 1.0         # 熵惩罚项的权重 (Minimization)
         
         # ---------------------
@@ -294,7 +294,7 @@ def plot_training_curves(metrics, outpath):
     plt.tight_layout()
     plt.savefig(outpath)
     plt.close()
-    
+
 if __name__ == "__main__":
     print("==== Running ConditionalUnet shape check (Fixed) ====")
 
