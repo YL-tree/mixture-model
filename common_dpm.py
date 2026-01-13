@@ -253,10 +253,18 @@ def gumbel_softmax_sample(logits, temperature):
     gumbel = -torch.log(-torch.log(noise + 1e-9) + 1e-9)
     return F.softmax((logits + gumbel) / (temperature + 1e-9), dim=-1)
 
+
+
 def get_semi_loaders(cfg, labeled_per_class=None):
     if labeled_per_class is None: labeled_per_class = cfg.labeled_per_class
+
+    # [修改点] 增加 Normalize 到 [-1, 1]
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5,), (0.5,)) 
+    ])
     
-    dataset = datasets.MNIST('./data', train=True, download=True, transform=transforms.ToTensor())
+    dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     labels = np.array(dataset.targets)
     labeled_idx, unlabeled_idx = [], []
     for c in range(cfg.num_classes):

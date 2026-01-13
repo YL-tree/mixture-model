@@ -24,10 +24,10 @@ def robust_evaluate(model, loader, cfg):
     
     # [关键策略 1] 只评估中低时间步
     # 避开 t > 500 的高噪声区域
-    eval_timesteps = [50, 100, 150, 200] 
+    eval_timesteps = [300, 400, 500] 
     
     # [关键策略 2] 对每个 t 重复采样次数
-    n_repeats = 5 
+    n_repeats = 10 
     
     print(f"🔍 开始评估: TimeSteps={eval_timesteps}, Repeats={n_repeats}")
 
