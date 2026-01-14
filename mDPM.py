@@ -216,7 +216,8 @@ def sample_and_save_dpm(denoiser, dpm_process, num_classes, out_path, device, n_
                 
             x_t = mu_t_1 + sigma_t_1 * noise
 
-        save_image(x_t.clamp(0, 1), out_path, nrow=n_per_class, normalize=True)
+        
+        save_image(x_t.clamp(-1, 1), out_path, nrow=n_per_class, normalize=True, value_range=(-1, 1))
     print(f"💾 Saved DPM samples to {out_path}")
 
 # -----------------------

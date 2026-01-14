@@ -13,68 +13,79 @@ from mDPM import mDPM_SemiSup  # 确保 mDPM.py 中包含 mDPM_SemiSup 类
 # ==========================================
 # 核心评估函数 (包含 Low-T 和 Monte Carlo 策略)
 # ==========================================
+
+import torch
+import os
+import json
+import numpy as np
+import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
+from sklearn.metrics import normalized_mutual_info_score as NMI
+
+from common_dpm import Config, get_semi_loaders
+from mDPM import mDPM_SemiSup 
+
 def robust_evaluate(model, loader, cfg):
     """
-    V3 强力评估版：
-    1. 专注于低时间步 (Low t strategy) - 信号最强区域
-    2. 蒙特卡洛多次采样 (Monte Carlo Averaging) - 消除噪声方差
+    V4 终极评估版：全轨迹扫描 (Full Trajectory Density Scan)
+    既然信号微弱，我们就通过覆盖更多的时间步来积累证据 (Accumulate Evidence)。
     """
     model.eval()
     preds, ys_true = [], []
     
-    # [关键策略 1] 只评估中低时间步
-    # 避开 t > 500 的高噪声区域
-    eval_timesteps = [300, 400, 500] 
+    # [核心修改] 不再猜哪个时间步好，而是均匀扫描 20-50 个点
+    # 覆盖从清晰(t=50)到模糊(t=950)的全过程
+    # 既然是一次性评估，稍微慢点没关系，准确率最重要
+    eval_timesteps = torch.linspace(50, 950, 30).long().tolist() 
     
-    # [关键策略 2] 对每个 t 重复采样次数
-    n_repeats = 10 
-    
-    print(f"🔍 开始评估: TimeSteps={eval_timesteps}, Repeats={n_repeats}")
+    print(f"🚀 启动全轨迹扫描评估: 扫描 {len(eval_timesteps)} 个时间点...")
 
     with torch.no_grad():
         for i, (x_0, y_true) in enumerate(loader):
             x_0 = x_0.to(cfg.device)
             batch_size = x_0.size(0)
             
-            # (Batch, Num_Classes)
+            # (Batch, 10) - 用于累积所有时间步的 MSE
             cumulative_mse = torch.zeros(batch_size, cfg.num_classes, device=cfg.device)
             
+            # 扫描每一个时间步
             for t_val in eval_timesteps:
-                mse_t_sum = torch.zeros(batch_size, cfg.num_classes, device=cfg.device)
+                # 每个时间步采样 1 次噪声即可，因为我们扫了 30 个时间步，
+                # 这本身就是一种强大的 Monte Carlo 平均
+                noise = torch.randn_like(x_0)
+                current_t = torch.full((batch_size,), t_val, device=cfg.device, dtype=torch.long)
+                x_t = model.dpm_process.q_sample(x_0, current_t, noise)
                 
-                for _ in range(n_repeats):
-                    # 1. 采样噪声
-                    noise = torch.randn_like(x_0)
-                    current_t = torch.full((batch_size,), t_val, device=cfg.device, dtype=torch.long)
-                    x_t = model.dpm_process.q_sample(x_0, current_t, noise)
+                # 计算 10 个类别的 Loss
+                for k in range(cfg.num_classes):
+                    y_vec = F.one_hot(torch.full((batch_size,), k, device=x_0.device), cfg.num_classes).float()
                     
-                    # 2. 对每个类别计算 MSE
-                    for k in range(cfg.num_classes):
-                        y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
-                                               num_classes=cfg.num_classes).float()
-                        
-                        pred_noise = model.cond_denoiser(x_t, current_t, y_onehot_k)
-                        
-                        # 计算单个样本的 MSE
-                        loss_k = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                        mse_t_sum[:, k] += loss_k
-                
-                # 平均该时间步的 MSE 并累加
-                cumulative_mse += (mse_t_sum / n_repeats)
+                    pred_noise = model.cond_denoiser(x_t, current_t, y_vec)
+                    
+                    # [关键] 使用 sum 而不是 mean，避免数值过小 (虽然数学上 argmin 不变，但数值稳定性更好)
+                    # view(B, -1).sum(dim=1)
+                    loss = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).sum(dim=1)
+                    
+                    cumulative_mse[:, k] += loss
 
-            # MSE 越小，似然概率越大。Logits = -MSE
-            log_pi = torch.log(model.registered_pi + 1e-8).unsqueeze(0).to(x_0.device)
-            final_logits = -cumulative_mse + log_pi
+            # 预测 MSE 最小的类别 (Evidence 最大)
+            pred_cluster = torch.argmin(cumulative_mse, dim=1).cpu().numpy()
             
-            pred_cluster = torch.argmax(final_logits, dim=1).cpu().numpy()
             preds.append(pred_cluster)
             ys_true.append(y_true.numpy())
             
-            if i % 10 == 0:
-                print(f"   处理 Batch {i}...")
+            # if i % 5 == 0:
+            #     acc_batch = (pred_cluster == y_true.numpy()).mean()
+            #     print(f"   Batch {i}: 当前 Batch 准确率 {acc_batch:.4f}")
 
     preds = np.concatenate(preds)
     ys_true = np.concatenate(ys_true)
+    
+    # # 既然是全监督，Raw Accuracy 就是真实准确率
+    # final_acc = np.mean(preds == ys_true)
+    # nmi = NMI(ys_true, preds)
+    
+    # return final_acc, final_acc, nmi, {}
     
     # --- 指标计算 ---
     nmi = NMI(ys_true, preds)
@@ -106,7 +117,7 @@ def load_and_run():
     
     # [重要] 必须与训练时的配置一致，否则模型权重加载会报错
     # 如果你在训练时修改了 batch_size 或 channels，这里也要改
-    cfg.unet_base_channels = 32  # 请确认你训练时是用 32 还是 64
+    cfg.unet_base_channels = 64  # 请确认你训练时是用 32 还是 64
     cfg.batch_size = 32          # 评估时 Batch 可以小一点以防显存溢出
     
     # 模型路径

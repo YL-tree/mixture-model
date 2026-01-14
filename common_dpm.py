@@ -112,27 +112,69 @@ class SinusoidalPositionalEmbedding(nn.Module):
         embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
         return embeddings
 
+# common_dpm.py 中的 ResidualBlock 类
+
 class ResidualBlock(nn.Module):
+    """
+    改进版 ResidualBlock：使用 AdaGN (Adaptive Group Norm) 替代简单的加法。
+    增强了条件 y 对生成过程的控制力，大幅提升分类时的判别度。
+    """
     def __init__(self, in_channels, out_channels, time_embed_dim, kernel_size=3):
         super().__init__()
+        
         padding = kernel_size // 2
+        
+        # 1. 正常的卷积层
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
         self.norm1 = nn.GroupNorm(8, out_channels)
         self.act1 = nn.SiLU()
+        
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act2 = nn.SiLU()
-        self.time_mlp = nn.Linear(time_embed_dim, out_channels)
+        
+        # [核心修改 1] 输出维度翻倍 (out_channels * 2)
+        # 因为我们要同时预测 Scale (乘法系数) 和 Shift (加法偏置)
+        self.time_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_embed_dim, out_channels * 2)
+        )
+        
         self.residual_conv = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x, t_emb):
+        """
+        x: (B, C, H, W)
+        t_emb: (B, time_embed_dim) -> 包含了 time + label 的信息
+        """
+        # --- 主干路径 ---
+        
+        # 1. 第一层卷积
         h = self.conv1(x)
-        h = self.act1(self.norm1(h))
-        time_emb_projected = self.time_mlp(t_emb)[:, :, None, None] 
-        h = h + time_emb_projected
+        
+        # 2. [核心修改 2] AdaGN 注入机制
+        # 先归一化
+        h = self.norm1(h)
+        
+        # 计算 Scale 和 Shift
+        # style shape: (B, 2*C) -> (B, 2*C, 1, 1)
+        style = self.time_mlp(t_emb)[:, :, None, None]
+        scale, shift = style.chunk(2, dim=1) # 分割成两半
+        
+        # 执行仿射变换: h = h * (1 + scale) + shift
+        # 这种乘法交互让条件 y 能强力控制特征图
+        h = h * (1 + scale) + shift
+        
+        # 激活函数
+        h = self.act1(h)
+        
+        # 3. 第二层卷积
         h = self.conv2(h)
         h = self.norm2(h)
-        return self.act2(h + self.residual_conv(x))
+        h = self.act2(h)
+        
+        # --- 残差连接 ---
+        return h + self.residual_conv(x)
 
 class AttentionBlock(nn.Module):
     def __init__(self, channels):
