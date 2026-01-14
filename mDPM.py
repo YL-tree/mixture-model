@@ -113,50 +113,39 @@ def evaluate_model(model, loader, cfg):
     model.eval()
     preds, ys_true = [], []
     
-    # [改进点] 使用多个时间步进行评估，而不是只用 t=500
-    # 选取能代表不同噪声程度的 5 个点
-    eval_timesteps = [100, 300, 500, 700, 900] 
+    # [修正 1] 剔除 700, 900，只保留信号最强的区间
+    eval_timesteps = [300, 400, 500] 
     
-    print("Evaluating with robust multi-step strategy...")
-
+    # [修正 2] 增加重复次数 (训练时为了速度可以用 3-5 次，不用 10 次)
+    n_repeats = 5
+    
     with torch.no_grad():
         for x_0, y_true in loader:
             x_0 = x_0.to(cfg.device)
             batch_size = x_0.size(0)
             
-            # 初始化每个类别的累积 Loss (Log-Likelihood Proxy)
-            # shape: (Batch, Num_Classes)
-            cumulative_log_probs = torch.zeros(batch_size, cfg.num_classes, device=cfg.device)
+            # (Batch, Num_Classes)
+            cumulative_mse = torch.zeros(batch_size, cfg.num_classes, device=cfg.device)
             
-            # 对每个时间步进行循环计算
             for t_val in eval_timesteps:
-                # 1. 在当前 t 采样加噪图片 x_t
-                current_noise = torch.randn_like(x_0)
-                current_t = torch.full((batch_size,), t_val, device=cfg.device, dtype=torch.long)
-                x_t = model.dpm_process.q_sample(x_0, current_t, current_noise)
+                mse_t_sum = torch.zeros(batch_size, cfg.num_classes, device=cfg.device)
                 
-                # 2. 计算所有类别的 MSE
-                for k in range(cfg.num_classes):
-                    y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
-                                           num_classes=cfg.num_classes).float()
+                # 重复采样以消除方差
+                for _ in range(n_repeats):
+                    noise = torch.randn_like(x_0)
+                    current_t = torch.full((batch_size,), t_val, device=cfg.device, dtype=torch.long)
+                    x_t = model.dpm_process.q_sample(x_0, current_t, noise)
                     
-                    # 预测噪声
-                    pred_noise_k = model.cond_denoiser(x_t, current_t, y_onehot_k)
-                    
-                    # 计算 MSE (reduction='none' 保留每个样本的维度)
-                    # MSE 越小，Likelihood 越大
-                    # view(batch_size, -1).mean(dim=1) 对 (C, H, W) 求均值
-                    dpm_loss_k = F.mse_loss(pred_noise_k, current_noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                    
-                    # 累积负 Loss (即 Log Probability)
-                    cumulative_log_probs[:, k] += -dpm_loss_k
+                    for k in range(cfg.num_classes):
+                        y_vec = F.one_hot(torch.full((batch_size,), k, device=x_0.device), cfg.num_classes).float()
+                        pred_noise = model.cond_denoiser(x_t, current_t, y_vec)
+                        
+                        loss = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
+                        mse_t_sum[:, k] += loss
+                
+                cumulative_mse += (mse_t_sum / n_repeats)
 
-            # 加上先验 (Log Prior)，这里假设是均匀分布，其实可以省略
-            log_pi = torch.log(model.registered_pi + 1e-8).unsqueeze(0).to(x_0.device)
-            final_logits = cumulative_log_probs + log_pi 
-            
-            # 取最大概率对应的类别
-            pred_cluster = torch.argmax(final_logits, dim=1).cpu().numpy()
+            pred_cluster = torch.argmin(cumulative_mse, dim=1).cpu().numpy()
             preds.append(pred_cluster)
             ys_true.append(y_true.numpy())
 
