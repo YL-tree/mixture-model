@@ -297,10 +297,13 @@ def gumbel_softmax_sample(logits, temperature):
 
 
 
-def get_semi_loaders(cfg, labeled_per_class=None):
-    if labeled_per_class is None: labeled_per_class = cfg.labeled_per_class
+# common_dpm.py
 
-    # [修改点] 增加 Normalize 到 [-1, 1]
+def get_semi_loaders(cfg, labeled_per_class=None):
+    if labeled_per_class is None: 
+        labeled_per_class = cfg.labeled_per_class
+
+    # 1. 预处理
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,)) 
@@ -308,23 +311,52 @@ def get_semi_loaders(cfg, labeled_per_class=None):
     
     dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     labels = np.array(dataset.targets)
-    labeled_idx, unlabeled_idx = [], []
-    for c in range(cfg.num_classes):
-        idx_c = np.where(labels == c)[0]
-        count = min(labeled_per_class, len(idx_c))
-        labeled_idx.extend(idx_c[:count])
-        unlabeled_idx.extend(idx_c[count:])
-        
-    labeled_set = Subset(dataset, labeled_idx)
-    unlabeled_set = Subset(dataset, unlabeled_idx)
     
-    # 验证集
+    # 2. 划分数据索引
+    labeled_idx, unlabeled_idx = [], []
+    
+    # 特殊情况：如果 labeled_per_class 为 -1，表示全监督（所有数据都有标签）
+    if labeled_per_class == -1:
+        print("Dataset Mode: Fully Supervised (All Data Labeled)")
+        labeled_idx = list(range(len(dataset)))
+        unlabeled_idx = [] # 无标签为空
+    else:
+        # 正常半监督或无监督逻辑
+        for c in range(cfg.num_classes):
+            idx_c = np.where(labels == c)[0]
+            
+            # 如果 labeled_per_class 是 0，这里 count 就是 0
+            count = min(labeled_per_class, len(idx_c))
+            
+            labeled_idx.extend(idx_c[:count])
+            unlabeled_idx.extend(idx_c[count:])
+
+    # 3. 构造 DataLoader
+    
+    # --- 处理有标签数据 ---
+    if len(labeled_idx) > 0:
+        labeled_set = Subset(dataset, labeled_idx)
+        labeled_loader = DataLoader(labeled_set, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
+    else:
+        # 关键修改：如果没有标签数据，直接返回 None
+        # 这会触发 run_training_session 进入 "UNSUPERVISED" 模式
+        labeled_loader = None
+        
+    # --- 处理无标签数据 ---
+    if len(unlabeled_idx) > 0:
+        unlabeled_set = Subset(dataset, unlabeled_idx)
+        unlabeled_loader = DataLoader(unlabeled_set, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
+    else:
+        unlabeled_loader = None
+        
+    # --- 处理验证集 ---
     val_indices = list(range(len(dataset)))[:int(0.1 * len(dataset))]
     val_set = Subset(dataset, val_indices)
-    
-    labeled_loader = DataLoader(labeled_set, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
-    unlabeled_loader = DataLoader(unlabeled_set, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False)
+    
+    # 打印数据集统计信息，防止配错
+    print(f"Dataset Split -> Labeled: {len(labeled_idx)} | Unlabeled: {len(unlabeled_idx)}")
+    
     return labeled_loader, unlabeled_loader, val_loader
 
 def plot_training_curves(metrics, outpath):
