@@ -24,7 +24,7 @@ class Config:
         # ---------------------
         # 自动检测可用设备
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.output_dir = "./mDPM_results_supervised"
+        self.output_dir = "./mDPM_results_unsupervised"
         self.batch_size = 16
         self.final_epochs = 50 
         self.optuna_epochs = 10 
@@ -34,14 +34,14 @@ class Config:
         # ---------------------
         # PVEM 框架权重
         # ---------------------
-        self.alpha_unlabeled = 0        # 无标签数据损失的权重
+        self.alpha_unlabeled = 1        # 无标签数据损失的权重
         self.lambda_entropy = 1.0         # 熵惩罚项的权重 (Minimization)
         
         # ---------------------
         # Gumbel Softmax 退火参数
         # ---------------------
-        self.initial_gumbel_temp = 1.0    
-        self.min_gumbel_temp = 0.5        
+        self.initial_gumbel_temp = 2.0    
+        self.min_gumbel_temp = 0.1        
         self.gumbel_anneal_rate = 0.995   
         self.current_gumbel_temp = self.initial_gumbel_temp 
         
