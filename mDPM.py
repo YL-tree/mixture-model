@@ -214,65 +214,127 @@ def sample_and_save_dpm(denoiser, dpm_process, num_classes, out_path, device, n_
 # -----------------------
 def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg,
                          is_final_training=False, trial_id=None):
+    """
+    通用训练函数：兼容全监督、半监督、无监督。
+    通过检测 loader 是否为 None 以及 cfg.alpha_unlabeled 来自动切换策略。
+    """
     total_epochs = cfg.final_epochs if is_final_training else cfg.optuna_epochs
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
 
-    metrics = {"Neg_ELBO": [], "DPM_Loss": [], "NMI": [], "PosteriorAcc": []}
+    metrics = {"Loss": [], "NMI": [], "Acc": []}
     best_val_nmi = -np.inf
+    
+    # --- 1. 自动判断训练模式 ---
+    mode = "UNKNOWN"
+    if labeled_loader is not None and unlabeled_loader is not None:
+        mode = "SEMI_SUPERVISED"
+        print("🚀 模式检测: 半监督训练 (Semi-Supervised)")
+    elif labeled_loader is not None and unlabeled_loader is None:
+        mode = "SUPERVISED"
+        # 强制修正：如果没无标签数据，alpha 必须为 0
+        cfg.alpha_unlabeled = 0.0 
+        print("🚀 模式检测: 全监督训练 (Fully Supervised)")
+    elif labeled_loader is None and unlabeled_loader is not None:
+        mode = "UNSUPERVISED"
+        print("🚀 模式检测: 无监督训练 (Unsupervised)")
+    else:
+        raise ValueError("❌ 错误: Labeled 和 Unlabeled loader 不能同时为空！")
 
+    # --- 2. 训练循环 ---
     for epoch in range(1, total_epochs + 1):
         model.train()
-        
-        # Tau 退火
-        if epoch > total_epochs * 0.5:
-            cfg.current_gumbel_temp = max(cfg.min_gumbel_temp, cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
-
         loss_accum = 0.0
+        n_batches = 0
         
-        for (x_lab, y_lab), (x_un, _) in zip(labeled_loader, unlabeled_loader):
-            x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device).long()
-            x_un = x_un.to(cfg.device)
-            
-            # Loss Calculation
-            loss_lab, _, _, _, _, _ = model(x_lab, cfg, y_lab)
-            loss_un, _, _, _, resp, _ = model(x_un, cfg, None)
-            
-            loss = loss_lab + cfg.alpha_unlabeled * loss_un
+        # === 策略 A: 无监督模式下的温度退火 ===
+        # 无监督需要激进的退火 (High -> Low)
+        if mode == "UNSUPERVISED":
+             if epoch > 5:
+                cfg.current_gumbel_temp = max(cfg.min_gumbel_temp, cfg.current_gumbel_temp * cfg.gumbel_anneal_rate)
+        # 半监督/全监督通常保持较低温度或缓慢退火
+        elif epoch > total_epochs * 0.5:
+             cfg.current_gumbel_temp = max(cfg.min_gumbel_temp, cfg.current_gumbel_temp * 0.995)
 
+        # === 策略 B: 半监督模式下的 Warm-up ===
+        # 前 10 个 Epoch 强制只看有标签数据
+        current_alpha_un = cfg.alpha_unlabeled
+        if mode == "SEMI_SUPERVISED" and epoch <= 10:
+            current_alpha_un = 0.0
+        
+        # === 3. 构造通用迭代器 ===
+        # 技巧：将不同的 Loader 包装成统一的 (batch_lab, batch_un) 格式
+        if mode == "SEMI_SUPERVISED":
+            # 取 min length，或者用 itertools.cycle 循环较短的那个
+            iterator = zip(labeled_loader, unlabeled_loader)
+            loader_len = len(labeled_loader) # 以有标签的为准
+        elif mode == "SUPERVISED":
+            # 伪造一个空的 unlabeled batch
+            iterator = ((batch, None) for batch in labeled_loader)
+            loader_len = len(labeled_loader)
+        elif mode == "UNSUPERVISED":
+            # 伪造一个空的 labeled batch
+            iterator = ((None, batch) for batch in unlabeled_loader)
+            loader_len = len(unlabeled_loader)
+
+        # === 4. Batch 循环 ===
+        for batch_lab, batch_un in iterator:
             optimizer.zero_grad()
-            loss.backward()
+            total_loss = torch.tensor(0.0, device=cfg.device)
+            resp = None # 用于更新 Prior
+
+            # --- 计算有监督部分 ---
+            if batch_lab is not None:
+                x_lab, y_lab = batch_lab
+                x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device).long()
+                
+                # 有标签 Loss (始终权重为 1.0 或自定义 alpha_labeled)
+                loss_lab, _, _, _, _, _ = model(x_lab, cfg, y_lab)
+                total_loss += loss_lab
+
+            # --- 计算无监督部分 ---
+            if batch_un is not None and current_alpha_un > 0:
+                x_un, _ = batch_un # 忽略标签
+                x_un = x_un.to(cfg.device)
+                
+                # 无标签 Loss
+                loss_un, _, _, _, resp, _ = model(x_un, cfg, None)
+                total_loss += current_alpha_un * loss_un
+            
+            # --- 反向传播 ---
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
-            loss_accum += loss.item()
+            loss_accum += total_loss.item()
+            n_batches += 1
 
-            # EMA Update for Prior
-            with torch.no_grad():
-                if resp is not None:
-                    model.registered_pi.copy_(0.99 * model.registered_pi + 0.01 * resp.mean(0).detach())
+            # EMA 更新 Prior (仅当有无监督推断发生时)
+            if resp is not None:
+                with torch.no_grad():
+                    momentum = 0.999 if mode == "UNSUPERVISED" else 0.99
+                    model.registered_pi.copy_(momentum * model.registered_pi + (1-momentum) * resp.mean(0).detach())
 
-        # Validation
-        posterior_acc, cluster2label, val_nmi = evaluate_model(model, val_loader, cfg)
+        # === 5. 评估与日志 ===
+        # 使用修正后的 evaluate_model (包含黄金区间和多次采样)
+        raw_acc, _, val_nmi = evaluate_model(model, val_loader, cfg)
         
-        metrics["NMI"].append(val_nmi)
-        metrics["PosteriorAcc"].append(posterior_acc)
+        # 记录最佳模型
+        target_metric = raw_acc if mode == "SUPERVISED" else val_nmi
+        if target_metric > best_val_nmi:
+            best_val_nmi = target_metric
+            if is_final_training:
+                torch.save(model.state_dict(), os.path.join(cfg.output_dir, "best_model.pt"))
 
-        if val_nmi > best_val_nmi:
-            best_val_nmi = val_nmi
+        log_tag = "FINAL" if is_final_training else f"TRIAL-{trial_id}"
+        print(f"[{log_tag}] Mode: {mode} | Epoch {epoch} | Loss: {loss_accum/n_batches:.4f} | "
+              f"Acc: {raw_acc:.4f} | NMI: {val_nmi:.4f} | τ: {cfg.current_gumbel_temp:.3f}")
 
-        mode = "FINAL" if is_final_training else f"TRIAL-{trial_id}"
-        print(f"[{mode}] Epoch {epoch} | Loss: {loss_accum/len(labeled_loader):.4f} | "
-              f"NMI: {val_nmi:.4f} | Acc: {posterior_acc:.4f} | τ: {cfg.current_gumbel_temp:.3f}")
-
+        # 定期保存图片
         if is_final_training and (epoch % 10 == 0 or epoch == total_epochs):
             sample_and_save_dpm(model.cond_denoiser, model.dpm_process, cfg.num_classes,
                                 os.path.join(sample_dir, f"epoch_{epoch:03d}.png"), cfg.device)
     
-    if is_final_training:
-        with open(os.path.join(cfg.output_dir, "posterior_mapping.json"), "w") as f:
-            json.dump(cluster2label, f, indent=2)
-
     return best_val_nmi, metrics
 
 def objective(trial):
