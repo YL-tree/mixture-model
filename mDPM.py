@@ -312,7 +312,8 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
             # EMA 更新 Prior (仅当有无监督推断发生时)
             if resp is not None:
                 with torch.no_grad():
-                    momentum = 0.999 if mode == "UNSUPERVISED" else 0.99
+                    # 无监督模式下，动量设为 0.9 更快响应，强迫模型注意那些“没人选”的类别
+                    momentum = 0.9 if mode == "UNSUPERVISED" else 0.99
                     model.registered_pi.copy_(momentum * model.registered_pi + (1-momentum) * resp.mean(0).detach())
 
         # === 5. 评估与日志 ===
@@ -372,27 +373,61 @@ def objective(trial):
         torch.cuda.empty_cache()
 
 def main():
-    # 1. Optuna Search
-    print("--- Starting Optuna ---")
-    study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=5) 
-    
-    print("Best params:", study.best_params)
-    
-    # 2. Final Training
-    print("--- Starting Final Training ---")
+    # ==========================================
+    # 🎛️ 控制开关：是否进行 Optuna 超参数搜索
+    # True  = 运行搜索，找到最优参后训练 (慢)
+    # False = 跳过搜索，直接用 Config 默认参数训练 (快)
+    # ==========================================
+    RUN_OPTUNA = False 
+
+    # 初始化基础配置
     cfg = Config()
-    for k, v in study.best_params.items():
-        setattr(cfg, k, v)
-    
+
+    if RUN_OPTUNA:
+        # --- 1. 运行 Optuna 搜索 ---
+        print("--- Starting Optuna Hyperparameter Search ---")
+        study = optuna.create_study(direction="minimize")
+        study.optimize(objective, n_trials=5) 
+        
+        print("Best params found:", study.best_params)
+        
+        # 将搜索到的最优参数覆盖到 cfg 中
+        for k, v in study.best_params.items():
+            setattr(cfg, k, v)
+            
+        # 保存最优参数备份
+        with open(os.path.join(cfg.output_dir, "optuna_best_params.json"), "w") as f:
+            json.dump(study.best_params, f, indent=4)
+            
+    else:
+        # --- 2. 跳过搜索，使用默认/手动配置 ---
+        print("--- Skipping Optuna: Using Manual/Default Config ---")
+        
+        # [关键安全设置] 
+        # 之前我们在 objective 里强制改成了 32 以防爆显存
+        # 如果跳过 Optuna，必须在这里手动设为 32，否则会读 common_dpm 里的默认值 64
+        cfg.unet_base_channels = 32
+        
+        # 你也可以在这里手动微调其他参数，例如：
+        # cfg.lr = 1e-3
+        # cfg.lambda_entropy = 2.0
+        
+    # --- 3. 开始最终训练 ---
+    print("\n" + "="*30)
+    print("--- Starting Final Training ---")
+    print(f"Config: Channels={cfg.unet_base_channels}, LR={cfg.lr}, Entropy={cfg.lambda_entropy}")
+    print("="*30 + "\n")
+
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     labeled_loader, unlabeled_loader, val_loader = get_semi_loaders(cfg)
     
+    # 运行训练
     run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg, is_final_training=True)
     
+    # 保存最终模型
     torch.save(model.state_dict(), os.path.join(cfg.output_dir, "final_model.pt"))
-    print("Done.")
+    print(f"✅ Done. Model saved to {cfg.output_dir}")
 
 if __name__ == "__main__":
     main()

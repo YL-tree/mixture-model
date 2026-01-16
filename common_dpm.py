@@ -35,14 +35,15 @@ class Config:
         # PVEM 框架权重
         # ---------------------
         self.alpha_unlabeled = 1        # 无标签数据损失的权重
-        self.lambda_entropy = 1.0         # 熵惩罚项的权重 (Minimization)
+        self.lambda_entropy = 5.0         # 熵惩罚项的权重 (Minimization)
         
         # ---------------------
         # Gumbel Softmax 退火参数
         # ---------------------
         self.initial_gumbel_temp = 2.0    
-        self.min_gumbel_temp = 0.1        
-        self.gumbel_anneal_rate = 0.995   
+        self.min_gumbel_temp = 0.1   
+
+        self.gumbel_anneal_rate = 0.9   
         self.current_gumbel_temp = self.initial_gumbel_temp 
         
         # ---------------------
@@ -53,7 +54,7 @@ class Config:
         self.image_channels = 1           # MNIST
         
         # U-Net 参数
-        self.unet_base_channels = 64      
+        self.unet_base_channels = 32      
         self.unet_time_emb_dim = 256      
         
         os.makedirs(self.output_dir, exist_ok=True)
