@@ -92,8 +92,7 @@ class mDPM_SemiSup(nn.Module):
             # H(p) = - sum p log p (这是一个正数)
             entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
             
-            # 修正: 使用 + 号来惩罚高熵 (Entropy Minimization)
-            total_loss = weighted_dpm_loss + cfg.lambda_entropy * entropy
+            total_loss = weighted_dpm_loss - cfg.lambda_entropy * entropy
             
             return total_loss, -total_loss.item(), weighted_dpm_loss.item(), 0.0, resp.detach(), None
 

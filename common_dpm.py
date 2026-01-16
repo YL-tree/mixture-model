@@ -29,13 +29,13 @@ class Config:
         self.final_epochs = 50 
         self.optuna_epochs = 10 
         self.lr = 2e-4                    # 学习率
-        self.labeled_per_class = 100      # 每类用于监督学习的样本数 (半监督)
+        self.labeled_per_class = 0      # 每类用于监督学习的样本数 (无监督)
         
         # ---------------------
         # PVEM 框架权重
         # ---------------------
         self.alpha_unlabeled = 1        # 无标签数据损失的权重
-        self.lambda_entropy = 5.0         # 熵惩罚项的权重 (Minimization)
+        self.lambda_entropy = 0.05         # 熵惩罚项的权重 (Minimization)
         
         # ---------------------
         # Gumbel Softmax 退火参数
@@ -62,7 +62,6 @@ class Config:
 # -----------------------------------------------------
 # B. DPM 前向过程
 # -----------------------------------------------------
-
 class DPMForwardProcess(nn.Module):
     def __init__(self, timesteps: int = 1000, schedule: str = 'linear', image_channels: int = 1):
         super().__init__()
