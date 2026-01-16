@@ -37,6 +37,10 @@ class Config:
         self.alpha_unlabeled = 1        # 无标签数据损失的权重
         self.lambda_entropy = 0.05         # 熵惩罚项的权重 (Minimization)
         
+        # [NEW] 论文中的 M (Monte Carlo steps for posterior estimation)
+        # 建议设置为 4 到 10。越大越准，但训练越慢。
+        self.posterior_sample_steps = 5
+        
         # ---------------------
         # Gumbel Softmax 退火参数
         # ---------------------

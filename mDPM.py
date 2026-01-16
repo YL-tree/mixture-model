@@ -12,7 +12,6 @@ from torchvision.utils import save_image
 
 # 导入 common 组件
 from common_dpm import *
-
 # -----------------------
 # Model Definition (mDPM Adaptation)
 # -----------------------
@@ -33,21 +32,72 @@ class mDPM_SemiSup(nn.Module):
         # 类别分布先验 (Uniform initialization)
         self.register_buffer('registered_pi', torch.ones(cfg.num_classes) / cfg.num_classes)
         
-    def forward(self, x_0, cfg, y=None):
+    def estimate_posterior_logits(self, x_0, cfg):
+        """
+        [E-Step]
+        对应论文: Log-space Multi-step Approximation
+        采样 M 个时间步，计算平均 Log-Likelihood (代理为负 MSE)
+        """
         batch_size = x_0.size(0)
+        num_classes = cfg.num_classes
+        M = cfg.posterior_sample_steps
         
-        # 1. 采样连续潜在变量 (Sample x_t)
-        t = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
-        noise = torch.randn_like(x_0)
-        x_t = self.dpm_process.q_sample(x_0, t, noise)
+        # 初始化累积 Log-Likelihood (Log Unnormalized Probability)
+        # 形状: (Batch, K)
+        accum_log_lik = torch.zeros(batch_size, num_classes, device=x_0.device)
+        
+        # 使用 no_grad，因为 E-Step 不需要更新网络参数，只需要推断 x 的分布
+        with torch.no_grad():
+            for _ in range(M):
+                # 随机采样时间步 t ~ U(0, T)
+                # 论文建议均匀采样
+                t = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
+                
+                # 采样扩散过程中的 z_t (即论文中的 z_{t_m})
+                noise = torch.randn_like(x_0)
+                x_t = self.dpm_process.q_sample(x_0, t, noise)
+                
+                # 对每个类别 k 计算 MSE
+                # 这一步计算量是: Batch * M * K
+                for k in range(num_classes):
+                    # 构造条件向量
+                    y_cond = torch.full((batch_size,), k, device=x_0.device, dtype=torch.long)
+                    y_onehot = F.one_hot(y_cond, num_classes=num_classes).float()
+                    
+                    # 预测噪声
+                    pred_noise = self.cond_denoiser(x_t, t, y_onehot)
+                    
+                    # 计算 Negative MSE 作为 log p(z_t | x=k) 的代理
+                    # 注意：这里我们忽略了方差系数常数，因为 Softmax 会自动处理相对大小
+                    mse = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
+                    
+                    # 累加到对应类别的 Log-Likelihood
+                    accum_log_lik[:, k] += -mse
+
+        # 添加 Prior log p(x)
+        # log_s_k = log_pi + (1/M) * sum(log p(z_tm | ...))
+        # 论文 Eq. 159
+        log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0)
+        final_logits = log_pi + (accum_log_lik / M)
+        
+        return final_logits
+
+    def forward(self, x_0, cfg, y=None):
+        """
+        前向传播包含 E-Step 和 M-Step 的损失计算
+        """
+        batch_size = x_0.size(0)
         
         # -------------------
         # 监督模式 (Labeled Data)
         # -------------------
         if y is not None:
-            y_onehot = F.one_hot(y, num_classes=cfg.num_classes).float()
+            # 标准 DDPM 训练：采样 1 个 t
+            t = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
+            noise = torch.randn_like(x_0)
+            x_t = self.dpm_process.q_sample(x_0, t, noise)
             
-            # 简单的 MSE 损失
+            y_onehot = F.one_hot(y, num_classes=cfg.num_classes).float()
             pred_noise = self.cond_denoiser(x_t, t, y_onehot)
             dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean') 
             
@@ -57,39 +107,43 @@ class mDPM_SemiSup(nn.Module):
         # 无监督模式 (Unlabeled Data) - PVEM
         # -------------------
         else:
-            log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0).to(x_0.device)
-            log_lik_proxy = []
+            # === E-Step: 推断潜变量 x 的分布 ===
+            # 这里使用了 Multi-step 近似，比原来的单步更准
+            logits = self.estimate_posterior_logits(x_0, cfg)
             
-            # E-Step: 估计 p(x|z)
-            for k in range(cfg.num_classes):
-                y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
-                                       num_classes=cfg.num_classes).float()
-                
-                # 使用负 MSE 作为 Log-Likelihood 的代理
-                pred_noise_k = self.cond_denoiser(x_t, t, y_onehot_k)
-                dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                
-                log_lik_proxy.append((-dpm_loss_k).unsqueeze(1))
-                
-            log_lik_proxy = torch.cat(log_lik_proxy, dim=1)
-            logits = log_pi + log_lik_proxy
-            
-            # Gumbel Softmax (松弛后验)
+            # 使用 Gumbel Softmax 进行重参数化或松弛采样
+            # 这里的 resp 对应论文中的 \tilde{p}(x|z,y)
             resp = gumbel_softmax_sample(logits, cfg.current_gumbel_temp)
             
-            # M-Step: 加权 DPM Loss
+            # === M-Step: 训练去噪网络 ===
+            # 论文: Sample x ~ p(x|z,y) then train DDPM
+            # 实际操作: 使用 resp 加权的 Loss (Soft-EM)，这在深度学习中比 Hard Sampling 更稳定
+            
+            # 重新采样一个 t 用于训练 (标准 DDPM 做法)
+            t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
+            noise = torch.randn_like(x_0)
+            x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
+            
             weighted_dpm_loss = 0.0
+            
+            # 计算加权 Loss
+            # L = Sum_k q(x=k) * ||eps - eps_theta(x_t, t, k)||^2
             for k in range(cfg.num_classes):
                 y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
                                        num_classes=cfg.num_classes).float()
                 
-                pred_noise_k = self.cond_denoiser(x_t, t, y_onehot_k)
+                # 这里需要梯度，用于更新 cond_denoiser
+                pred_noise_k = self.cond_denoiser(x_t_train, t_train, y_onehot_k)
+                
+                # Per-sample loss
                 dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
                 
-                weighted_dpm_loss += (resp[:, k] * dpm_loss_k).mean()
+                # 使用 E-Step 算出来的 resp 进行加权
+                # resp.detach() 很关键！确保梯度不回传到 E-Step 逻辑
+                weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
             
-            # 熵最小化 (Entropy Minimization) - 鼓励高置信度
-            # H(p) = - sum p log p (这是一个正数)
+            # === 辅助损失 ===
+            # 熵最小化: 鼓励模型做出确定的预测 (Paper context: Self-consistent)
             entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
             
             total_loss = weighted_dpm_loss - cfg.lambda_entropy * entropy
