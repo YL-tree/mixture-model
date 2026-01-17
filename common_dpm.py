@@ -44,10 +44,10 @@ class Config:
         # ---------------------
         # Gumbel Softmax 退火参数
         # ---------------------
-        self.initial_gumbel_temp = 2.0    
-        self.min_gumbel_temp = 0.1   
+        self.initial_gumbel_temp = 1.0    
+        self.min_gumbel_temp = 0.5   
 
-        self.gumbel_anneal_rate = 0.9   
+        self.gumbel_anneal_rate = 0.99  
         self.current_gumbel_temp = self.initial_gumbel_temp 
         
         # ---------------------
@@ -77,8 +77,8 @@ def get_time_weight(t, max_steps=1000):
     # 使用正弦波的半个周期: sin(0)=0, sin(pi/2)=1, sin(pi)=0
     # 这样中间最大，两头最小
     # 加上一个基数 base，保证不会完全变成 0
-    base = 0.3
-    peak = 2.0  # 中间时刻增强两倍
+    base = 0.5
+    peak = 10.0  # 中间时刻增强两倍
     
     # weight = base + peak * sin(t * pi)
     weights = base + peak * torch.sin(t_norm * torch.pi)

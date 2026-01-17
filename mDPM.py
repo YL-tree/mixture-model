@@ -67,8 +67,17 @@ class mDPM_SemiSup(nn.Module):
                     mse = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
                     accum_log_lik[:, k] += -mse
 
+        # 在循环结束后，accum_log_lik 里面存的是 -MSE
+        # MSE 的数值通常很小 (0.02 左右)，导致差异只有 0.001 级别
+        
+        # [关键修改] 手动放大差异 (Scale Factor)
+        # 这相当于人为降低了 E-Step 的 "温度"
+        # 让猜对的类别的 Logits 显著高于猜错的
+        scale_factor = 100.0  
+        accum_log_lik = accum_log_lik * scale_factor
+        
         log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0)
-        final_logits = log_pi + (accum_log_lik / M) # 平均
+        final_logits = log_pi + (accum_log_lik / M)
         
         return final_logits
 
@@ -459,7 +468,7 @@ def main():
     # --- 3. 开始最终训练 ---
     print("\n" + "="*30)
     print("--- Starting Final Training ---")
-    print(f"Config: Channels={cfg.unet_base_channels}, LR={cfg.lr}, Entropy={cfg.lambda_entropy}")
+    print(f"Config: Channels={cfg.unet_base_channels}, LR={cfg.lr}")
     print("="*30 + "\n")
 
     model = mDPM_SemiSup(cfg).to(cfg.device)
