@@ -73,7 +73,7 @@ class mDPM_SemiSup(nn.Module):
         # [关键修改] 手动放大差异 (Scale Factor)
         # 这相当于人为降低了 E-Step 的 "温度"
         # 让猜对的类别的 Logits 显著高于猜错的
-        scale_factor = 100.0  
+        scale_factor = 1.0  
         accum_log_lik = accum_log_lik * scale_factor
         
         log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0)
@@ -167,7 +167,8 @@ def evaluate_model(model, loader, cfg):
     preds, ys_true = [], []
     
     # [修正 1] 剔除 700, 900，只保留信号最强的区间
-    eval_timesteps = [300, 400, 500] 
+    # eval_timesteps = [300, 400, 500] 
+    eval_timesteps = [60, 100, 140] 
     
     # [修正 2] 增加重复次数 (训练时为了速度可以用 3-5 次，不用 10 次)
     n_repeats = 5
@@ -199,6 +200,10 @@ def evaluate_model(model, loader, cfg):
                 cumulative_mse += (mse_t_sum / n_repeats)
 
             pred_cluster = torch.argmin(cumulative_mse, dim=1).cpu().numpy()
+            # [新增调试打印]
+            unique_preds, counts = np.unique(pred_cluster, return_counts=True)
+            print(f"DEBUG: Predicted Clusters Distribution: {dict(zip(unique_preds, counts))}")
+        
             preds.append(pred_cluster)
             ys_true.append(y_true.numpy())
 

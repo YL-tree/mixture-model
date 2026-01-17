@@ -25,7 +25,7 @@ class Config:
         # 自动检测可用设备
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.output_dir = "./mDPM_results_unsupervised"
-        self.batch_size = 16
+        self.batch_size = 64
         self.final_epochs = 50 
         self.optuna_epochs = 10 
         self.lr = 2e-4                    # 学习率
@@ -39,7 +39,7 @@ class Config:
         
         # [NEW] 论文中的 M (Monte Carlo steps for posterior estimation)
         # 建议设置为 4 到 10。越大越准，但训练越慢。
-        self.posterior_sample_steps = 5
+        self.posterior_sample_steps = 1
         
         # ---------------------
         # Gumbel Softmax 退火参数
@@ -54,7 +54,7 @@ class Config:
         # 模型结构和 DPM 参数
         # ---------------------
         self.num_classes = 10             # MNIST
-        self.timesteps = 1000             # 扩散总时间步 T
+        self.timesteps = 200             # 扩散总时间步 T
         self.image_channels = 1           # MNIST
         
         # U-Net 参数
@@ -78,7 +78,7 @@ def get_time_weight(t, max_steps=1000):
     # 这样中间最大，两头最小
     # 加上一个基数 base，保证不会完全变成 0
     base = 0.5
-    peak = 10.0  # 中间时刻增强两倍
+    peak = 5.0  # 中间时刻增强两倍
     
     # weight = base + peak * sin(t * pi)
     weights = base + peak * torch.sin(t_norm * torch.pi)
@@ -291,7 +291,7 @@ class ConditionalUnet(nn.Module):
         # 获取当前 batch 每个样本的时间权重
         w_t = get_time_weight(t, self.time_mlp[0].dim * 2).to(t.device) # 这里的 dim * 2 只是为了获取 max_steps 对应的参数，或者直接传 1000
         # 修正：直接用 cfg.timesteps 或者硬编码 1000
-        w_t = get_time_weight(t, max_steps=1000).to(t.device)
+        w_t = get_time_weight(t, max_steps=200).to(t.device)
         
         # 增强/抑制条件信号
         y_emb = y_emb * w_t
