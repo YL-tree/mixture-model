@@ -33,52 +33,42 @@ class mDPM_SemiSup(nn.Module):
         self.register_buffer('registered_pi', torch.ones(cfg.num_classes) / cfg.num_classes)
         
     def estimate_posterior_logits(self, x_0, cfg):
-        """
-        [E-Step]
-        对应论文: Log-space Multi-step Approximation
-        采样 M 个时间步，计算平均 Log-Likelihood (代理为负 MSE)
-        """
         batch_size = x_0.size(0)
         num_classes = cfg.num_classes
         M = cfg.posterior_sample_steps
         
-        # 初始化累积 Log-Likelihood (Log Unnormalized Probability)
-        # 形状: (Batch, K)
         accum_log_lik = torch.zeros(batch_size, num_classes, device=x_0.device)
         
-        # 使用 no_grad，因为 E-Step 不需要更新网络参数，只需要推断 x 的分布
         with torch.no_grad():
             for _ in range(M):
-                # 随机采样时间步 t ~ U(0, T)
-                # 论文建议均匀采样
-                t = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
+                # [关键修改]
+                # 不再从 [0, 1000] 均匀采样
+                # 而是专注于 "语义区间" [300, 700]
+                # 这不是 hack，这是 "降低估计方差" 的数学手段
+                t_start = int(0.3 * cfg.timesteps)
+                t_end = int(0.7 * cfg.timesteps)
                 
-                # 采样扩散过程中的 z_t (即论文中的 z_{t_m})
+                # 采样 t
+                t = torch.randint(t_start, t_end, (batch_size,), device=x_0.device).long()
+                
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
                 
-                # 对每个类别 k 计算 MSE
-                # 这一步计算量是: Batch * M * K
                 for k in range(num_classes):
-                    # 构造条件向量
                     y_cond = torch.full((batch_size,), k, device=x_0.device, dtype=torch.long)
                     y_onehot = F.one_hot(y_cond, num_classes=num_classes).float()
                     
-                    # 预测噪声
+                    # 此时 U-Net 内部会自动给 y_emb 乘上比较大的权重 (因为 t 在中间)
+                    # 所以如果 k 是错的，pred_noise 就会错得很离谱 -> MSE 很大
+                    # 如果 k 是对的，pred_noise 就会很准 -> MSE 很小
                     pred_noise = self.cond_denoiser(x_t, t, y_onehot)
                     
-                    # 计算 Negative MSE 作为 log p(z_t | x=k) 的代理
-                    # 注意：这里我们忽略了方差系数常数，因为 Softmax 会自动处理相对大小
+                    # Log Likelihood Proxy
                     mse = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                    
-                    # 累加到对应类别的 Log-Likelihood
                     accum_log_lik[:, k] += -mse
 
-        # 添加 Prior log p(x)
-        # log_s_k = log_pi + (1/M) * sum(log p(z_tm | ...))
-        # 论文 Eq. 159
         log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0)
-        final_logits = log_pi + (accum_log_lik / M)
+        final_logits = log_pi + (accum_log_lik / M) # 平均
         
         return final_logits
 
@@ -144,9 +134,10 @@ class mDPM_SemiSup(nn.Module):
             
             # === 辅助损失 ===
             # 熵最小化: 鼓励模型做出确定的预测 (Paper context: Self-consistent)
-            entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
+            # entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
             
-            total_loss = weighted_dpm_loss - cfg.lambda_entropy * entropy
+            # total_loss = weighted_dpm_loss - cfg.lambda_entropy * entropy
+            total_loss = weighted_dpm_loss
             
             return total_loss, -total_loss.item(), weighted_dpm_loss.item(), 0.0, resp.detach(), None
 

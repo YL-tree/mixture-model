@@ -35,7 +35,7 @@ class Config:
         # PVEM 框架权重
         # ---------------------
         self.alpha_unlabeled = 1        # 无标签数据损失的权重
-        self.lambda_entropy = 0.05         # 熵惩罚项的权重 (Minimization)
+        # self.lambda_entropy = 0.05         # 熵惩罚项的权重 (Minimization)
         
         # [NEW] 论文中的 M (Monte Carlo steps for posterior estimation)
         # 建议设置为 4 到 10。越大越准，但训练越慢。
@@ -62,6 +62,28 @@ class Config:
         self.unet_time_emb_dim = 256      
         
         os.makedirs(self.output_dir, exist_ok=True)
+
+# 增加条件注入时的时间步权重函数，用于控制条件注入的强度
+# 权重函数在中间时间步 (30% - 70%) 增强，两头抑制
+def get_time_weight(t, max_steps=1000):
+    """
+    返回一个随时间变化的权重系数，形状为 (Batch_Size, 1)
+    在中间时间步 (30% - 70%) 权重为 1.5 ~ 2.0 (增强)
+    在两头 (0% 或 100%) 权重为 0.1 ~ 0.5 (抑制)
+    """
+    # 归一化 t 到 [0, 1]
+    t_norm = t.float() / max_steps
+    
+    # 使用正弦波的半个周期: sin(0)=0, sin(pi/2)=1, sin(pi)=0
+    # 这样中间最大，两头最小
+    # 加上一个基数 base，保证不会完全变成 0
+    base = 0.3
+    peak = 2.0  # 中间时刻增强两倍
+    
+    # weight = base + peak * sin(t * pi)
+    weights = base + peak * torch.sin(t_norm * torch.pi)
+    
+    return weights.view(-1, 1)
 
 # -----------------------------------------------------
 # B. DPM 前向过程
@@ -252,13 +274,29 @@ class ConditionalUnet(nn.Module):
         )
 
     def forward(self, x, t, y_cond):
+        # 1. 计算时间嵌入
         t_emb = self.time_mlp(t)
+        
+        # 2. 计算标签嵌入
         if y_cond.dim() == 2 and y_cond.size(1) == self.num_classes:
             y_emb = y_cond @ self.label_emb.weight
         elif y_cond.dim() == 1:
             y_emb = self.label_emb(y_cond)
         else:
             raise ValueError("y_cond format error")
+            
+        # ==========================================
+        # [关键修改] 动态调整注入强度
+        # ==========================================
+        # 获取当前 batch 每个样本的时间权重
+        w_t = get_time_weight(t, self.time_mlp[0].dim * 2).to(t.device) # 这里的 dim * 2 只是为了获取 max_steps 对应的参数，或者直接传 1000
+        # 修正：直接用 cfg.timesteps 或者硬编码 1000
+        w_t = get_time_weight(t, max_steps=1000).to(t.device)
+        
+        # 增强/抑制条件信号
+        y_emb = y_emb * w_t
+        
+        # 3. 融合 (条件 = 时间 + 加权后的标签)
         cond_emb = t_emb + y_emb
 
         x = self.init_conv(x)
