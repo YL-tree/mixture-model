@@ -150,51 +150,107 @@ class mDPM_SemiSup(nn.Module):
             # total_loss = weighted_dpm_loss
             
             # return total_loss, -total_loss.item(), weighted_dpm_loss.item(), 0.0, resp.detach(), None
-            # mDPM.py -> forward 函数
-
-            # ... (前面是 E-Step 计算 logits 和 resp) ...
             
-            # Gumbel Softmax (松弛后验) - 这部分保留用于计算 Entropy (可选)
-            resp_soft = gumbel_softmax_sample(logits, cfg.current_gumbel_temp)
             
-            # ==========================================
-            # [关键修改] 切换为 Hard-EM
-            # ==========================================
-            # 不再使用软概率加权，而是直接取最大概率的类别作为 "伪标签"
-            # 这种 "赢家通吃" 的策略能产生最强的梯度信号
+            # === Part 1: E-Step (推断伪标签) ===
             
-            # 1. 找到概率最大的类别索引
-            pseudo_y = logits.argmax(dim=1) 
+            # A. 准备 Log Prior (log pi)
+            # registered_pi 记录了历史上的类别频率
+            log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0).to(x_0.device)
             
-            # 2. 转为 One-Hot (这就相当于把概率变成了 [0, 1, 0...])
-            resp_hard = F.one_hot(pseudo_y, num_classes=cfg.num_classes).float()
+            log_lik_proxy = []
             
-            # M-Step: 计算 Loss
-            weighted_dpm_loss = 0.0
-            
-            # 重新采样一个 t 用于训练
-            t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
-            noise = torch.randn_like(x_0)
-            x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
-
+            # B. 计算所有类别的 MSE (即 Log-Likelihood 代理)
             for k in range(cfg.num_classes):
                 y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
                                        num_classes=cfg.num_classes).float()
                 
-                pred_noise_k = self.cond_denoiser(x_t_train, t_train, y_onehot_k)
-                dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
+                # 预测噪声
+                pred_noise_k = self.cond_denoiser(x_t, t, y_onehot_k)
                 
-                # [修改] 使用 resp_hard 进行选择
-                # 只有当 k == pseudo_y 时，这项 Loss 才会生效
-                weighted_dpm_loss += (resp_hard[:, k].detach() * dpm_loss_k).mean()
+                # 计算 Per-sample MSE
+                # 注意：这里我们用 Negative MSE，因为 MSE 越小越好，LogLikelihood 越大越好
+                mse_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
+                log_lik_proxy.append((-mse_k).unsqueeze(1))
             
-            # ==========================================
+            # 形状: (Batch, 10)
+            log_lik_proxy = torch.cat(log_lik_proxy, dim=1)
             
-            total_loss = weighted_dpm_loss 
+            # [参数设置] Logits 缩放因子
+            # 保持在 3.0 - 5.0 之间比较稳健，既放大差异又不至于梯度爆炸
+            scale_factor = 3.0
             
-            # 返回 resp_soft 用于更新 Prior (保持平滑更新)
-            return total_loss, -total_loss.item(), weighted_dpm_loss.item(), 0.0, resp_soft.detach(), None
-
+            # C. 组合得到原始 Logits
+            # Logits = Log_Prior + Scale * (Log_Likelihood)
+            logits = log_pi + (log_lik_proxy * scale_factor)
+            
+            # === [关键新增] 反坍缩机制 (Anti-Collapse) ===
+            # 如果不加这一步，Hard-EM 容易导致某个类 pi 接近 1，
+            # 从而 log_pi 很大，永远选中那个类 (富者越富)。
+            
+            # 1. 计算惩罚项 (即 log_pi 本身)
+            # 如果某个类选多了，log_pi 就大，我们把它减掉
+            penalty = log_pi  
+            
+            # 2. 计算平衡后的 Logits
+            # 实际上这就变成了纯粹比较 MSE (Likelihood)，暂时忽略 Prior 的影响
+            # 这样即使类别 6 之前选了 100 次，只要这张图看起来像 0，MSE(0) 更小，0 就能胜出
+            balanced_logits = logits - penalty
+            
+            # === Part 2: Hard-EM Selection (赢家通吃) ===
+            
+            # 1. 选出概率最大的类 (Pseudo Label)
+            pseudo_y = balanced_logits.argmax(dim=1) 
+            
+            # 2. 转为 One-Hot (硬分配)
+            resp_hard = F.one_hot(pseudo_y, num_classes=cfg.num_classes).float()
+            
+            # === Part 3: 更新全局 Prior (Registered Pi) ===
+            
+            if self.training:
+                with torch.no_grad():
+                    # 统计当前 Batch 选了哪些类
+                    batch_counts = resp_hard.mean(0)
+                    # 动量更新 (0.9 保持历史, 0.1 吸收新数据)
+                    # 这一步保证了 self.registered_pi 能真实反映模型的选择倾向
+                    self.registered_pi.copy_(0.9 * self.registered_pi + 0.1 * batch_counts)
+            
+            # === Part 4: M-Step (训练去噪网络) ===
+            
+            # 重新采样一个 t 用于训练 (标准 DDPM 做法)
+            t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
+            noise_train = torch.randn_like(x_0)
+            x_t_train = self.dpm_process.q_sample(x_0, t_train, noise_train)
+            
+            weighted_dpm_loss = 0.0
+            
+            # 只计算被选中的那个类的 Loss (Hard Selection)
+            # 相比于 Soft-EM 计算所有类再加权，这样计算量其实可以优化(只算 pseudo_y 对应的)，
+            # 但为了代码结构清晰，且 Batch 内不同样本属于不同类，保留循环写法最稳妥。
+            for k in range(cfg.num_classes):
+                # 构造 mask: 只有 pseudo_y == k 的样本才参与计算
+                mask = resp_hard[:, k]
+                
+                # 优化：如果当前 Batch 没人选这个类，直接跳过，节省显存和计算
+                if mask.sum() == 0:
+                    continue
+                
+                y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
+                                       num_classes=cfg.num_classes).float()
+                
+                # 预测
+                pred_noise_k = self.cond_denoiser(x_t_train, t_train, y_onehot_k)
+                
+                # 计算 MSE
+                loss_k = F.mse_loss(pred_noise_k, noise_train, reduction='none').view(batch_size, -1).mean(dim=1)
+                
+                # 累加 Loss (mask 已经 detach 过了，相当于常量)
+                weighted_dpm_loss += (mask.detach() * loss_k).mean()
+            
+            # 返回值
+            # resp_hard 用于外部记录，不再用于梯度
+            return weighted_dpm_loss, -weighted_dpm_loss.item(), weighted_dpm_loss.item(), 0.0, resp_hard.detach(), None
+            
 # -----------------------
 # Evaluation Utils
 # -----------------------
