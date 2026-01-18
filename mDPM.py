@@ -86,7 +86,10 @@ class mDPM_SemiSup(nn.Module):
         前向传播包含 E-Step 和 M-Step 的损失计算
         """
         batch_size = x_0.size(0)
-        
+        t = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
+        noise = torch.randn_like(x_0)
+        x_t = self.dpm_process.q_sample(x_0, t, noise)
+
         # -------------------
         # 监督模式 (Labeled Data)
         # -------------------
@@ -115,141 +118,48 @@ class mDPM_SemiSup(nn.Module):
             # 这里的 resp 对应论文中的 \tilde{p}(x|z,y)
             # resp = gumbel_softmax_sample(logits, cfg.current_gumbel_temp)
             
-            # # === M-Step: 训练去噪网络 ===
-            # # 论文: Sample x ~ p(x|z,y) then train DDPM
-            # # 实际操作: 使用 resp 加权的 Loss (Soft-EM)，这在深度学习中比 Hard Sampling 更稳定
-            
-            # # 重新采样一个 t 用于训练 (标准 DDPM 做法)
-            # t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
-            # noise = torch.randn_like(x_0)
-            # x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
-            
-            # weighted_dpm_loss = 0.0
-            
-            # # 计算加权 Loss
-            # # L = Sum_k q(x=k) * ||eps - eps_theta(x_t, t, k)||^2
-            # for k in range(cfg.num_classes):
-            #     y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
-            #                            num_classes=cfg.num_classes).float()
-                
-            #     # 这里需要梯度，用于更新 cond_denoiser
-            #     pred_noise_k = self.cond_denoiser(x_t_train, t_train, y_onehot_k)
-                
-            #     # Per-sample loss
-            #     dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                
-            #     # 使用 E-Step 算出来的 resp 进行加权
-            #     # resp.detach() 很关键！确保梯度不回传到 E-Step 逻辑
-            #     weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
-            
-            # # === 辅助损失 ===
-            # # 熵最小化: 鼓励模型做出确定的预测 (Paper context: Self-consistent)
-            # # entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
-            
-            # # total_loss = weighted_dpm_loss - cfg.lambda_entropy * entropy
-            # total_loss = weighted_dpm_loss
-            
-            # return total_loss, -total_loss.item(), weighted_dpm_loss.item(), 0.0, resp.detach(), None
-            
-            
-            # === Part 1: E-Step (推断伪标签) ===
-            
-            # A. 准备 Log Prior (log pi)
-            # registered_pi 记录了历史上的类别频率
-            log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0).to(x_0.device)
-            
-            log_lik_proxy = []
-            
-            # B. 计算所有类别的 MSE (即 Log-Likelihood 代理)
-            for k in range(cfg.num_classes):
-                y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
-                                       num_classes=cfg.num_classes).float()
-                
-                # 预测噪声
-                pred_noise_k = self.cond_denoiser(x_t, t, y_onehot_k)
-                
-                # 计算 Per-sample MSE
-                # 注意：这里我们用 Negative MSE，因为 MSE 越小越好，LogLikelihood 越大越好
-                mse_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                log_lik_proxy.append((-mse_k).unsqueeze(1))
-            
-            # 形状: (Batch, 10)
-            log_lik_proxy = torch.cat(log_lik_proxy, dim=1)
-            
-            # [参数设置] Logits 缩放因子
-            # 保持在 3.0 - 5.0 之间比较稳健，既放大差异又不至于梯度爆炸
-            scale_factor = 3.0
-            
-            # C. 组合得到原始 Logits
-            # Logits = Log_Prior + Scale * (Log_Likelihood)
-            logits = log_pi + (log_lik_proxy * scale_factor)
-            
-            # === [关键新增] 反坍缩机制 (Anti-Collapse) ===
-            # 如果不加这一步，Hard-EM 容易导致某个类 pi 接近 1，
-            # 从而 log_pi 很大，永远选中那个类 (富者越富)。
-            
-            # 1. 计算惩罚项 (即 log_pi 本身)
-            # 如果某个类选多了，log_pi 就大，我们把它减掉
-            penalty = log_pi  
-            
-            # 2. 计算平衡后的 Logits
-            # 实际上这就变成了纯粹比较 MSE (Likelihood)，暂时忽略 Prior 的影响
-            # 这样即使类别 6 之前选了 100 次，只要这张图看起来像 0，MSE(0) 更小，0 就能胜出
-            balanced_logits = logits - penalty
-            
-            # === Part 2: Hard-EM Selection (赢家通吃) ===
-            
-            # 1. 选出概率最大的类 (Pseudo Label)
-            pseudo_y = balanced_logits.argmax(dim=1) 
-            
-            # 2. 转为 One-Hot (硬分配)
-            resp_hard = F.one_hot(pseudo_y, num_classes=cfg.num_classes).float()
-            
-            # === Part 3: 更新全局 Prior (Registered Pi) ===
-            
-            if self.training:
-                with torch.no_grad():
-                    # 统计当前 Batch 选了哪些类
-                    batch_counts = resp_hard.mean(0)
-                    # 动量更新 (0.9 保持历史, 0.1 吸收新数据)
-                    # 这一步保证了 self.registered_pi 能真实反映模型的选择倾向
-                    self.registered_pi.copy_(0.9 * self.registered_pi + 0.1 * batch_counts)
-            
-            # === Part 4: M-Step (训练去噪网络) ===
+            # === M-Step: 训练去噪网络 ===
+            # 论文: Sample x ~ p(x|z,y) then train DDPM
+            # 实际操作: 使用 resp 加权的 Loss (Soft-EM)，这在深度学习中比 Hard Sampling 更稳定
             
             # 重新采样一个 t 用于训练 (标准 DDPM 做法)
             t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
-            noise_train = torch.randn_like(x_0)
-            x_t_train = self.dpm_process.q_sample(x_0, t_train, noise_train)
+            noise = torch.randn_like(x_0)
+            x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
             
             weighted_dpm_loss = 0.0
             
-            # 只计算被选中的那个类的 Loss (Hard Selection)
-            # 相比于 Soft-EM 计算所有类再加权，这样计算量其实可以优化(只算 pseudo_y 对应的)，
-            # 但为了代码结构清晰，且 Batch 内不同样本属于不同类，保留循环写法最稳妥。
+            # 计算加权 Loss
+            # L = Sum_k q(x=k) * ||eps - eps_theta(x_t, t, k)||^2
             for k in range(cfg.num_classes):
-                # 构造 mask: 只有 pseudo_y == k 的样本才参与计算
-                mask = resp_hard[:, k]
-                
-                # 优化：如果当前 Batch 没人选这个类，直接跳过，节省显存和计算
-                if mask.sum() == 0:
-                    continue
-                
                 y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
                                        num_classes=cfg.num_classes).float()
                 
-                # 预测
+                # 这里需要梯度，用于更新 cond_denoiser
                 pred_noise_k = self.cond_denoiser(x_t_train, t_train, y_onehot_k)
                 
-                # 计算 MSE
-                loss_k = F.mse_loss(pred_noise_k, noise_train, reduction='none').view(batch_size, -1).mean(dim=1)
+                # Per-sample loss
+                dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
                 
-                # 累加 Loss (mask 已经 detach 过了，相当于常量)
-                weighted_dpm_loss += (mask.detach() * loss_k).mean()
+                # 使用 E-Step 算出来的 resp 进行加权
+                # resp.detach() 很关键！确保梯度不回传到 E-Step 逻辑
+                weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
             
-            # 返回值
-            # resp_hard 用于外部记录，不再用于梯度
-            return weighted_dpm_loss, -weighted_dpm_loss.item(), weighted_dpm_loss.item(), 0.0, resp_hard.detach(), None
+            # === 辅助损失 ===
+            # 熵最小化: 鼓励模型做出确定的预测 (Paper context: Self-consistent)
+            # entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
+            
+            # total_loss = weighted_dpm_loss - cfg.lambda_entropy * entropy
+            total_loss = weighted_dpm_loss
+
+            # --- 更新 Prior ---
+            if self.training:
+                with torch.no_grad():
+                    current_counts = resp.mean(0)
+                    self.registered_pi.copy_(0.99 * self.registered_pi + 0.01 * current_counts)
+            
+            return total_loss, -total_loss.item(), weighted_dpm_loss.item(), 0.0, resp.detach(), None
+            
             
 # -----------------------
 # Evaluation Utils
@@ -301,9 +211,9 @@ def evaluate_model(model, loader, cfg):
                 cumulative_mse += (mse_t_sum / n_repeats)
 
             pred_cluster = torch.argmin(cumulative_mse, dim=1).cpu().numpy()
-            # [新增调试打印]
-            unique_preds, counts = np.unique(pred_cluster, return_counts=True)
-            print(f"DEBUG: Predicted Clusters Distribution: {dict(zip(unique_preds, counts))}")
+            # # [新增调试打印]
+            # unique_preds, counts = np.unique(pred_cluster, return_counts=True)
+            # print(f"DEBUG: Predicted Clusters Distribution: {dict(zip(unique_preds, counts))}")
         
             preds.append(pred_cluster)
             ys_true.append(y_true.numpy())
