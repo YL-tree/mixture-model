@@ -78,7 +78,7 @@ def get_time_weight(t, max_steps=1000):
     # 这样中间最大，两头最小
     # 加上一个基数 base，保证不会完全变成 0
     base = 0.5
-    peak = 5.0  # 中间时刻增强两倍
+    peak = 15.0  # 中间时刻增强两倍
     
     # weight = base + peak * sin(t * pi)
     weights = base + peak * torch.sin(t_norm * torch.pi)
@@ -234,6 +234,7 @@ class ConditionalUnet(nn.Module):
             nn.Linear(time_emb_dim, time_emb_dim),
         )
         self.label_emb = nn.Embedding(num_classes, time_emb_dim)
+        nn.init.normal_(self.label_emb.weight, mean=0.0, std=1.0)
 
         ch = [base_channels, base_channels * 2, base_channels * 4]
         self.init_conv = nn.Conv2d(in_channels, ch[0], 3, padding=1)

@@ -73,7 +73,7 @@ class mDPM_SemiSup(nn.Module):
         # [关键修改] 手动放大差异 (Scale Factor)
         # 这相当于人为降低了 E-Step 的 "温度"
         # 让猜对的类别的 Logits 显著高于猜错的
-        scale_factor = 1.0  
+        scale_factor = 3.0  
         accum_log_lik = accum_log_lik * scale_factor
         
         log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0)
@@ -110,45 +110,90 @@ class mDPM_SemiSup(nn.Module):
             # 这里使用了 Multi-step 近似，比原来的单步更准
             logits = self.estimate_posterior_logits(x_0, cfg)
             
+            # 先保留softmax的代码
             # 使用 Gumbel Softmax 进行重参数化或松弛采样
             # 这里的 resp 对应论文中的 \tilde{p}(x|z,y)
-            resp = gumbel_softmax_sample(logits, cfg.current_gumbel_temp)
+            # resp = gumbel_softmax_sample(logits, cfg.current_gumbel_temp)
             
-            # === M-Step: 训练去噪网络 ===
-            # 论文: Sample x ~ p(x|z,y) then train DDPM
-            # 实际操作: 使用 resp 加权的 Loss (Soft-EM)，这在深度学习中比 Hard Sampling 更稳定
+            # # === M-Step: 训练去噪网络 ===
+            # # 论文: Sample x ~ p(x|z,y) then train DDPM
+            # # 实际操作: 使用 resp 加权的 Loss (Soft-EM)，这在深度学习中比 Hard Sampling 更稳定
             
-            # 重新采样一个 t 用于训练 (标准 DDPM 做法)
+            # # 重新采样一个 t 用于训练 (标准 DDPM 做法)
+            # t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
+            # noise = torch.randn_like(x_0)
+            # x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
+            
+            # weighted_dpm_loss = 0.0
+            
+            # # 计算加权 Loss
+            # # L = Sum_k q(x=k) * ||eps - eps_theta(x_t, t, k)||^2
+            # for k in range(cfg.num_classes):
+            #     y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
+            #                            num_classes=cfg.num_classes).float()
+                
+            #     # 这里需要梯度，用于更新 cond_denoiser
+            #     pred_noise_k = self.cond_denoiser(x_t_train, t_train, y_onehot_k)
+                
+            #     # Per-sample loss
+            #     dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
+                
+            #     # 使用 E-Step 算出来的 resp 进行加权
+            #     # resp.detach() 很关键！确保梯度不回传到 E-Step 逻辑
+            #     weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
+            
+            # # === 辅助损失 ===
+            # # 熵最小化: 鼓励模型做出确定的预测 (Paper context: Self-consistent)
+            # # entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
+            
+            # # total_loss = weighted_dpm_loss - cfg.lambda_entropy * entropy
+            # total_loss = weighted_dpm_loss
+            
+            # return total_loss, -total_loss.item(), weighted_dpm_loss.item(), 0.0, resp.detach(), None
+            # mDPM.py -> forward 函数
+
+            # ... (前面是 E-Step 计算 logits 和 resp) ...
+            
+            # Gumbel Softmax (松弛后验) - 这部分保留用于计算 Entropy (可选)
+            resp_soft = gumbel_softmax_sample(logits, cfg.current_gumbel_temp)
+            
+            # ==========================================
+            # [关键修改] 切换为 Hard-EM
+            # ==========================================
+            # 不再使用软概率加权，而是直接取最大概率的类别作为 "伪标签"
+            # 这种 "赢家通吃" 的策略能产生最强的梯度信号
+            
+            # 1. 找到概率最大的类别索引
+            pseudo_y = logits.argmax(dim=1) 
+            
+            # 2. 转为 One-Hot (这就相当于把概率变成了 [0, 1, 0...])
+            resp_hard = F.one_hot(pseudo_y, num_classes=cfg.num_classes).float()
+            
+            # M-Step: 计算 Loss
+            weighted_dpm_loss = 0.0
+            
+            # 重新采样一个 t 用于训练
             t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
-            
-            weighted_dpm_loss = 0.0
-            
-            # 计算加权 Loss
-            # L = Sum_k q(x=k) * ||eps - eps_theta(x_t, t, k)||^2
+
             for k in range(cfg.num_classes):
                 y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
                                        num_classes=cfg.num_classes).float()
                 
-                # 这里需要梯度，用于更新 cond_denoiser
                 pred_noise_k = self.cond_denoiser(x_t_train, t_train, y_onehot_k)
-                
-                # Per-sample loss
                 dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
                 
-                # 使用 E-Step 算出来的 resp 进行加权
-                # resp.detach() 很关键！确保梯度不回传到 E-Step 逻辑
-                weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
+                # [修改] 使用 resp_hard 进行选择
+                # 只有当 k == pseudo_y 时，这项 Loss 才会生效
+                weighted_dpm_loss += (resp_hard[:, k].detach() * dpm_loss_k).mean()
             
-            # === 辅助损失 ===
-            # 熵最小化: 鼓励模型做出确定的预测 (Paper context: Self-consistent)
-            # entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
+            # ==========================================
             
-            # total_loss = weighted_dpm_loss - cfg.lambda_entropy * entropy
-            total_loss = weighted_dpm_loss
+            total_loss = weighted_dpm_loss 
             
-            return total_loss, -total_loss.item(), weighted_dpm_loss.item(), 0.0, resp.detach(), None
+            # 返回 resp_soft 用于更新 Prior (保持平滑更新)
+            return total_loss, -total_loss.item(), weighted_dpm_loss.item(), 0.0, resp_soft.detach(), None
 
 # -----------------------
 # Evaluation Utils
