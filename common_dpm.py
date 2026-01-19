@@ -26,7 +26,7 @@ class Config:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.output_dir = "./mDPM_results_unsupervised"
         self.batch_size = 64
-        self.final_epochs = 50 
+        self.final_epochs = 500 
         self.optuna_epochs = 10 
         self.lr = 2e-4                    # 学习率
         self.labeled_per_class = 0      # 每类用于监督学习的样本数 (无监督)
@@ -54,7 +54,7 @@ class Config:
         # 模型结构和 DPM 参数
         # ---------------------
         self.num_classes = 10             # MNIST
-        self.timesteps = 200             # 扩散总时间步 T
+        self.timesteps = 1000             # 扩散总时间步 T
         self.image_channels = 1           # MNIST
         
         # U-Net 参数
