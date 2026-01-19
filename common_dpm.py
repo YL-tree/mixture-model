@@ -24,12 +24,12 @@ class Config:
         # ---------------------
         # 自动检测可用设备
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.output_dir = "./mDPM_results_unsupervised"
+        self.output_dir = "./mDPM_results_semisupervised"
         self.batch_size = 64
         self.final_epochs = 500 
         self.optuna_epochs = 10 
         self.lr = 2e-4                    # 学习率
-        self.labeled_per_class = 0      # 每类用于监督学习的样本数 (无监督)
+        self.labeled_per_class = 100      # 每类用于监督学习的样本数 (无监督)
         
         # ---------------------
         # PVEM 框架权重

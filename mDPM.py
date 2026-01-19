@@ -9,7 +9,7 @@ import gc  # 显式内存管理
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from torchvision.utils import save_image
-
+import itertools  # <--- 必须加这个
 # 导入 common 组件
 from common_dpm import *
 
@@ -244,7 +244,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     metrics = {"Loss": [], "NMI": [], "Acc": []}
     best_val_nmi = -np.inf
     
-    # --- 1. 自动判断训练模式 ---
+    # 自动判断模式
     mode = "UNKNOWN"
     if labeled_loader is not None and unlabeled_loader is not None:
         mode = "SEMI_SUPERVISED"
@@ -259,49 +259,38 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     else:
         raise ValueError("❌ 错误: Labeled 和 Unlabeled loader 不能同时为空！")
 
-    # --- 2. 训练循环 ---
+    # 训练循环
     for epoch in range(1, total_epochs + 1):
         
-        # ==========================================
-        # [新增] 动态退火调度器 (Scheduler)
-        # ==========================================
-        
-        # 1. 计算进度 (0.0 -> 1.0)
+        # === 动态退火调度器 ===
         progress = epoch / total_epochs
-        
-        # 2. 动态 Scale (温度退火)
-        # 策略：从 3.0 (温和) 慢慢涨到 10.0 (尖锐)
         dynamic_scale = 3.0 + (10.0 - 3.0) * progress
         
-        # 3. 动态 Entropy Weight (鞭子力度)
-        # 策略：前 20 Epoch 不打鞭子 (Warmup)，防止初期爆炸
-        # 之后从 0.0 慢慢涨到 0.2
         if epoch < 20:
             dynamic_lambda = 0.0
         else:
-            # 防止分母为0
             denom = max(1, total_epochs - 20)
             lambda_progress = (epoch - 20) / denom
             dynamic_lambda = 0.0 + (0.2 - 0.0) * lambda_progress
         
-        # 打印参数监控
         if epoch % 5 == 0 or epoch == 1:
             print(f"🔥 [Scheduler] Epoch {epoch}: Scale={dynamic_scale:.2f}, Lambda={dynamic_lambda:.4f}")
             
-        # ==========================================
-        
         model.train()
         loss_accum = 0.0
         n_batches = 0
         
-        # 半监督模式下的 Warm-up: 前 10 个 Epoch 强制只看有标签数据
+        # Warm-up: 前 10 Epoch alpha=0
         current_alpha_un = cfg.alpha_unlabeled
         if mode == "SEMI_SUPERVISED" and epoch <= 10:
             current_alpha_un = 0.0
         
-        # 构造通用迭代器
+        # === [关键修复] 构造迭代器 ===
         if mode == "SEMI_SUPERVISED":
-            iterator = zip(labeled_loader, unlabeled_loader)
+            # 使用 itertools.cycle 确保 labeled_loader 循环使用，
+            # 这样 Epoch 长度由 unlabeled_loader (长) 决定，而不是 labeled_loader (短)
+            import itertools 
+            iterator = zip(itertools.cycle(labeled_loader), unlabeled_loader)
         elif mode == "SUPERVISED":
             iterator = ((batch, None) for batch in labeled_loader)
         elif mode == "UNSUPERVISED":
@@ -313,27 +302,22 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
             total_loss = torch.tensor(0.0, device=cfg.device)
             resp = None 
 
-            # --- 有监督部分 ---
+            # 有监督部分
             if batch_lab is not None:
                 x_lab, y_lab = batch_lab
                 x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device).long()
-                
-                # 有标签 Loss (Scale 和 Lambda 在这里不重要，因为直接返回 MSE)
                 loss_lab, _, _, _, _, _ = model(x_lab, cfg, y_lab)
                 total_loss += loss_lab
 
-            # --- 无监督部分 ---
+            # 无监督部分
             if batch_un is not None and current_alpha_un > 0:
                 x_un, _ = batch_un 
                 x_un = x_un.to(cfg.device)
-                
-                # [关键] 传入动态计算的 scale 和 lambda
                 loss_un, _, _, _, resp, _ = model(x_un, cfg, None, 
                                                   current_scale=dynamic_scale, 
                                                   current_lambda=dynamic_lambda)
                 total_loss += current_alpha_un * loss_un
             
-            # --- 反向传播 ---
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
@@ -341,13 +325,12 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
             loss_accum += total_loss.item()
             n_batches += 1
 
-            # Prior 更新
             if resp is not None:
                 with torch.no_grad():
                     momentum = 0.9 if mode == "UNSUPERVISED" else 0.99
                     model.registered_pi.copy_(momentum * model.registered_pi + (1-momentum) * resp.mean(0).detach())
 
-        # === 评估与日志 ===
+        # 评估
         raw_acc, _, val_nmi = evaluate_model(model, val_loader, cfg)
         
         target_metric = raw_acc if mode == "SUPERVISED" else val_nmi
@@ -413,7 +396,7 @@ def main():
         cfg.unet_base_channels = 32
         
         # [关键] 手动设置较小的学习率，配合 Hardening 阶段
-        cfg.lr = 2e-5 
+        # cfg.lr = 2e-5 
         print(f"🎯 Manual LR set to: {cfg.lr}")
         
     print("\n" + "="*30)
