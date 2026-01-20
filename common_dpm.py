@@ -39,7 +39,7 @@ class Config:
         
         # [NEW] 论文中的 M (Monte Carlo steps for posterior estimation)
         # 建议设置为 4 到 10。越大越准，但训练越慢。
-        self.posterior_sample_steps = 1
+        self.posterior_sample_steps = 5
         
         # ---------------------
         # Gumbel Softmax 退火参数
@@ -292,7 +292,7 @@ class ConditionalUnet(nn.Module):
         # 获取当前 batch 每个样本的时间权重
         w_t = get_time_weight(t, self.time_mlp[0].dim * 2).to(t.device) # 这里的 dim * 2 只是为了获取 max_steps 对应的参数，或者直接传 1000
         # 修正：直接用 cfg.timesteps 或者硬编码 1000
-        w_t = get_time_weight(t, max_steps=200).to(t.device)
+        w_t = get_time_weight(t, max_steps=1000).to(t.device)
         
         # 增强/抑制条件信号
         y_emb = y_emb * w_t
@@ -328,7 +328,6 @@ class ConditionalUnet(nn.Module):
                     x = module(x) 
 
         return self.final_conv(x)
-
 # -----------------------------------------------------
 # D. 辅助函数
 # -----------------------------------------------------

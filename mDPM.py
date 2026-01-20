@@ -33,58 +33,38 @@ class mDPM_SemiSup(nn.Module):
         # 类别分布先验 (Uniform initialization)
         self.register_buffer('registered_pi', torch.ones(cfg.num_classes) / cfg.num_classes)
         
-    # [修改] 增加 scale_factor 参数，接收动态调度值
-    def estimate_posterior_logits(self, x_0, cfg, scale_factor=5.0):
+    def estimate_posterior_logits(self, x_0, cfg, scale_factor=1.0):
         batch_size = x_0.size(0)
         num_classes = cfg.num_classes
         M = cfg.posterior_sample_steps
         
-        accum_log_lik = torch.zeros(batch_size, num_classes, device=x_0.device)
+        # 使用负 MSE 累加器
+        accum_neg_mse = torch.zeros(batch_size, num_classes, device=x_0.device)
         
         with torch.no_grad():
             for _ in range(M):
-                # 语义区间 [300, 700]
-                t_start = int(0.3 * cfg.timesteps)
-                t_end = int(0.7 * cfg.timesteps)
-                
-                # 采样 t
-                t = torch.randint(t_start, t_end, (batch_size,), device=x_0.device).long()
-                
+                # 稍微放宽时间步范围，更符合 PVEM 的全过程假设
+                t = torch.randint(100, 900, (batch_size,), device=x_0.device).long()
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
                 
                 for k in range(num_classes):
                     y_cond = torch.full((batch_size,), k, device=x_0.device, dtype=torch.long)
                     y_onehot = F.one_hot(y_cond, num_classes=num_classes).float()
-                    
                     pred_noise = self.cond_denoiser(x_t, t, y_onehot)
                     
-                    # Log Likelihood Proxy
+                    # Log P(z_t | z_t+1, x) ∝ -||eps - eps_theta||^2
                     mse = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                    accum_log_lik[:, k] += -mse
+                    accum_neg_mse[:, k] += -mse
 
-        # ==========================================
-        # 🛡️ [最终安全锁] Z-Score Normalization
-        # ==========================================
-        # 计算每个样本在 10 个类别上的均值和标准差
-        # (Batch, 10) -> (Batch, 1)
-        mean_lik = accum_log_lik.mean(dim=1, keepdim=True)
-        std_lik = accum_log_lik.std(dim=1, keepdim=True)
+        # 平均化
+        avg_neg_mse = accum_neg_mse / M
         
-        # 标准化：强制拉开差距，不管原始 MSE 差别多小
-        # 加上 1e-8 防止除以 0
-        normalized_lik = (accum_log_lik - mean_lik) / (std_lik + 1e-8)
-        
-        # 现在 normalized_lik 的数值大约在 -2 到 +2 之间
-        # 我们给它一个固定的 Scale (Temperature)，比如 10.0
-        # 这样 Softmax 出来的分布就会非常尖锐 (Confident)
-        # 这里的 10.0 不需要动态调整了，因为输入已经被标准化了
-        final_scale = 10.0 
-        
+        # 加入 Prior
         log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0)
         
-        # Logits = Prior + Likelihood
-        final_logits = log_pi + (normalized_lik * final_scale)
+        
+        final_logits = log_pi + (avg_neg_mse * scale_factor)
 
         return final_logits
 
@@ -115,45 +95,79 @@ class mDPM_SemiSup(nn.Module):
         # -------------------
         # 无监督模式 (Unlabeled Data) - Soft-EM with Dynamic Annealing
         # -------------------
-        else:
-            # === E-Step: 推断潜变量 x 的分布 ===
-            # [修改] 传入动态 Scale
+        # else:
+        #     # === E-Step: 推断潜变量 x 的分布 ===
+        #     # [修改] 传入动态 Scale
+        #     logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=current_scale)
+            
+        #     # 使用 Softmax 获取概率 (Soft-EM)
+        #     # 在推理阶段，直接用 Softmax 比 Gumbel 更稳定，因为我们已经在 Logits 层面加了 scale
+        #     resp = F.softmax(logits, dim=1)
+            
+        #     # === M-Step: 训练去噪网络 ===
+        #     t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
+        #     noise = torch.randn_like(x_0)
+        #     x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
+            
+        #     weighted_dpm_loss = 0.0
+            
+        #     # 计算加权 Loss
+        #     for k in range(cfg.num_classes):
+        #         y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
+        #                                num_classes=cfg.num_classes).float()
+                
+        #         pred_noise_k = self.cond_denoiser(x_t_train, t_train, y_onehot_k)
+        #         dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
+                
+        #         weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
+            
+        #     # === 辅助损失 ===
+        #     # [修改] 使用动态 Lambda
+        #     entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
+        #     total_loss = weighted_dpm_loss + current_lambda * entropy
+
+        #     # --- 更新 Prior ---
+        #     if self.training:
+        #         with torch.no_grad():
+        #             current_counts = resp.mean(0)
+        #             self.registered_pi.copy_(0.99 * self.registered_pi + 0.01 * current_counts)
+            
+        #     return total_loss, -total_loss.item(), weighted_dpm_loss.item(), entropy.item(), resp.detach(), None
+        # 无监督部分
+        if y is None:
+            # === E-Step ===
             logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=current_scale)
+            resp = F.softmax(logits, dim=1) # shape: (B, K)
             
-            # 使用 Softmax 获取概率 (Soft-EM)
-            # 在推理阶段，直接用 Softmax 比 Gumbel 更稳定，因为我们已经在 Logits 层面加了 scale
-            resp = F.softmax(logits, dim=1)
+            # === M-Step (使用 Hard Sampling 以符合论文并加速) ===
+            # 论文: "By drawing samples... obtain class labels... proceed with noise prediction"
             
-            # === M-Step: 训练去噪网络 ===
+            # 1. 采样伪标签
+            pseudo_y = torch.multinomial(resp, 1).squeeze(1) # (B,)
+            
+            # 2. 构造训练数据
             t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
             
-            weighted_dpm_loss = 0.0
+            y_onehot_pseudo = F.one_hot(pseudo_y, num_classes=cfg.num_classes).float()
             
-            # 计算加权 Loss
-            for k in range(cfg.num_classes):
-                y_onehot_k = F.one_hot(torch.full((batch_size,), k, device=x_0.device),
-                                       num_classes=cfg.num_classes).float()
-                
-                pred_noise_k = self.cond_denoiser(x_t_train, t_train, y_onehot_k)
-                dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                
-                weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
+            # 3. 计算 DPM Loss (只算一次 forward，不用算 K 次)
+            pred_noise = self.cond_denoiser(x_t_train, t_train, y_onehot_pseudo)
+            dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean')
             
-            # === 辅助损失 ===
-            # [修改] 使用动态 Lambda
+            # 4. 辅助 Loss (Entropy Regularization)
             entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
-            total_loss = weighted_dpm_loss + current_lambda * entropy
+            
+            total_loss = dpm_loss + current_lambda * entropy
 
-            # --- 更新 Prior ---
+            # 更新 Prior (Momentum Update)
             if self.training:
                 with torch.no_grad():
-                    current_counts = resp.mean(0)
-                    self.registered_pi.copy_(0.99 * self.registered_pi + 0.01 * current_counts)
+                    # 这里可以用 resp 的均值，也可以用 pseudo_y 的 one-hot 均值，resp 更平滑
+                    self.registered_pi.copy_(0.99 * self.registered_pi + 0.01 * resp.mean(0).detach())
             
-            return total_loss, -total_loss.item(), weighted_dpm_loss.item(), entropy.item(), resp.detach(), None
-            
+            return total_loss, -total_loss.item(), dpm_loss.item(), entropy.item(), resp.detach(), None
             
 # -----------------------
 # Evaluation Utils
@@ -341,6 +355,31 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
                                                   current_scale=dynamic_scale, 
                                                   current_lambda=dynamic_lambda)
                 total_loss += current_alpha_un * loss_un
+                
+                # ==========================================
+                # 🔍 [新增] 深度监控代码块 (不影响梯度)
+                # ==========================================
+                with torch.no_grad():
+                    # 1. 获取伪标签
+                    pseudo_labels = resp.argmax(dim=1)
+                    
+                    # 2. 监控 A: 伪标签准确率 (看看E-Step算出的概率对不对)
+                    # 如果这一项很低，说明 E-Step (Logits计算) 有问题
+                    acc_unsup = (pseudo_labels == y_un_true).float().mean().item()
+                    
+                    # 3. 监控 B: 类别分布 (检查是否发生 Mode Collapse)
+                    # 统计当前 Batch 中每个类被选中的次数
+                    class_counts = torch.bincount(pseudo_labels, minlength=cfg.num_classes).cpu().numpy()
+                    
+                    # 4. 监控 D: 置信度 (检查 Scale 是否合适)
+                    # 如果刚开始就接近 1.0，说明 dynamic_scale 太大了
+                    confidence = resp.max(dim=1)[0].mean().item()
+                    
+                    # 打印监控日志 (每N个batch打印一次，防止刷屏)
+                    if n_batches % 20 == 0:
+                        print(f"   [Debug] Unsup Acc: {acc_unsup:.4f} | Conf: {confidence:.3f}")
+                        print(f"   [Debug] Class Dist: {class_counts} (若某项特别大则为坍塌)")
+                # ==========================================
             
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
