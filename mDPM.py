@@ -238,74 +238,87 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     start_epoch = 1
     best_val_acc = 0.0
 
-    # Resume Logic (简略)
+    # Resume Logic
     if resume_path and os.path.exists(resume_path):
         checkpoint = torch.load(resume_path, map_location=cfg.device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
-        best_val_acc = checkpoint.get('best_nmi', 0.0) # 兼容
+        best_val_acc = checkpoint.get('best_nmi', 0.0)
         print(f"🔄 Resumed at Ep {start_epoch}")
 
-    # Detect Mode
-    mode = "SEMI_SUPERVISED" if (labeled_loader and unlabeled_loader) else "SUPERVISED"
-    print(f"🚀 Mode: {mode}")
+    # ==========================================
+    # [修复] 完善的模式检测逻辑
+    # ==========================================
+    mode = "UNKNOWN"
+    if labeled_loader is not None and unlabeled_loader is not None: 
+        mode = "SEMI_SUPERVISED"
+    elif labeled_loader is not None: 
+        mode = "SUPERVISED"
+        cfg.alpha_unlabeled = 0.0 # 强制关闭无监督权重
+    elif unlabeled_loader is not None: 
+        # 这种情况就是你现在需要的
+        mode = "UNSUPERVISED"
+        cfg.alpha_unlabeled = 1.0 # 强制开启无监督权重
+    
+    print(f"🚀 Training Mode: {mode}")
 
     for epoch in range(start_epoch, total_epochs + 1):
         progress = (epoch - 1) / total_epochs
         
-        # Scale: 起步要高，拉开差距 (300 -> 600)
+        # Scale: 保持 300 -> 600
         dynamic_scale = 300.0 + (600.0 - 300.0) * progress
-        # 2. [新增] Threshold 调度 (课程学习)
-        # 从 0.70 慢慢涨到 0.95
-        # 如果一开始就是 0.95，无监督冷启动可能会直接死锁 (Pass Rate=0)
+        
+        # [新增] Threshold 课程学习: 0.70 -> 0.95
+        # 无监督起步难，先降低门槛
         dynamic_threshold = 0.70 + (0.95 - 0.70) * progress
-        # 打印看看当前门槛
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"🔥 [Scheduler] Ep {epoch}: Scale={dynamic_scale:.1f}, Threshold={dynamic_threshold:.2f}")
 
-        # Lambda: 很小
-        dynamic_lambda = 0.01
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"🔥 [Scheduler] Ep {epoch}: Scale={dynamic_scale:.1f}, Thres={dynamic_threshold:.2f}")
 
         model.train()
         loss_accum = 0.0
         mask_rate_accum = 0.0
         n_batches = 0
         
-        # Warm-up: 前5轮不加无监督
+        # Warm-up (仅在半监督时生效，无监督不跳过)
         current_alpha = cfg.alpha_unlabeled
         if mode == "SEMI_SUPERVISED" and epoch <= 5: 
             current_alpha = 0.0
         
-        # Iterator
+        # ==========================================
+        # [修复] Iterator 分发逻辑
+        # ==========================================
         if mode == "SEMI_SUPERVISED": 
             iterator = zip(itertools.cycle(labeled_loader), unlabeled_loader)
-        else:
+        elif mode == "SUPERVISED":
             iterator = ((batch, None) for batch in labeled_loader)
+        elif mode == "UNSUPERVISED":
+            # 纯无监督：第一个位置(labeled)传 None，第二个位置(unlabeled)传数据
+            iterator = ((None, batch) for batch in unlabeled_loader)
 
         for batch_lab, batch_un in iterator:
             optimizer.zero_grad()
             total_loss = torch.tensor(0.0, device=cfg.device)
 
-            # A. 有标签
+            # A. 有标签部分 (UNSUPERVISED 模式下 batch_lab 为 None，会自动跳过)
             if batch_lab is not None:
                 x, y = batch_lab
                 x, y = x.to(cfg.device), y.to(cfg.device).long()
                 l_sup, _, _, _, _, _ = model(x, cfg, y=y)
                 total_loss += l_sup
-            
-            # B. 无标签 (FixMatch)
+
+            # B. 无标签部分 (SUPERVISED 模式下 batch_un 为 None，会自动跳过)
             if batch_un is not None and current_alpha > 0:
-                x_un, _ = batch_un # 这里不需要y_un_true了，不再打印Acc
+                x_un, _ = batch_un
                 x_un = x_un.to(cfg.device)
                 
-                # 这里不再传 gumbel_temp，只传 scale
-                # [修改] 传入 dynamic_threshold
+                # 传入 dynamic_threshold
                 l_unsup, _, _, mask_rate, _, _ = model(x_un, cfg, y=None, 
                                                        current_scale=dynamic_scale,
-                                                       current_lambda=dynamic_lambda,
-                                                       threshold=dynamic_threshold) # <--- 传入
-                                                       
+                                                       current_lambda=0.01,
+                                                       threshold=dynamic_threshold)
+                
                 total_loss += current_alpha * l_unsup
                 mask_rate_accum += mask_rate
 
@@ -318,7 +331,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         # Validation
         val_acc, _, _ = evaluate_model(model, val_loader, cfg)
         
-        # Save Checkpoints
+        # Checkpointing
         ckpt = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -331,18 +344,15 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
             torch.save(ckpt, os.path.join(cfg.output_dir, "best_model.pt"))
             print(f"   ★ New Best! Acc: {best_val_acc:.4f}")
 
-        # Log
         avg_mask = mask_rate_accum / n_batches if n_batches > 0 else 0
-        print(f"Ep {epoch} | Loss: {loss_accum/n_batches:.4f} | Val Acc: {val_acc:.4f} | Unsup Pass Rate: {avg_mask*100:.1f}%")
+        print(f"Ep {epoch} | Loss: {loss_accum/n_batches:.4f} | Val Acc: {val_acc:.4f} | Pass: {avg_mask*100:.1f}%")
 
-        # [修改] 每一轮都生成图像！这是唯一的监控手段。
-        # 如果所有行都变成一样的数字，说明 Mode Collapse。
         if epoch % 1 == 0:
             sample_and_save_dpm(model.cond_denoiser, model.dpm_process, cfg.num_classes,
                                 os.path.join(sample_dir, f"epoch_{epoch:03d}.png"), cfg.device)
     
     return best_val_acc, {}
-
+    
 def main():
     cfg = Config()
     # 强制覆盖配置以确保 FixMatch 生效
