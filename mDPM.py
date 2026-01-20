@@ -83,56 +83,51 @@ class mDPM_SemiSup(nn.Module):
             # 返回格式: (total_loss, neg_elbo, dpm_loss, mask_rate, resp, None)
             return dpm_loss, -dpm_loss.item(), dpm_loss.item(), 1.0, None, None
             
-        # -------------------
-        # Path B: 无监督模式 (FixMatch 策略) - 严厉的自学
-        # -------------------
+        # Path B: 无监督
         else:
-            # 1. E-Step: 估算属于哪一类
+            # 1. E-Step
             logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=current_scale)
             resp = F.softmax(logits, dim=1) 
             
-            # 2. 获取置信度和伪标签
-            max_probs, pseudo_labels = resp.max(dim=1)
-            
-            # 3. [核心策略] 阈值过滤 (Thresholding)
-            # 只有置信度极高 (>0.95) 的样本才允许进入训练
-            # "要么非常确定，要么闭嘴"
-            # 半监督的时候为0.95
-            mask = (max_probs >= threshold).float()
+            # --- 分支 1: 硬标签模式 (FixMatch) ---
+            if use_hard_label:
+                max_probs, pseudo_labels = resp.max(dim=1)
+                mask = (max_probs >= threshold).float()
+                y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
+                
+                # M-Step
+                t_train = torch.randint(0, cfg.timesteps, (x_0.size(0),), device=x_0.device).long()
+                noise = torch.randn_like(x_0)
+                x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
+                pred_noise = self.cond_denoiser(x_t_train, t_train, y_target)
+                
+                loss_per_sample = F.mse_loss(pred_noise, noise, reduction='none').view(x_0.size(0), -1).mean(dim=1)
+                dpm_loss = (loss_per_sample * mask).sum() / (mask.sum() + 1e-8)
+                mask_rate = mask.mean().item()
 
-            # 4. [核心策略] Hard Label
-            # 即使通过了阈值，也只给 One-hot 标签，绝不给模糊的 Soft Label
-            # 防止特征空间被稀释
-            y_hard = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
-            
-            # 5. M-Step: 带着伪标签去训练
-            t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
-            noise = torch.randn_like(x_0)
-            x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
-            
-            # 传入 Hard Label
-            pred_noise = self.cond_denoiser(x_t_train, t_train, y_hard)
-            
-            # 6. 计算 Loss (应用 Mask)
-            loss_per_sample = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-            
-            # 只有 mask=1 的样本产生梯度
-            dpm_loss = (loss_per_sample * mask).sum() / (mask.sum() + 1e-8)
-            
-            # 7. 辅助损失 (Entropy) - 可选，权重很低
+            # --- 分支 2: 软标签模式 (Soft-EM) [新增] ---
+            # 适用于无监督初期，防止坍塌
+            else:
+                y_target = resp # 直接用概率分布作为 Target
+                mask_rate = 1.0 # 所有样本都参与，不搞阈值
+                
+                # M-Step (Gumbel-Softmax 或 直接 Soft)
+                # 为了稳定，这里建议直接把 Softmax 概率喂进去，
+                # 但前提是你的 ConditionalUnet 支持 float 类型的 label (你的代码支持)
+                t_train = torch.randint(0, cfg.timesteps, (x_0.size(0),), device=x_0.device).long()
+                noise = torch.randn_like(x_0)
+                x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
+                pred_noise = self.cond_denoiser(x_t_train, t_train, y_target)
+                
+                # 损失：MSE * 权重(resp) ? 不，直接算 MSE 即可
+                # 因为 y_target 已经是混合 embedding 了，网络会自动学去噪
+                dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean')
+
+            # 辅助损失
             entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
             total_loss = dpm_loss + current_lambda * entropy
-
-            # [FATAL FIX] 彻底冻结 Prior 更新
-            # 在半监督初期，更新 Prior 极易导致 Mode Collapse (马太效应)。
-            # 我们强制保持 Prior 为均匀分布，让 MSE 决定一切。
-            # if self.training:
-            #     with torch.no_grad():
-            #         self.registered_pi.copy_(...) <--- 注释掉了
-
-            mask_rate = mask.mean().item()
+            
             return total_loss, -total_loss.item(), dpm_loss.item(), mask_rate, resp.detach(), None
-
 # -----------------------
 # Evaluation Utils
 # -----------------------
@@ -266,16 +261,35 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     for epoch in range(start_epoch, total_epochs + 1):
         progress = (epoch - 1) / total_epochs
         
-        # Scale: 保持 300 -> 600
-        dynamic_scale = 300.0 + (600.0 - 300.0) * progress
+    
+        if mode == "UNSUPERVISED":
+            # 1. 阶段划分
+            # 前 10 Epoch: 探索期 (Soft, Low Scale)
+            # 后期: 硬化期 (Hard, High Scale)
+            if epoch <= 10:
+                use_hard = False
+                # Scale 从 1.0 慢慢涨到 10.0 (非常低，让 MSE 自然竞争)
+                dynamic_scale = 1.0 + (10.0 - 1.0) * (epoch / 10)
+                dynamic_threshold = 0.0 # 不生效
+            else:
+                use_hard = True
+                # Scale 开始飙升: 10.0 -> 100.0
+                p2 = (epoch - 10) / (total_epochs - 10)
+                dynamic_scale = 10.0 + (100.0 - 10.0) * p2
+                # 阈值慢慢加上来
+                dynamic_threshold = 0.5 + (0.9 - 0.5) * p2
         
-        # [新增] Threshold 课程学习: 0.70 -> 0.95
-        # 无监督起步难，先降低门槛
-        dynamic_threshold = 0.70 + (0.95 - 0.70) * progress
+        else: 
+            # 半监督/监督模式维持原判
+            use_hard = True
+            dynamic_scale = 300.0 + (600.0 - 300.0) * progress
+            dynamic_threshold = 0.70 + (0.95 - 0.70) * progress
 
         if epoch % 5 == 0 or epoch == 1:
-            print(f"🔥 [Scheduler] Ep {epoch}: Scale={dynamic_scale:.1f}, Thres={dynamic_threshold:.2f}")
+            status = "HARD" if use_hard else "SOFT"
+            print(f"🔥 [Scheduler] Ep {epoch} ({status}): Scale={dynamic_scale:.1f}, Thres={dynamic_threshold:.2f}")
 
+        
         model.train()
         loss_accum = 0.0
         mask_rate_accum = 0.0
@@ -285,6 +299,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         current_alpha = cfg.alpha_unlabeled
         if mode == "SEMI_SUPERVISED" and epoch <= 5: 
             current_alpha = 0.0
+        
         
         # ==========================================
         # [修复] Iterator 分发逻辑
@@ -313,12 +328,13 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
                 x_un, _ = batch_un
                 x_un = x_un.to(cfg.device)
                 
-                # 传入 dynamic_threshold
+                # [修改] 传入 use_hard_label
                 l_unsup, _, _, mask_rate, _, _ = model(x_un, cfg, y=None, 
                                                        current_scale=dynamic_scale,
                                                        current_lambda=0.01,
-                                                       threshold=dynamic_threshold)
-                
+                                                       threshold=dynamic_threshold,
+                                                       use_hard_label=use_hard) # <--- 传入
+                # ...
                 total_loss += current_alpha * l_unsup
                 mask_rate_accum += mask_rate
 
@@ -352,7 +368,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
                                 os.path.join(sample_dir, f"epoch_{epoch:03d}.png"), cfg.device)
     
     return best_val_acc, {}
-    
+
 def main():
     cfg = Config()
     # 强制覆盖配置以确保 FixMatch 生效
