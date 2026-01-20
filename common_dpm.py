@@ -34,7 +34,7 @@ class Config:
         # ---------------------
         # PVEM 框架权重
         # ---------------------
-        self.alpha_unlabeled = 1        # 无标签数据损失的权重
+        self.alpha_unlabeled = 0.1        # 无标签数据损失的权重
         # self.lambda_entropy = 0.05         # 熵惩罚项的权重 (Minimization)
         
         # [NEW] 论文中的 M (Monte Carlo steps for posterior estimation)

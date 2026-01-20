@@ -101,24 +101,35 @@ class mDPM_SemiSup(nn.Module):
             
             # 仅用于指标监控 (Softmax)
             resp = F.softmax(logits, dim=1) 
+
             
             # === M-Step: Gumbel-Softmax Sampling ===
             # [关键修改] 使用可导的软采样
             # hard=False 表示我们需要软概率向量 (e.g., [0.1, 0.8, 0.1]) 而不是 One-hot
             # 这样梯度可以流向所有类别，如果不确定是类2还是类7，两个类都会得到更新
+            # [新增] 计算置信度权重
+            # 获取每个样本最大的概率值 (B,)
+            max_probs, _ = resp.max(dim=1)
+            
+            # [关键策略] 只有置信度 > 0.4 的样本才贡献 Loss
+            # 或者是软权重: weight = max_probs^2 (让确信的样本权重更大)
+            mask = (max_probs > 0.4).float() 
+
             y_soft = F.gumbel_softmax(logits, tau=gumbel_temp, hard=False)
             
-            # 构造训练数据
             t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
             
-            # [关键修改] 直接将软标签 y_soft 喂给 U-Net
-            # 你的 ConditionalUnet 代码中: if y_cond.dim() == 2: y_emb = y_cond @ weight
-            # 这使得 "混合条件" 成为可能
             pred_noise = self.cond_denoiser(x_t_train, t_train, y_soft)
             
-            dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean')
+            # 计算 element-wise MSE: (B, C, H, W) -> (B,)
+            loss_per_sample = F.mse_loss(pred_noise, noise, reduction='none').mean(dim=[1,2,3])
+            
+            # [关键] 应用 Mask，只训练高质量样本
+            # 加上一个极小值防止除以0
+            dpm_loss = (loss_per_sample * mask).sum() / (mask.sum() + 1e-8)
+        
             
             # === 辅助损失: 熵正则化 ===
             entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
@@ -360,7 +371,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         
         # 1. Dynamic Scale: 放大 Logits 差异
         # [修改] 提高起始值到 150，防止初期 Logits 太平滑导致 Gumbel 也是均匀分布
-        dynamic_scale = 150.0 + (400.0 - 150.0) * progress
+        dynamic_scale = 300.0 + (600.0 - 300.0) * progress
         
         # 2. Dynamic Lambda: 熵惩罚
         if epoch < 10: 
