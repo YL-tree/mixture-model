@@ -28,7 +28,7 @@ class Config:
         self.batch_size = 64
         self.final_epochs = 50
         self.optuna_epochs = 10 
-        self.lr = 2e-4                    # 学习率
+        self.lr = 5e-5                  # 学习率
         self.labeled_per_class = 100      # 每类用于监督学习的样本数 (无监督)
         
         # ---------------------
@@ -68,19 +68,17 @@ class Config:
 def get_time_weight(t, max_steps=1000):
     """
     返回一个随时间变化的权重系数，形状为 (Batch_Size, 1)
-    在中间时间步 (30% - 70%) 权重为 1.5 ~ 2.0 (增强)
-    在两头 (0% 或 100%) 权重为 0.1 ~ 0.5 (抑制)
     """
     # 归一化 t 到 [0, 1]
     t_norm = t.float() / max_steps
     
-    # 使用正弦波的半个周期: sin(0)=0, sin(pi/2)=1, sin(pi)=0
-    # 这样中间最大，两头最小
-    # 加上一个基数 base，保证不会完全变成 0
-    base = 0.5
-    peak = 15.0  # 中间时刻增强两倍
+    # 权重基数
+    base = 1.0
+    # 峰值强度 (不要太大，3.0 左右即可)
+    peak = 3.0  
     
     # weight = base + peak * sin(t * pi)
+    # 中间时刻增强，两头正常
     weights = base + peak * torch.sin(t_norm * torch.pi)
     
     return weights.view(-1, 1)
