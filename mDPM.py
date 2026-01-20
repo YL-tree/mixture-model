@@ -62,7 +62,7 @@ class mDPM_SemiSup(nn.Module):
         final_logits = log_pi + (avg_neg_mse * scale_factor)
         return final_logits
 
-    def forward(self, x_0, cfg, y=None, current_scale=100.0, current_lambda=0.0):
+    def forward(self, x_0, cfg, y=None, current_scale=100.0, current_lambda=0.0, threshold=0.95):
         """
         前向传播：根据 y 是否存在，自动选择 Supervised 或 FixMatch 路径
         """
@@ -97,7 +97,7 @@ class mDPM_SemiSup(nn.Module):
             # 3. [核心策略] 阈值过滤 (Thresholding)
             # 只有置信度极高 (>0.95) 的样本才允许进入训练
             # "要么非常确定，要么闭嘴"
-            threshold = 0.95
+            # 半监督的时候为0.95
             mask = (max_probs >= threshold).float()
 
             # 4. [核心策略] Hard Label
@@ -256,6 +256,14 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         
         # Scale: 起步要高，拉开差距 (300 -> 600)
         dynamic_scale = 300.0 + (600.0 - 300.0) * progress
+        # 2. [新增] Threshold 调度 (课程学习)
+        # 从 0.70 慢慢涨到 0.95
+        # 如果一开始就是 0.95，无监督冷启动可能会直接死锁 (Pass Rate=0)
+        dynamic_threshold = 0.70 + (0.95 - 0.70) * progress
+        # 打印看看当前门槛
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"🔥 [Scheduler] Ep {epoch}: Scale={dynamic_scale:.1f}, Threshold={dynamic_threshold:.2f}")
+
         # Lambda: 很小
         dynamic_lambda = 0.01
 
@@ -285,17 +293,19 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
                 x, y = x.to(cfg.device), y.to(cfg.device).long()
                 l_sup, _, _, _, _, _ = model(x, cfg, y=y)
                 total_loss += l_sup
-
+            
             # B. 无标签 (FixMatch)
             if batch_un is not None and current_alpha > 0:
                 x_un, _ = batch_un # 这里不需要y_un_true了，不再打印Acc
                 x_un = x_un.to(cfg.device)
                 
                 # 这里不再传 gumbel_temp，只传 scale
+                # [修改] 传入 dynamic_threshold
                 l_unsup, _, _, mask_rate, _, _ = model(x_un, cfg, y=None, 
                                                        current_scale=dynamic_scale,
-                                                       current_lambda=dynamic_lambda)
-                
+                                                       current_lambda=dynamic_lambda,
+                                                       threshold=dynamic_threshold) # <--- 传入
+                                                       
                 total_loss += current_alpha * l_unsup
                 mask_rate_accum += mask_rate
 
