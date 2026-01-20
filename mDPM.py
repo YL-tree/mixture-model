@@ -63,12 +63,29 @@ class mDPM_SemiSup(nn.Module):
                     mse = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
                     accum_log_lik[:, k] += -mse
 
-        # [修改] 使用传入的动态 Scale
-        accum_log_lik = accum_log_lik * scale_factor
+        # ==========================================
+        # 🛡️ [最终安全锁] Z-Score Normalization
+        # ==========================================
+        # 计算每个样本在 10 个类别上的均值和标准差
+        # (Batch, 10) -> (Batch, 1)
+        mean_lik = accum_log_lik.mean(dim=1, keepdim=True)
+        std_lik = accum_log_lik.std(dim=1, keepdim=True)
+        
+        # 标准化：强制拉开差距，不管原始 MSE 差别多小
+        # 加上 1e-8 防止除以 0
+        normalized_lik = (accum_log_lik - mean_lik) / (std_lik + 1e-8)
+        
+        # 现在 normalized_lik 的数值大约在 -2 到 +2 之间
+        # 我们给它一个固定的 Scale (Temperature)，比如 10.0
+        # 这样 Softmax 出来的分布就会非常尖锐 (Confident)
+        # 这里的 10.0 不需要动态调整了，因为输入已经被标准化了
+        final_scale = 10.0 
         
         log_pi = torch.log(self.registered_pi + 1e-8).unsqueeze(0)
-        final_logits = log_pi + (accum_log_lik / M)
         
+        # Logits = Prior + Likelihood
+        final_logits = log_pi + (normalized_lik * final_scale)
+
         return final_logits
 
     # [修改] 增加 current_scale 和 current_lambda 参数
@@ -264,7 +281,14 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         
         # === 动态退火调度器 ===
         progress = epoch / total_epochs
-        dynamic_scale = 3.0 + (10.0 - 3.0) * progress
+        # dynamic_scale = 3.0 + (10.0 - 3.0) * progress
+        
+        
+        # [修改] 动态 Scale 范围
+        # 之前是 3.0 -> 10.0
+        # 现在针对 T=1000，改为 100.0 -> 500.0
+        # 前期 100 倍放大，后期 500 倍放大 (Hard-EM)
+        dynamic_scale = 100.0 + (500.0 - 100.0) * progress
         
         if epoch < 20:
             dynamic_lambda = 0.0
