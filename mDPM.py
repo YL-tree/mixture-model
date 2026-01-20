@@ -92,31 +92,35 @@ class mDPM_SemiSup(nn.Module):
             return dpm_loss, -dpm_loss.item(), dpm_loss.item(), 0.0, None, None
             
         # -------------------
-        # 无监督模式 (Unlabeled Data) - Hard-EM
+        # 无监督模式 (Unlabeled Data) - 改为 Gumbel-Softmax
         # -------------------
         else:
             # === E-Step: 推断潜变量 y 的分布 ===
+            # 获取 Logits (注意：Scale 依然很重要，Logits 差异过小会导致 Gumbel 输出趋向均匀)
             logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=current_scale)
-            resp = F.softmax(logits, dim=1) # Shape: (B, K)
             
-            # === M-Step: Hard Sampling (伪标签) ===
-            # 论文做法: 从后验分布中采样类别
-            pseudo_y = torch.multinomial(resp, 1).squeeze(1) # (B,)
+            # 仅用于指标监控 (Softmax)
+            resp = F.softmax(logits, dim=1) 
+            
+            # === M-Step: Gumbel-Softmax Sampling ===
+            # [关键修改] 使用可导的软采样
+            # hard=False 表示我们需要软概率向量 (e.g., [0.1, 0.8, 0.1]) 而不是 One-hot
+            # 这样梯度可以流向所有类别，如果不确定是类2还是类7，两个类都会得到更新
+            y_soft = F.gumbel_softmax(logits, tau=gumbel_temp, hard=False)
             
             # 构造训练数据
             t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
             
-            # 使用伪标签作为条件
-            y_onehot_pseudo = F.one_hot(pseudo_y, num_classes=cfg.num_classes).float()
+            # [关键修改] 直接将软标签 y_soft 喂给 U-Net
+            # 你的 ConditionalUnet 代码中: if y_cond.dim() == 2: y_emb = y_cond @ weight
+            # 这使得 "混合条件" 成为可能
+            pred_noise = self.cond_denoiser(x_t_train, t_train, y_soft)
             
-            # 计算 DPM Loss
-            pred_noise = self.cond_denoiser(x_t_train, t_train, y_onehot_pseudo)
             dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean')
             
-            # === 辅助损失: 熵正则化 (Minimization) ===
-            # 鼓励模型做出确信的预测
+            # === 辅助损失: 熵正则化 ===
             entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
             
             total_loss = dpm_loss + current_lambda * entropy
@@ -124,8 +128,8 @@ class mDPM_SemiSup(nn.Module):
             # === Update Prior (Momentum) ===
             if self.training:
                 with torch.no_grad():
-                    # 动量更新，防止震荡
-                    momentum = 0.99
+                    # 稍微减慢更新速度，防止初期波动
+                    momentum = 0.995 
                     current_counts = resp.mean(0).detach()
                     self.registered_pi.copy_(momentum * self.registered_pi + (1 - momentum) * current_counts)
             
@@ -315,115 +319,170 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     best_val_nmi = -np.inf
     metrics = {"Loss": [], "NMI": [], "Acc": []}
 
-    # === Resume Logic ===
+    # ==========================================
+    # 🔄 Resume Logic (断点续训)
+    # ==========================================
     if resume_path and os.path.exists(resume_path):
         print(f"🔄 Resuming from: {resume_path}")
         checkpoint = torch.load(resume_path, map_location=cfg.device)
+        
         model.load_state_dict(checkpoint['model_state_dict'])
         if 'optimizer_state_dict' in checkpoint and optimizer is not None:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
         start_epoch = checkpoint['epoch'] + 1
         best_val_nmi = checkpoint.get('best_nmi', -np.inf)
         print(f"✅ Resumed at Epoch {start_epoch}, Best NMI: {best_val_nmi:.4f}")
+    else:
+        if resume_path:
+            print(f"⚠️ Checkpoint not found at {resume_path}, starting from scratch.")
 
-    # Detect Mode
+    # ==========================================
+    # Detect Mode (模式检测)
+    # ==========================================
     mode = "UNKNOWN"
-    if labeled_loader is not None and unlabeled_loader is not None: mode = "SEMI_SUPERVISED"
-    elif labeled_loader is not None: mode = "SUPERVISED"; cfg.alpha_unlabeled = 0.0
-    elif unlabeled_loader is not None: mode = "UNSUPERVISED"
+    if labeled_loader is not None and unlabeled_loader is not None: 
+        mode = "SEMI_SUPERVISED"
+    elif labeled_loader is not None: 
+        mode = "SUPERVISED"
+        cfg.alpha_unlabeled = 0.0
+    elif unlabeled_loader is not None: 
+        mode = "UNSUPERVISED"
+    
     print(f"🚀 Training Mode: {mode}")
 
+    # ==========================================
     # Training Loop
+    # ==========================================
     for epoch in range(start_epoch, total_epochs + 1):
-        # === Dynamic Scheduler ===
-        # Scale: 50 -> 300 (适应 Raw MSE)
-        progress = epoch / total_epochs
-        dynamic_scale = 50.0 + (300.0 - 50.0) * progress
+        # --- Schedulers (关键参数调度) ---
+        progress = (epoch - 1) / total_epochs # 0.0 -> 1.0
         
-        # Lambda: 0.0 -> 0.2 (后期增强熵惩罚)
-        if epoch < 10: dynamic_lambda = 0.0
-        else: dynamic_lambda = 0.0 + (0.2) * ((epoch - 10) / (total_epochs - 10))
+        # 1. Dynamic Scale: 放大 Logits 差异
+        # [修改] 提高起始值到 150，防止初期 Logits 太平滑导致 Gumbel 也是均匀分布
+        dynamic_scale = 150.0 + (400.0 - 150.0) * progress
+        
+        # 2. Dynamic Lambda: 熵惩罚
+        if epoch < 10: 
+            dynamic_lambda = 0.0
+        else: 
+            dynamic_lambda = 0.0 + (0.2) * ((epoch - 10) / (max(1, total_epochs - 10)))
+        
+        # 3. [新增] Gumbel Temperature: 探索 -> 确定
+        # 初期 1.0 (平滑，探索所有类)，后期 0.5 (尖锐，接近 One-hot)
+        gumbel_temp = 1.0 - (0.5 * progress)
         
         if epoch % 5 == 0 or epoch == 1:
-            print(f"🔥 [Scheduler] Epoch {epoch}: Scale={dynamic_scale:.1f}, Lambda={dynamic_lambda:.4f}")
+            print(f"🔥 [Scheduler] Ep {epoch}: Scale={dynamic_scale:.1f}, Lambda={dynamic_lambda:.4f}, Temp={gumbel_temp:.2f}")
 
         model.train()
         loss_accum = 0.0
         n_batches = 0
         
-        # Warm-up alpha
+        # Warm-up alpha (前5轮不进行无监督训练，先学好 backbone)
         current_alpha_un = cfg.alpha_unlabeled
-        if mode == "SEMI_SUPERVISED" and epoch <= 5: current_alpha_un = 0.0
+        if mode == "SEMI_SUPERVISED" and epoch <= 5: 
+            current_alpha_un = 0.0
         
         # Iterator Setup
-        if mode == "SEMI_SUPERVISED": iterator = zip(itertools.cycle(labeled_loader), unlabeled_loader)
-        elif mode == "SUPERVISED": iterator = ((batch, None) for batch in labeled_loader)
-        elif mode == "UNSUPERVISED": iterator = ((None, batch) for batch in unlabeled_loader)
+        if mode == "SEMI_SUPERVISED": 
+            iterator = zip(itertools.cycle(labeled_loader), unlabeled_loader)
+        elif mode == "SUPERVISED": 
+            iterator = ((batch, None) for batch in labeled_loader)
+        elif mode == "UNSUPERVISED": 
+            iterator = ((None, batch) for batch in unlabeled_loader)
 
         for batch_lab, batch_un in iterator:
             optimizer.zero_grad()
             total_loss = torch.tensor(0.0, device=cfg.device)
             resp = None 
 
-            # Labeled
+            # --- A. Supervised Part ---
             if batch_lab is not None:
                 x_lab, y_lab = batch_lab
                 x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device).long()
-                loss_lab, _, _, _, _, _ = model(x_lab, cfg, y_lab)
+                loss_lab, _, _, _, _, _ = model(x_lab, cfg, y=y_lab) # y is provided
                 total_loss += loss_lab
 
-            # Unlabeled
+            # --- B. Unsupervised Part (Gumbel-Softmax) ---
             if batch_un is not None and current_alpha_un > 0:
                 # [修复] 正确解包，获取 y_un_true 用于 Debug
                 x_un, y_un_true = batch_un 
                 x_un = x_un.to(cfg.device)
                 y_un_true = y_un_true.to(cfg.device)
                 
-                loss_un, _, _, _, resp, _ = model(x_un, cfg, None, 
+                # 调用 forward，传入 gumbel_temp
+                loss_un, _, _, _, resp, _ = model(x_un, cfg, y=None, 
                                                   current_scale=dynamic_scale, 
-                                                  current_lambda=dynamic_lambda)
+                                                  current_lambda=dynamic_lambda,
+                                                  gumbel_temp=gumbel_temp) # <--- 传入温度
+                
                 total_loss += current_alpha_un * loss_un
                 
-                # === 深度监控 ===
+                # === 深度监控 (Deep Monitoring) ===
+                # 每 50 个 batch 打印一次，观察是否发生 Mode Collapse
                 if n_batches % 50 == 0:
                     with torch.no_grad():
+                        # resp 是 Softmax 后的概率，用于观察模型"想"选哪个
                         pseudo_labels = resp.argmax(dim=1)
+                        
+                        # 计算伪标签准确率 (仅供参考，不参与梯度)
                         acc_unsup = (pseudo_labels == y_un_true).float().mean().item()
+                        
+                        # 计算平均置信度
                         conf = resp.max(dim=1)[0].mean().item()
+                        
+                        # 统计类别分布 (最重要！检查是否全部分到了某一类)
                         class_counts = torch.bincount(pseudo_labels, minlength=cfg.num_classes).cpu().numpy()
-                        # 仅打印简要信息
+                        
                         print(f"   [Debug] Unsup Acc: {acc_unsup:.2f} | Conf: {conf:.2f} | Dist: {class_counts}")
 
+            # Optimization
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             loss_accum += total_loss.item()
             n_batches += 1
 
-        # Validation
+        # ==========================================
+        # Validation & Checkpointing
+        # ==========================================
+        # 这里的验证比较耗时，但很有必要
         raw_acc, _, val_nmi = evaluate_model(model, val_loader, cfg)
         target_metric = raw_acc if mode == "SUPERVISED" else val_nmi
         
-        # === Checkpointing ===
-        # Save Last
-        ckpt = {
+        # 准备 Checkpoint 数据
+        checkpoint_dict = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'best_nmi': best_val_nmi
+            'best_nmi': best_val_nmi,
+            'config': cfg.__dict__
         }
-        torch.save(ckpt, os.path.join(cfg.output_dir, "checkpoint_last.pt"))
         
-        # Save Best
+        # 1. 保存 "Latest" (用于 Resume)
+        last_ckpt_path = os.path.join(cfg.output_dir, "checkpoint_last.pt")
+        torch.save(checkpoint_dict, last_ckpt_path)
+
+        # 2. 保存 "Periodic" (每10轮备份，防止跑崩了没后悔药)
+        if epoch % 10 == 0:
+            periodic_path = os.path.join(cfg.output_dir, f"checkpoint_epoch_{epoch:03d}.pt")
+            torch.save(checkpoint_dict, periodic_path)
+            print(f"   💾 [Backup] Periodic checkpoint saved: {periodic_path}")
+
+        # 3. 保存 "Best" (最佳指标)
         if target_metric > best_val_nmi:
             best_val_nmi = target_metric
             if is_final_training:
                 torch.save(model.state_dict(), os.path.join(cfg.output_dir, "best_model.pt"))
-                print(f"   ★ New Best! NMI: {best_val_nmi:.4f}")
+                torch.save(checkpoint_dict, os.path.join(cfg.output_dir, "checkpoint_best.pt"))
+                print(f"   ★ New Best Model Saved! (NMI: {best_val_nmi:.4f})")
 
+        # Log
         log_tag = "FINAL" if is_final_training else f"TRIAL-{trial_id}"
         print(f"[{log_tag}] Ep {epoch} | Loss: {loss_accum/n_batches:.4f} | Acc: {raw_acc:.4f} | NMI: {val_nmi:.4f}")
 
+        # 采样看图
         if is_final_training and (epoch % 10 == 0 or epoch == total_epochs):
             sample_and_save_dpm(model.cond_denoiser, model.dpm_process, cfg.num_classes,
                                 os.path.join(sample_dir, f"epoch_{epoch:03d}.png"), cfg.device)
