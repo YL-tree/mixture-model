@@ -118,20 +118,24 @@ class mDPM_SemiSup(nn.Module):
             loss_per_sample = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
             dpm_loss = (loss_per_sample * mask).sum() / (mask.sum() + 1e-8)
             
-            # === 3. 关键的熵正则化 (Entropy Regularization) ===
+            # # === 3. 关键的熵正则化 (Entropy Regularization) ===
             
-            # (A) 最小化个体熵 (Be Confident): 希望每个样本的预测尽可能尖锐
-            # 惩罚 [0.1, 0.1...] 这种不自信的预测
-            entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
+            # # (A) 最小化个体熵 (Be Confident): 希望每个样本的预测尽可能尖锐
+            # # 惩罚 [0.1, 0.1...] 这种不自信的预测
+            # entropy = -(resp * torch.log(resp + 1e-8)).sum(dim=1).mean()
             
-            # (B) 最大化全局边缘熵 (Be Diverse): 希望 Batch 内的类别分布尽可能均匀
-            # 惩罚所有样本都分到同一类的情况 (Mode Collapse)
-            avg_prob = resp.mean(dim=0)
-            marginal_entropy = -(avg_prob * torch.log(avg_prob + 1e-8)).sum()
+            # # (B) 最大化全局边缘熵 (Be Diverse): 希望 Batch 内的类别分布尽可能均匀
+            # # 惩罚所有样本都分到同一类的情况 (Mode Collapse)
+            # avg_prob = resp.mean(dim=0)
+            # marginal_entropy = -(avg_prob * torch.log(avg_prob + 1e-8)).sum()
             
-            # 组合 Loss: DPM Loss + 0.1*自信 - 0.5*多样性
-            # 在无监督初期，这个 Marginal Entropy 至关重要！
-            total_loss = dpm_loss + 0.1 * entropy - 0.5 * marginal_entropy
+            # # 组合 Loss: DPM Loss + 0.1*自信 - 0.5*多样性
+            # # 在无监督初期，这个 Marginal Entropy 至关重要！
+            # total_loss = dpm_loss + 0.01 * entropy - 0.05 * marginal_entropy
+            # [核心修改] 只保留 MSE！移除所有熵项！
+            # 依靠 Multinomial Sampling 的随机性来防止坍塌
+            
+            total_loss = dpm_loss
 
             # 暂时冻结 Prior (防止马太效应)
             # if self.training: ...
@@ -261,25 +265,27 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         # [核心调度器] 探索(Exploration) -> 利用(Exploitation)
         # ==========================================
         if mode == "UNSUPERVISED":
-            # Phase 1: 探索期 (Ep 1-15)
-            # 使用 Multinomial 采样，Scale 适中，不设阈值
+            # Phase 1: 探索 (Ep 1-15)
             if epoch <= 15:
                 use_hard = False
-                # Scale: 20 -> 50 (让概率分布稍微尖锐一点，不要完全平均)
-                dynamic_scale = 20.0 + (50.0 - 20.0) * (epoch / 15)
+                # Scale: 5.0 -> 20.0 (不要太高，让 Multinomial 保持随机性)
+                dynamic_scale = 5.0 + (20.0 - 5.0) * (epoch / 15)
                 dynamic_threshold = 0.0 
-                status = "EXPLORE(Multinomial)"
+                status = "EXPLORE"
             
-            # Phase 2: 精炼期 (Ep 16+)
-            # 切换回 FixMatch (Argmax)，提高 Scale，开启阈值过滤
+            # Phase 2: 精炼 (Ep 16+)
             else:
                 use_hard = True
                 p2 = (epoch - 15) / (total_epochs - 15)
-                # Scale: 50 -> 300 (非常自信)
-                dynamic_scale = 50.0 + (300.0 - 50.0) * p2
-                # Threshold: 0.5 -> 0.95
-                dynamic_threshold = 0.5 + (0.95 - 0.5) * p2
-                status = "REFINE(FixMatch)"
+                # Scale: 20.0 -> 150.0 (慢慢变自信)
+                dynamic_scale = 20.0 + (150.0 - 20.0) * p2
+                
+                # [核心修改] 起始阈值设为 0.0！
+                # 刚切换模式时，让所有样本都通过，防止 Loss=0
+                # 然后慢慢涨到 0.95
+                dynamic_threshold = 0.0 + (0.95 - 0.0) * p2
+                
+                status = "REFINE"
         
         else: 
             # 半监督/监督模式保持原样
