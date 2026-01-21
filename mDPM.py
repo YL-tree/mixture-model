@@ -277,13 +277,15 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
             else:
                 use_hard = True
                 p2 = (epoch - 15) / (total_epochs - 15)
+                p3 = (epoch - 51) / (total_epochs - 51)
                 # Scale: 20.0 -> 150.0 (慢慢变自信)
-                dynamic_scale = 20.0 + (150.0 - 20.0) * p2
-                
+                # dynamic_scale = 150.0 + (250.0 - 150.0) * p3
+                dynamic_scale = 150.0
                 # [核心修改] 起始阈值设为 0.0！
                 # 刚切换模式时，让所有样本都通过，防止 Loss=0
                 # 然后慢慢涨到 0.95
-                dynamic_threshold = 0.0 + (0.95 - 0.0) * p2
+                # dynamic_threshold = 0.0 + (0.6 - 0.0) * p3
+                dynamic_threshold = 0.0
                 
                 status = "REFINE"
         
@@ -368,6 +370,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     return best_val_acc, {}
 
 def main():
+    RESUME_TRAINING = True
     cfg = Config()
     
     # 强制配置为无监督模式
@@ -385,8 +388,8 @@ def main():
     labeled_loader, unlabeled_loader, val_loader = get_semi_loaders(cfg)
     
     # 从头开始训练
-    resume_path = None # os.path.join(cfg.output_dir, "checkpoint_last.pt")
-    
+    # resume_path = None # os.path.join(cfg.output_dir, "checkpoint_last.pt")
+    resume_path = os.path.join(cfg.output_dir, "best_model.pt")
     run_training_session(
         model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg, 
         is_final_training=True,

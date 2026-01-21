@@ -17,7 +17,7 @@ def verify_model_performance(model_path="mDPM_results_semisupervised/best_model.
     # 2. 加载模型
     model = mDPM_SemiSup(cfg).to(device)
     try:
-        checkpoint = torch.load(model_path, map_location=device)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
         # 兼容只保存了 state_dict 或保存了完整 checkpoint 的情况
         if 'model_state_dict' in checkpoint:
             model.load_state_dict(checkpoint['model_state_dict'])

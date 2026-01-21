@@ -26,9 +26,9 @@ class Config:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.output_dir = "./mDPM_results_unsupervised"
         self.batch_size = 64
-        self.final_epochs = 50
+        self.final_epochs = 100
         self.optuna_epochs = 10 
-        self.lr = 5e-5                  # 学习率
+        self.lr = 1e-5                  # 学习率
         self.labeled_per_class = 0      # 每类用于监督学习的样本数 (无监督)
         
         # ---------------------
