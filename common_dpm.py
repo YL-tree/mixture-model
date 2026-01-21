@@ -24,7 +24,7 @@ class Config:
         # ---------------------
         # 自动检测可用设备
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.output_dir = "./mDPM_results_unsupervised"
+        self.output_dir = "./mDPM_results_unsupervised_optuna"
         self.batch_size = 64
         self.final_epochs = 100
         self.optuna_epochs = 10 
