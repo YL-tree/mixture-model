@@ -311,7 +311,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
             if epoch % 5 == 0:
                 sample_and_save_dpm(model.cond_denoiser, model.dpm_process, cfg.num_classes,
                                     os.path.join(sample_dir, f"epoch_{epoch:03d}.png"), cfg.device)
-                                    
+
     return best_val_acc, {}
 
 # -----------------------
@@ -364,55 +364,86 @@ def objective(trial):
     
     return accuracy
 
+# mDPM.py 中的 main 函数替换为以下内容：
+
 def main():
     # ==========================
-    # 开关：选择模式
+    # 全自动开关
     # ==========================
-    RUN_OPTUNA = True  # True=搜参数, False=用最佳参数跑最终训练
+    # True: 先搜参数，搜完自动跑最终训练
+    # False: 跳过搜索，直接用下方手动指定的参数跑最终训练
+    ENABLE_AUTO_SEARCH = True 
     
-    if RUN_OPTUNA:
-        print("🔍 Starting Optuna Hyperparameter Search...")
-        # 创建 Study
-        study = optuna.create_study(direction="maximize")
+    cfg = Config()
+    
+    # 强制配置
+    cfg.alpha_unlabeled = 1.0
+    cfg.labeled_per_class = 0
+    cfg.posterior_sample_steps = 5 
+    
+    # -------------------------------------------
+    # 步骤 1: 参数搜索 (Optuna)
+    # -------------------------------------------
+    if ENABLE_AUTO_SEARCH:
+        print("🔍 [Step 1] Starting Optuna Hyperparameter Search...")
         
-        # 运行搜索 (比如搜 20 次)
-        study.optimize(objective, n_trials=20)
+        # 定义搜索轮数 (比如搜 20 次)
+        n_trials = 20 
+        
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=n_trials)
         
         print("\n" + "="*40)
         print("🎉 Search Finished!")
-        print("Best Trial:")
-        print(f"  Value (Acc): {study.best_value:.4f}")
-        print("  Params: ")
-        for key, value in study.best_params.items():
-            print(f"    {key}: {value}")
+        print(f"  Best Acc: {study.best_value:.4f}")
+        print("  Best Params found:")
+        for k, v in study.best_params.items():
+            print(f"    {k}: {v}")
         print("="*40)
         
-    else:
-        # 使用手动指定的参数或 Optuna 搜出来的参数跑最终模型
-        cfg = Config()
-        cfg.alpha_unlabeled = 1.0
-        cfg.labeled_per_class = 0
-        cfg.final_epochs = 60 # 最终训练可以跑久一点
-        
-        # 将上面搜出来的最佳参数填入这里
+        # 提取最佳参数
         best_params = {
-            'target_scale': 150.0,  # 替换为 Optuna 结果
+            'target_scale': study.best_params['target_scale'],
+            'warmup_epochs': study.best_params['warmup_epochs'],
+            'threshold_final': study.best_params['threshold_final']
+        }
+        best_lr = study.best_params['lr']
+        
+    else:
+        # 如果不搜参数，就用这里手动指定的默认值
+        print("⏩ [Step 1] Skipping Search, using manual params...")
+        best_params = {
+            'target_scale': 150.0,
             'warmup_epochs': 15,
             'threshold_final': 0.0
         }
-        best_lr = 1e-4              # 替换为 Optuna 结果
-        
-        print(f"🚀 Running Final Training with Params: {best_params}")
-        
-        model = mDPM_SemiSup(cfg).to(cfg.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
-        _, unlabeled_loader, val_loader = get_semi_loaders(cfg)
-        
-        run_training_session(
-            model, optimizer, None, unlabeled_loader, val_loader, cfg, 
-            is_final_training=True,
-            hyperparams=best_params
-        )
+        best_lr = 1e-4
+
+    # -------------------------------------------
+    # 步骤 2: 最终训练 (Final Training)
+    # -------------------------------------------
+    print("\n🚀 [Step 2] Starting Final Training with BEST parameters...")
+    print(f"   Configs: LR={best_lr:.2e}, Params={best_params}")
+    
+    # 设置最终训练的时长
+    cfg.final_epochs = 100 
+    
+    # [关键] 必须重新实例化模型和优化器，确保是从头开始训练
+    model = mDPM_SemiSup(cfg).to(cfg.device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
+    _, unlabeled_loader, val_loader = get_semi_loaders(cfg)
+    
+    # 运行最终训练
+    # 注意：这里我们传入 best_params，并没有传入 resume_path，
+    # 意味着它是用最佳参数“从零开始”跑一个完美的 100 轮。
+    run_training_session(
+        model, optimizer, None, unlabeled_loader, val_loader, cfg, 
+        is_final_training=True,
+        hyperparams=best_params
+    )
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
