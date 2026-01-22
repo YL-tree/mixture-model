@@ -205,6 +205,11 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
 
     start_epoch = 1
     best_val_acc = 0.0
+
+    metrics = {
+        "DPM_Loss": [],      # 记录 Loss
+        "PosteriorAcc": []   # 记录 Accuracy
+    }
     
     # 模式检测
     mode = "UNSUPERVISED" # 强制无监督
@@ -277,20 +282,36 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            
-        # [Optuna Pruning] 如果表现太差，提前终止
+        # [Optuna Pruning] 保持不变
         if trial is not None:
             trial.report(val_acc, epoch)
             if trial.should_prune():
                 raise optuna.exceptions.TrialPruned()
 
+        # 计算平均 Loss
+        avg_loss = loss_accum / n_batches if n_batches > 0 else 0.0
+        avg_mask = mask_rate_accum / n_batches if n_batches > 0 else 0
+        
+        # [新增 2] 记录数据并绘图
+        metrics["DPM_Loss"].append(avg_loss)
+        metrics["PosteriorAcc"].append(val_acc)
+        
+        # 每一轮都更新图片
+        # 如果是 Optuna 搜索，文件名可以加上 trial id 防止覆盖，或者就叫 training_curves.png 实时看
+        if trial is not None:
+            curve_name = f"optuna_trial_{trial.number}_curve.png"
+        else:
+            curve_name = "training_curves_final.png"
+            
+        plot_path = os.path.join(cfg.output_dir, curve_name)
+        plot_training_curves(metrics, plot_path)
+
         if is_final_training:
-            avg_mask = mask_rate_accum / n_batches if n_batches > 0 else 0
-            print(f"Ep {epoch} | Loss: {loss_accum/n_batches:.4f} | Val Acc: {val_acc:.4f} | Pass: {avg_mask*100:.1f}%")
+            print(f"Ep {epoch} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | Pass: {avg_mask*100:.1f}%")
             if epoch % 5 == 0:
                 sample_and_save_dpm(model.cond_denoiser, model.dpm_process, cfg.num_classes,
                                     os.path.join(sample_dir, f"epoch_{epoch:03d}.png"), cfg.device)
-    
+                                    
     return best_val_acc, {}
 
 # -----------------------
