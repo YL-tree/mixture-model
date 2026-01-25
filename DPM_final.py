@@ -1,85 +1,131 @@
 # mDPM.py
-import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import optuna
-from optuna.trial import TrialState
 import os
-import gc
+import random
 import numpy as np
-import matplotlib.pyplot as plt  # [新增] 绘图库
+import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
-from sklearn.metrics import normalized_mutual_info_score as NMI # [新增] NMI指标
+from sklearn.metrics import normalized_mutual_info_score as NMI
 from torchvision.utils import save_image
 import itertools
 from common_dpm import *
 
+# [新增] 引入生成质量指标库
+try:
+    from torchmetrics.image.fid import FrechetInceptionDistance
+    from torchmetrics.image.inception import InceptionScore
+    HAS_METRICS = True
+except ImportError:
+    print("⚠️ Warning: torchmetrics not installed. FID/IS will be skipped.")
+    print("   Please run: pip install torchmetrics torch-fidelity")
+    HAS_METRICS = False
+
 # -----------------------
-# 1. 绘图辅助函数 (仪表盘)
+# 0. 随机种子设置 (Reproducibility)
+# -----------------------
+def set_seed(seed=42):
+    """锁定所有随机种子，确保实验可复现"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"🔒 Seed locked to {seed}")
+
+# -----------------------
+# 1. 绘图辅助函数 (升级版仪表盘)
 # -----------------------
 def plot_advanced_curves(history, outpath):
     """
-    绘制 6 张子图的仪表盘：
-    1. Loss 曲线
-    2. Accuracy & NMI 曲线
-    3. Pass Rate (通过率)
-    4. Scale (放大倍数)
-    5. Threshold (门槛)
-    6. Learning Rate / Info
+    绘制 2x4 仪表盘：
+    Row 1: Loss, Acc & NMI, Pass Rate, FID (New)
+    Row 2: Scale, Threshold, IS (New), Text Info
     """
-    # 确保数据长度一致
     n = len(history["loss"])
     epochs = range(1, n + 1)
     
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle(f'Training Dashboard (Ep {n})', fontsize=16)
+    # 过滤出有 FID/IS 数据的 epoch (因为不是每轮都算)
+    fid_epochs = [x[0] for x in history["fid"]]
+    fid_values = [x[1] for x in history["fid"]]
+    is_epochs = [x[0] for x in history["is_score"]]
+    is_values = [x[1] for x in history["is_score"]]
     
-    # Subplot 1: Loss
+    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+    fig.suptitle(f'Training Dashboard (Ep {n})', fontsize=18)
+    
+    # 1. Loss
     ax = axes[0, 0]
     ax.plot(epochs, history["loss"], 'b-', label='MSE Loss')
     ax.set_title('Training Loss')
-    ax.set_xlabel('Epoch')
     ax.grid(True, alpha=0.3)
     ax.legend()
     
-    # Subplot 2: Metrics (Acc & NMI)
+    # 2. Acc & NMI
     ax = axes[0, 1]
     ax.plot(epochs, history["acc"], 'r-', label='Accuracy')
     if "nmi" in history and len(history["nmi"]) > 0:
         ax.plot(epochs, history["nmi"], 'g--', label='NMI')
-    ax.set_title('Clustering Performance')
-    ax.set_ylim(0, 1.0) # 0% - 100%
+    ax.set_title('Clustering (Acc/NMI)')
+    ax.set_ylim(0, 1.0)
     ax.grid(True, alpha=0.3)
     ax.legend()
     
-    # Subplot 3: Pass Rate
+    # 3. Pass Rate
     ax = axes[0, 2]
     ax.plot(epochs, history["pass_rate"], 'm-', label='Pass Rate')
-    ax.set_title('Pass Rate (Samples Used)')
+    ax.set_title('Pass Rate')
     ax.set_ylim(0, 105)
     ax.grid(True, alpha=0.3)
     
-    # Subplot 4: Scale Schedule
+    # 4. [New] FID Score
+    ax = axes[0, 3]
+    if len(fid_values) > 0:
+        ax.plot(fid_epochs, fid_values, 'k-o', label='FID (Lower is better)')
+        ax.set_title('FID Score (Image Quality)')
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, 'FID not calculated', ha='center')
+    ax.grid(True, alpha=0.3)
+    
+    # 5. Scale
     ax = axes[1, 0]
-    ax.plot(epochs, history["scale"], 'c-', label='Scale Factor')
-    ax.set_title('Dynamic Scale (Confidence)')
+    ax.plot(epochs, history["scale"], 'c-', label='Scale')
+    ax.set_title('Dynamic Scale')
     ax.grid(True, alpha=0.3)
     
-    # Subplot 5: Threshold Schedule
+    # 6. Threshold
     ax = axes[1, 1]
-    ax.plot(epochs, history["threshold"], 'k-', label='Threshold')
-    ax.set_title('Dynamic Threshold (Filter)')
+    ax.plot(epochs, history["threshold"], 'orange', label='Threshold')
+    ax.set_title('Dynamic Threshold')
     ax.grid(True, alpha=0.3)
     
-    # Subplot 6: Text Info
+    # 7. [New] Inception Score
     ax = axes[1, 2]
+    if len(is_values) > 0:
+        ax.plot(is_epochs, is_values, 'b-o', label='IS (Higher is better)')
+        ax.set_title('Inception Score')
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, 'IS not calculated', ha='center')
+    ax.grid(True, alpha=0.3)
+    
+    # 8. Text Info
+    ax = axes[1, 3]
     ax.axis('off')
+    current_fid = fid_values[-1] if len(fid_values) > 0 else "N/A"
+    current_is = is_values[-1] if len(is_values) > 0 else "N/A"
+    
     info_text = (f"Current Acc: {history['acc'][-1]:.4f}\n"
-                 f"Best Acc: {max(history['acc']):.4f}\n"
-                 f"Scale: {history['scale'][-1]:.1f}\n"
-                 f"Pass Rate: {history['pass_rate'][-1]:.1f}%")
-    ax.text(0.1, 0.5, info_text, fontsize=14, family='monospace')
+                 f"Best Acc:    {max(history['acc']):.4f}\n"
+                 f"Current FID: {current_fid}\n"
+                 f"Current IS:  {current_is}\n"
+                 f"Scale:       {history['scale'][-1]:.1f}")
+    ax.text(0.1, 0.5, info_text, fontsize=16, family='monospace')
     
     plt.tight_layout()
     plt.savefig(outpath)
@@ -132,7 +178,7 @@ class mDPM_SemiSup(nn.Module):
     def forward(self, x_0, cfg, y=None, current_scale=1.0, current_lambda=0.0, threshold=0.0, use_hard_label=False):
         batch_size = x_0.size(0)
 
-        # Path A: 监督模式
+        # Path A: 监督
         if y is not None:
             t = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
@@ -143,18 +189,16 @@ class mDPM_SemiSup(nn.Module):
             dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean') 
             return dpm_loss, -dpm_loss.item(), dpm_loss.item(), 1.0, None, None
             
-        # Path B: 无监督模式
+        # Path B: 无监督
         else:
             logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=current_scale)
             resp = F.softmax(logits, dim=1) 
             
             if use_hard_label:
-                # FixMatch Mode
                 max_probs, pseudo_labels = resp.max(dim=1)
                 mask = (max_probs >= threshold).float()
                 y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
             else:
-                # Exploration Mode
                 pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
                 y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
                 mask = torch.ones(batch_size, device=x_0.device)
@@ -172,7 +216,7 @@ class mDPM_SemiSup(nn.Module):
             return total_loss, -total_loss.item(), dpm_loss.item(), mask_rate, resp.detach(), None
 
 # -----------------------
-# 3. 评估与可视化 (核心升级)
+# 3. 评估与可视化
 # -----------------------
 def evaluate_model(model, loader, cfg):
     try:
@@ -212,7 +256,7 @@ def evaluate_model(model, loader, cfg):
     preds = np.concatenate(preds)
     ys_true = np.concatenate(ys_true)
     
-    # 1. 计算 ACC (Hungarian)
+    # 1. Hungarian Matching
     n_classes = cfg.num_classes
     cost_matrix = np.zeros((n_classes, n_classes))
     for i in range(n_classes):
@@ -220,21 +264,18 @@ def evaluate_model(model, loader, cfg):
             cost_matrix[i, j] = -np.sum((ys_true == i) & (preds == j))
     row_ind, col_ind = linear_sum_assignment(cost_matrix)
     
-    # cluster2label: {Model_Cluster_ID : Real_Digit_Label}
     cluster2label = {int(c): int(l) for c, l in zip(col_ind, row_ind)}
-    
     aligned_preds = np.array([cluster2label.get(p, 0) for p in preds])
     acc = np.mean(aligned_preds == ys_true)
     
-    # 2. 计算 NMI
+    # 2. NMI
     nmi_score = NMI(ys_true, preds)
     
     return acc, cluster2label, nmi_score
 
 def sample_and_save_dpm(denoiser, dpm_process, num_classes, out_path, device, n_per_class=10, cluster_mapping=None):
     """
-    生成图像网格。
-    [升级版] 如果提供了 cluster_mapping，会尝试按真实数字 0-9 的顺序排列生成的行。
+    生成图像网格 (按真实数字顺序)
     """
     T = dpm_process.timesteps
     denoiser.eval()
@@ -244,28 +285,19 @@ def sample_and_save_dpm(denoiser, dpm_process, num_classes, out_path, device, n_
         shape = (n_per_class * num_classes, image_c, 28, 28)
         x_t = torch.randn(shape, device=device)
         
-        # [核心] 决定生成顺序
+        # 顺序映射
         if cluster_mapping is not None:
-            # cluster_mapping 是 {Cluster_ID: Real_Label}
-            # 我们需要反过来 {Real_Label: Cluster_ID}
             label2cluster = {v: k for k, v in cluster_mapping.items()}
-            
-            # 按真实数字 0, 1, 2... 的顺序，找出模型内部对应的 ID
             ordered_internal_labels = []
             for true_digit in range(num_classes):
-                # 找到对应的内部ID，找不到就默认用 true_digit
                 internal_c = label2cluster.get(true_digit, true_digit)
                 ordered_internal_labels.append(internal_c)
-            
-            # 生成条件：每行对应一个真实数字
             y_cond = torch.tensor(ordered_internal_labels, device=device).repeat_interleave(n_per_class).long()
         else:
-            # 旧逻辑
             y_cond = torch.arange(num_classes).to(device).repeat_interleave(n_per_class).long()
             
         y_cond_vec = F.one_hot(y_cond, num_classes).float()
         
-        # 采样循环
         for i in reversed(range(0, T)):
             t = torch.full((shape[0],), i, device=device, dtype=torch.long)
             alpha_t = dpm_process._extract_t(dpm_process.alphas, t, shape)
@@ -283,7 +315,75 @@ def sample_and_save_dpm(denoiser, dpm_process, num_classes, out_path, device, n_
         save_image(x_t.clamp(-1, 1), out_path, nrow=n_per_class, normalize=True, value_range=(-1, 1))
 
 # -----------------------
-# 4. 训练引擎 (带历史记录)
+# 4. [新增] 计算生成质量 (FID/IS)
+# -----------------------
+def calculate_generative_metrics(model, val_loader, cfg, fid_metric, is_metric, num_samples=1000):
+    """
+    计算 FID 和 IS。
+    需要:
+    1. 生成一批假图像 (Fake)
+    2. 获取一批真图像 (Real)
+    3. 转换成 RGB (因为 Inception 需要 3 通道)
+    """
+    if not HAS_METRICS:
+        return 0.0, 0.0
+
+    model.eval()
+    
+    # 1. 获取真图像 (Real Images)
+    # 从验证集中取出一个 Batch
+    real_imgs, _ = next(iter(val_loader))
+    real_imgs = real_imgs.to(cfg.device)
+    # MNIST 1 channel -> 3 channels for Inception
+    real_imgs_rgb = real_imgs.repeat(1, 3, 1, 1)
+    
+    # 归一化处理: Inception 期望 [0, 255] 的 uint8
+    # 我们先将其转回 [0, 1] (假设原图是 [-1, 1])
+    real_imgs_uint8 = ((real_imgs_rgb * 0.5 + 0.5) * 255).byte()
+
+    # 2. 生成假图像 (Fake Images)
+    # 为了速度，我们只生成和 Real Batch 一样多的图
+    n_gen = real_imgs.size(0)
+    with torch.no_grad():
+        x_fake = torch.randn(n_gen, 1, 28, 28, device=cfg.device)
+        # 随机生成标签
+        y_gen = torch.randint(0, cfg.num_classes, (n_gen,), device=cfg.device).long()
+        y_vec = F.one_hot(y_gen, cfg.num_classes).float()
+        
+        # 扩散采样 loop
+        for i in reversed(range(0, cfg.timesteps)):
+            t = torch.full((n_gen,), i, device=cfg.device, dtype=torch.long)
+            # ... (简化的采样逻辑，直接用 dpm_process 的 helper 会更干净，这里为了独立性展开) ...
+            alpha_t = model.dpm_process._extract_t(model.dpm_process.alphas, t, x_fake.shape)
+            one_minus_alpha_t_bar = model.dpm_process._extract_t(model.dpm_process.sqrt_one_minus_alphas_cumprod, t, x_fake.shape)
+            pred_noise = model.cond_denoiser(x_fake, t, y_vec)
+            mu_t_1 = (x_fake - (1 - alpha_t) / one_minus_alpha_t_bar * pred_noise) / alpha_t.sqrt()
+            sigma_t_1 = model.dpm_process._extract_t(model.dpm_process.posterior_variance, t, x_fake.shape).sqrt()
+            if i > 0:
+                noise = torch.randn_like(x_fake)
+            else:
+                noise = torch.zeros_like(x_fake)
+            x_fake = mu_t_1 + sigma_t_1 * noise
+            
+    # Fake RGB & Uint8
+    fake_imgs_rgb = x_fake.repeat(1, 3, 1, 1)
+    fake_imgs_uint8 = ((fake_imgs_rgb.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
+
+    # 3. 更新指标
+    fid_metric.reset()
+    is_metric.reset()
+    
+    fid_metric.update(real_imgs_uint8, real=True)
+    fid_metric.update(fake_imgs_uint8, real=False)
+    is_metric.update(fake_imgs_uint8)
+    
+    fid_score = fid_metric.compute().item()
+    is_score_mean, _ = is_metric.compute()
+    
+    return fid_score, is_score_mean.item()
+
+# -----------------------
+# 5. 训练引擎
 # -----------------------
 def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg,
                          is_final_training=False, trial=None, hyperparams=None):
@@ -300,13 +400,22 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
 
+    # [新增] 初始化指标计算器 (Lazy loading)
+    fid_metric = None
+    is_metric = None
+    if HAS_METRICS:
+        # feature=64 是为了加速 (对于 MNIST 足够)，标准是 2048
+        fid_metric = FrechetInceptionDistance(feature=64, normalize=False).to(cfg.device)
+        is_metric = InceptionScore(feature=64, normalize=False).to(cfg.device)
+
     start_epoch = 1
     best_val_acc = 0.0
     
-    # [新增] 全套历史记录
+    # 历史记录 (包含 FID/IS)
     history = {
         "loss": [], "acc": [], "nmi": [], 
-        "pass_rate": [], "scale": [], "threshold": []
+        "pass_rate": [], "scale": [], "threshold": [],
+        "fid": [], "is_score": [] # 列表存储 [(epoch, value), ...]
     }
     
     mode = "UNSUPERVISED"
@@ -360,24 +469,42 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
             loss_accum += total_loss.item()
             n_batches += 1
 
-        # Validation (带 NMI 和 映射)
+        # Validation (Acc & NMI)
         val_acc, cluster_mapping, val_nmi = evaluate_model(model, val_loader, cfg)
         
+        # [新增] 计算 FID/IS (每 5 轮算一次，因为很慢)
+        # 且仅在 Final Training 时计算
+        if is_final_training and HAS_METRICS and (epoch % 5 == 0 or epoch == total_epochs):
+            print("   ⏳ Calculating FID & IS... (This takes a moment)")
+            fid, is_s = calculate_generative_metrics(model, val_loader, cfg, fid_metric, is_metric)
+            history["fid"].append((epoch, fid))
+            history["is_score"].append((epoch, is_s))
+            print(f"   📊 Metrics -> FID: {fid:.2f} | IS: {is_s:.2f}")
+        else:
+            # 填补空缺以便打印，或者保持之前的
+            pass
+        
+        # [新增] 保存最佳模型 (Best Checkpoint)
+        # 我们依然以 Acc 为主指标，但你也可以改为 FID
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            
-        # [Optuna Pruning] 保持开启（你选择被杀）
-        if trial is not None:
-            trial.report(val_acc, epoch)
-            if trial.should_prune():
-                raise optuna.exceptions.TrialPruned()
+            save_dict = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'acc': val_acc,
+                'nmi': val_nmi,
+                'params': hyperparams
+            }
+            torch.save(save_dict, os.path.join(cfg.output_dir, "best_model.pt"))
+            if is_final_training:
+                print(f"   ★ New Best Model Saved! (Acc: {best_val_acc:.4f})")
 
-        # 统计
+        # 统计 & 记录
         avg_loss = loss_accum / n_batches if n_batches > 0 else 0.0
         avg_mask = mask_rate_accum / n_batches if n_batches > 0 else 0
         pass_rate_percent = avg_mask * 100
         
-        # 记录数据
         history["loss"].append(avg_loss)
         history["acc"].append(val_acc)
         history["nmi"].append(val_nmi)
@@ -395,20 +522,21 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         if is_final_training:
             print(f"Ep {epoch} | Loss: {avg_loss:.4f} | Acc: {val_acc:.4f} | NMI: {val_nmi:.4f} | Pass: {pass_rate_percent:.1f}%")
             
-            # [核心] 带映射的图像生成 (每5轮)
+            # 画生成图 (每5轮)
             if epoch % 5 == 0:
                 sample_and_save_dpm(
                     model.cond_denoiser, model.dpm_process, cfg.num_classes,
                     os.path.join(sample_dir, f"epoch_{epoch:03d}.png"), cfg.device,
-                    cluster_mapping=cluster_mapping # 传入映射，实现 Row 0 = Digit 0
+                    cluster_mapping=cluster_mapping
                 )
     
     return best_val_acc, {}
 
 # -----------------------
-# 5. Optuna 目标函数
+# 6. 主入口
 # -----------------------
 def objective(trial):
+    # Optuna logic (如果你想继续搜)
     cfg = Config()
     cfg.alpha_unlabeled = 1.0
     cfg.labeled_per_class = 0
@@ -437,11 +565,10 @@ def objective(trial):
     return acc
 
 def main():
-    # ==========================
-    # 加速策略配置
-    # ==========================
-    # 设置为 False: 既然 Trial 3 已经搜出了神级参数，我们直接用它跑！
-    # 这样可以跳过漫长的搜索，直接开始出图。
+    # [设置] 随机种子 (例如 42)
+    set_seed(42)
+    
+    # 自动搜索开关
     ENABLE_AUTO_SEARCH = False 
     
     cfg = Config()
@@ -463,8 +590,8 @@ def main():
         best_lr = study.best_params['lr']
         
     else:
-        print("⏩ [Step 1] Skipping Search, using Trial 3 BEST params (Speed Up!)")
-        # 直接使用 Trial 3 的参数 (Acc 0.5853)
+        print("⏩ [Step 1] Skipping Search, using Trial 3 BEST params")
+        # 您上次获得的最佳参数 (Acc ~0.605)
         best_params = {
             'target_scale': 134.37,
             'warmup_epochs': 10,
@@ -472,17 +599,11 @@ def main():
         }
         best_lr = 4.01e-05
 
-    # -------------------------------------------
-    # 步骤 2: 最终训练 (自动加速)
-    # -------------------------------------------
-    print("\n🚀 [Step 2] Starting Final Training...")
+    print("\n🚀 [Step 2] Starting Final Training with Full Metrics (FID/IS)...")
     print(f"   Configs: LR={best_lr:.2e}, Params={best_params}")
     
-    # [加速优化] 从 100 轮缩减到 60 轮
-    # 因为日志显示 Ep 49 之后性能就下降了，跑 100 轮纯属浪费。
-    cfg.output_dir = "./final_training"
     cfg.final_epochs = 60 
-    print(f"   Training Duration: {cfg.final_epochs} Epochs (Optimized for Speed)")
+    cfg.output_dir = "./final_training"
     
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
