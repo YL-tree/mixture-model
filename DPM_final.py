@@ -13,16 +13,6 @@ from torchvision.utils import save_image
 import itertools
 from common_dpm import *
 
-# [新增] 引入生成质量指标库
-try:
-    from torchmetrics.image.fid import FrechetInceptionDistance
-    from torchmetrics.image.inception import InceptionScore
-    HAS_METRICS = True
-except ImportError:
-    print("⚠️ Warning: torchmetrics not installed. FID/IS will be skipped.")
-    print("   Please run: pip install torchmetrics torch-fidelity")
-    HAS_METRICS = False
-
 # -----------------------
 # 0. 随机种子设置 (Reproducibility)
 # -----------------------
@@ -38,24 +28,18 @@ def set_seed(seed=42):
     print(f"🔒 Seed locked to {seed}")
 
 # -----------------------
-# 1. 绘图辅助函数 (升级版仪表盘)
+# 1. 绘图辅助函数 (简化版仪表盘)
 # -----------------------
 def plot_advanced_curves(history, outpath):
     """
-    绘制 2x4 仪表盘：
-    Row 1: Loss, Acc & NMI, Pass Rate, FID (New)
-    Row 2: Scale, Threshold, IS (New), Text Info
+    绘制 2x3 仪表盘：
+    Row 1: Loss, Acc & NMI, Pass Rate
+    Row 2: Scale, Threshold, Text Info
     """
     n = len(history["loss"])
     epochs = range(1, n + 1)
     
-    # 过滤出有 FID/IS 数据的 epoch (因为不是每轮都算)
-    fid_epochs = [x[0] for x in history["fid"]]
-    fid_values = [x[1] for x in history["fid"]]
-    is_epochs = [x[0] for x in history["is_score"]]
-    is_values = [x[1] for x in history["is_score"]]
-    
-    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle(f'Training Dashboard (Ep {n})', fontsize=18)
     
     # 1. Loss
@@ -82,49 +66,26 @@ def plot_advanced_curves(history, outpath):
     ax.set_ylim(0, 105)
     ax.grid(True, alpha=0.3)
     
-    # 4. [New] FID Score
-    ax = axes[0, 3]
-    if len(fid_values) > 0:
-        ax.plot(fid_epochs, fid_values, 'k-o', label='FID (Lower is better)')
-        ax.set_title('FID Score (Image Quality)')
-        ax.legend()
-    else:
-        ax.text(0.5, 0.5, 'FID not calculated', ha='center')
-    ax.grid(True, alpha=0.3)
-    
-    # 5. Scale
+    # 4. Scale
     ax = axes[1, 0]
     ax.plot(epochs, history["scale"], 'c-', label='Scale')
     ax.set_title('Dynamic Scale')
     ax.grid(True, alpha=0.3)
     
-    # 6. Threshold
+    # 5. Threshold
     ax = axes[1, 1]
     ax.plot(epochs, history["threshold"], 'orange', label='Threshold')
     ax.set_title('Dynamic Threshold')
     ax.grid(True, alpha=0.3)
     
-    # 7. [New] Inception Score
+    # 6. Text Info
     ax = axes[1, 2]
-    if len(is_values) > 0:
-        ax.plot(is_epochs, is_values, 'b-o', label='IS (Higher is better)')
-        ax.set_title('Inception Score')
-        ax.legend()
-    else:
-        ax.text(0.5, 0.5, 'IS not calculated', ha='center')
-    ax.grid(True, alpha=0.3)
-    
-    # 8. Text Info
-    ax = axes[1, 3]
     ax.axis('off')
-    current_fid = fid_values[-1] if len(fid_values) > 0 else "N/A"
-    current_is = is_values[-1] if len(is_values) > 0 else "N/A"
     
     info_text = (f"Current Acc: {history['acc'][-1]:.4f}\n"
                  f"Best Acc:    {max(history['acc']):.4f}\n"
-                 f"Current FID: {current_fid}\n"
-                 f"Current IS:  {current_is}\n"
-                 f"Scale:       {history['scale'][-1]:.1f}")
+                 f"Scale:       {history['scale'][-1]:.1f}\n"
+                 f"Pass Rate:   {history['pass_rate'][-1]:.1f}%")
     ax.text(0.1, 0.5, info_text, fontsize=16, family='monospace')
     
     plt.tight_layout()
@@ -315,75 +276,7 @@ def sample_and_save_dpm(denoiser, dpm_process, num_classes, out_path, device, n_
         save_image(x_t.clamp(-1, 1), out_path, nrow=n_per_class, normalize=True, value_range=(-1, 1))
 
 # -----------------------
-# 4. [新增] 计算生成质量 (FID/IS)
-# -----------------------
-def calculate_generative_metrics(model, val_loader, cfg, fid_metric, is_metric, num_samples=1000):
-    """
-    计算 FID 和 IS。
-    需要:
-    1. 生成一批假图像 (Fake)
-    2. 获取一批真图像 (Real)
-    3. 转换成 RGB (因为 Inception 需要 3 通道)
-    """
-    if not HAS_METRICS:
-        return 0.0, 0.0
-
-    model.eval()
-    
-    # 1. 获取真图像 (Real Images)
-    # 从验证集中取出一个 Batch
-    real_imgs, _ = next(iter(val_loader))
-    real_imgs = real_imgs.to(cfg.device)
-    # MNIST 1 channel -> 3 channels for Inception
-    real_imgs_rgb = real_imgs.repeat(1, 3, 1, 1)
-    
-    # 归一化处理: Inception 期望 [0, 255] 的 uint8
-    # 我们先将其转回 [0, 1] (假设原图是 [-1, 1])
-    real_imgs_uint8 = ((real_imgs_rgb * 0.5 + 0.5) * 255).byte()
-
-    # 2. 生成假图像 (Fake Images)
-    # 为了速度，我们只生成和 Real Batch 一样多的图
-    n_gen = real_imgs.size(0)
-    with torch.no_grad():
-        x_fake = torch.randn(n_gen, 1, 28, 28, device=cfg.device)
-        # 随机生成标签
-        y_gen = torch.randint(0, cfg.num_classes, (n_gen,), device=cfg.device).long()
-        y_vec = F.one_hot(y_gen, cfg.num_classes).float()
-        
-        # 扩散采样 loop
-        for i in reversed(range(0, cfg.timesteps)):
-            t = torch.full((n_gen,), i, device=cfg.device, dtype=torch.long)
-            # ... (简化的采样逻辑，直接用 dpm_process 的 helper 会更干净，这里为了独立性展开) ...
-            alpha_t = model.dpm_process._extract_t(model.dpm_process.alphas, t, x_fake.shape)
-            one_minus_alpha_t_bar = model.dpm_process._extract_t(model.dpm_process.sqrt_one_minus_alphas_cumprod, t, x_fake.shape)
-            pred_noise = model.cond_denoiser(x_fake, t, y_vec)
-            mu_t_1 = (x_fake - (1 - alpha_t) / one_minus_alpha_t_bar * pred_noise) / alpha_t.sqrt()
-            sigma_t_1 = model.dpm_process._extract_t(model.dpm_process.posterior_variance, t, x_fake.shape).sqrt()
-            if i > 0:
-                noise = torch.randn_like(x_fake)
-            else:
-                noise = torch.zeros_like(x_fake)
-            x_fake = mu_t_1 + sigma_t_1 * noise
-            
-    # Fake RGB & Uint8
-    fake_imgs_rgb = x_fake.repeat(1, 3, 1, 1)
-    fake_imgs_uint8 = ((fake_imgs_rgb.clamp(-1, 1) * 0.5 + 0.5) * 255).byte()
-
-    # 3. 更新指标
-    fid_metric.reset()
-    is_metric.reset()
-    
-    fid_metric.update(real_imgs_uint8, real=True)
-    fid_metric.update(fake_imgs_uint8, real=False)
-    is_metric.update(fake_imgs_uint8)
-    
-    fid_score = fid_metric.compute().item()
-    is_score_mean, _ = is_metric.compute()
-    
-    return fid_score, is_score_mean.item()
-
-# -----------------------
-# 5. 训练引擎
+# 4. 训练引擎
 # -----------------------
 def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg,
                          is_final_training=False, trial=None, hyperparams=None):
@@ -400,22 +293,13 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
 
-    # [新增] 初始化指标计算器 (Lazy loading)
-    fid_metric = None
-    is_metric = None
-    if HAS_METRICS:
-        # feature=64 是为了加速 (对于 MNIST 足够)，标准是 2048
-        fid_metric = FrechetInceptionDistance(feature=64, normalize=False).to(cfg.device)
-        is_metric = InceptionScore(feature=64, normalize=False).to(cfg.device)
-
     start_epoch = 1
     best_val_acc = 0.0
     
-    # 历史记录 (包含 FID/IS)
+    # 历史记录 (移除了 FID/IS)
     history = {
         "loss": [], "acc": [], "nmi": [], 
-        "pass_rate": [], "scale": [], "threshold": [],
-        "fid": [], "is_score": [] # 列表存储 [(epoch, value), ...]
+        "pass_rate": [], "scale": [], "threshold": []
     }
     
     mode = "UNSUPERVISED"
@@ -472,20 +356,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         # Validation (Acc & NMI)
         val_acc, cluster_mapping, val_nmi = evaluate_model(model, val_loader, cfg)
         
-        # [新增] 计算 FID/IS (每 5 轮算一次，因为很慢)
-        # 且仅在 Final Training 时计算
-        if is_final_training and HAS_METRICS and (epoch % 5 == 0 or epoch == total_epochs):
-            print("   ⏳ Calculating FID & IS... (This takes a moment)")
-            fid, is_s = calculate_generative_metrics(model, val_loader, cfg, fid_metric, is_metric)
-            history["fid"].append((epoch, fid))
-            history["is_score"].append((epoch, is_s))
-            print(f"   📊 Metrics -> FID: {fid:.2f} | IS: {is_s:.2f}")
-        else:
-            # 填补空缺以便打印，或者保持之前的
-            pass
-        
-        # [新增] 保存最佳模型 (Best Checkpoint)
-        # 我们依然以 Acc 为主指标，但你也可以改为 FID
+        # 保存最佳模型
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             save_dict = {
@@ -533,7 +404,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     return best_val_acc, {}
 
 # -----------------------
-# 6. 主入口
+# 5. 主入口
 # -----------------------
 def objective(trial):
     # Optuna logic (如果你想继续搜)
@@ -599,11 +470,10 @@ def main():
         }
         best_lr = 4.01e-05
 
-    print("\n🚀 [Step 2] Starting Final Training with Full Metrics (FID/IS)...")
+    print("\n🚀 [Step 2] Starting Final Training (Clean Version)...")
     print(f"   Configs: LR={best_lr:.2e}, Params={best_params}")
     
     cfg.final_epochs = 60 
-    cfg.output_dir = "./final_training"
     
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)

@@ -6,7 +6,7 @@ from tqdm import tqdm
 
 # 引入项目中的定义
 from common_dpm import Config, get_semi_loaders
-from mDPM import mDPM_SemiSup, set_seed, evaluate_model, sample_and_save_dpm
+from DPM_final import mDPM_SemiSup, set_seed, evaluate_model, sample_and_save_dpm
 
 # 引入 FID/IS
 try:
@@ -37,7 +37,7 @@ def run_full_evaluation(checkpoint_path, num_fid_samples=5000):
         return
 
     model = mDPM_SemiSup(cfg).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -158,6 +158,19 @@ def run_full_evaluation(checkpoint_path, num_fid_samples=5000):
     print(f"IS Score:    {is_score:.4f} ± {is_std:.4f}")
     print("="*40)
 
+    # ==========================================
+    # Phase 4: 保存结果
+    # ==========================================
+    # 保存至txt文件
+    print(f"\n[Phase 4] Saving Results...")
+    with open(f"eval_results.txt", "w") as f:
+        f.write(f"Model Epoch: {train_epoch}\n")
+        f.write(f"Accuracy:    {acc:.4f}\n")
+        f.write(f"NMI Score:   {nmi:.4f}\n")
+        f.write(f"FID Score:   {fid_score:.4f}  (Lower is better)\n")
+        f.write(f"IS Score:    {is_score:.4f} ± {is_std:.4f}\n")
+
+    
 if __name__ == "__main__":
     # 指向您的最佳模型路径
     CKPT_PATH = "./final_training_FID/best_model.pt"
