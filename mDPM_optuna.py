@@ -448,7 +448,7 @@ def main():
     # ==========================
     # 全自动开关
     # ==========================
-    ENABLE_AUTO_SEARCH = True 
+    ENABLE_AUTO_SEARCH = False 
     
     # 当前任务模式：用于 main 函数里非搜索部分的配置
     # 注意：objective 函数里的 SEARCH_MODE 需要单独改，或者你可以把 objective 定义在 main 里面闭包调用
@@ -471,8 +471,9 @@ def main():
         # 提取最佳参数
         best_params = {
             'target_scale': study.best_params['target_scale'],
-            'warmup_epochs': study.best_params['warmup_epochs'],
-            'threshold_start': study.best_params.get('threshold_start', 0.0), # 兼容性写法
+            # [修复] 使用 .get(key, 0) 提供默认值 0
+            'warmup_epochs': study.best_params.get('warmup_epochs', 0), 
+            'threshold_start': study.best_params.get('threshold_start', 0.0),
             'threshold_final': study.best_params['threshold_final']
         }
         best_lr = study.best_params['lr']
@@ -481,12 +482,12 @@ def main():
         print("⏩ [Step 1] Skipping Search, using manual params...")
         # 手动指定（示例）
         best_params = {
-            'target_scale': 150.0,
-            'warmup_epochs': 10,
-            'threshold_start': 0.5,
-            'threshold_final': 0.95
+            'target_scale': 219.0,      # 截图值
+            'warmup_epochs': 0,         # 半监督不需要预热
+            'threshold_start': 0.55,    # 截图值
+            'threshold_final': 0.96     # 截图值
         }
-        best_lr = 1e-4
+        best_lr = 4.48e-4
 
     # -------------------------------------------
     # 步骤 2: 最终训练
