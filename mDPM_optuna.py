@@ -188,18 +188,19 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
     # 如果是最终训练，由 cfg.final_epochs 决定
     total_epochs = cfg.final_epochs if is_final_training else cfg.optuna_epochs
     
-    # 默认超参数（手动调出的最佳实践）
     if hyperparams is None:
         hyperparams = {
             'target_scale': 150.0,
             'warmup_epochs': 15,
+            'threshold_start': 0.0,  # 默认值
             'threshold_final': 0.0
         }
 
     target_scale = hyperparams.get('target_scale', 150.0)
     warmup_epochs = hyperparams.get('warmup_epochs', 15)
+    threshold_start = hyperparams.get('threshold_start', 0.0) # 新增接收
     threshold_final = hyperparams.get('threshold_final', 0.0)
-
+    
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
 
@@ -251,15 +252,23 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
                 dynamic_threshold = 0.0 + (threshold_final - 0.0) * p2
                 status = "REFINE"
 
-        else: # SEMI_SUPERVISED
+         # SEMI_SUPERVISED
             # --- 策略 B: 半监督 (FixMatch 策略) ---
             # 特点：全程硬标签，高自信，中等门槛
             # 既然有标签指路，直接自信地 Scale=150
             # 半监督/监督模式保持原样
-            use_hard = True
-            dynamic_scale = 300.0 + (600.0 - 300.0) * progress
-            dynamic_threshold = 0.70 + (0.95 - 0.70) * progress
-            status = "SEMI/SUP"
+        elif mode == "SEMI_SUPERVISED":
+            use_hard = True 
+            # 搜索出来的 Scale
+            dynamic_scale = target_scale 
+            
+            # 搜索出来的爬坡曲线
+            # 比如从 0.4 爬到 0.95
+            progress = (epoch - 1) / total_epochs
+            dynamic_threshold = threshold_start + (threshold_final - threshold_start) * progress
+            
+            status = "SEMI-SUP"
+        
             
 
         if is_final_training and epoch % 1 == 0:
@@ -356,44 +365,78 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
 def objective(trial):
     cfg = Config()
     
-    # 1. 强制无监督设置
-    cfg.alpha_unlabeled = 1.0
-    cfg.labeled_per_class = 0
-    cfg.posterior_sample_steps = 5 
-    # [重要] 搜索时不需要跑 100 轮，跑 30-40 轮足够看趋势了
+    # ==========================================
+    # 1. 设置搜索模式 (从 main 函数外部控制，或在这里修改)
+    # ==========================================
+    # 选项: "UNSUPERVISED" 或 "SEMI_SUPERVISED"
+    # 注意：Optuna 运行时这里的变量需要能被访问，建议直接在这里硬编码当前想搜的模式
+    SEARCH_MODE = "SEMI_SUPERVISED" 
+    
+    # ==========================================
+    # 2. 定义不同模式下的搜索空间
+    # ==========================================
+    
+    if SEARCH_MODE == "UNSUPERVISED":
+        # --- 无监督配置 ---
+        cfg.labeled_per_class = 0
+        cfg.alpha_unlabeled = 1.0
+        
+        # [搜索空间 - 无监督]
+        # 策略：低自信，低门槛，小心翼翼
+        lr = trial.suggest_float("lr", 4e-5, 2e-4, log=True)
+        target_scale = trial.suggest_float("target_scale", 120.0, 180.0)
+        warmup_epochs = trial.suggest_int("warmup_epochs", 10, 20)
+        
+        # 无监督的门槛通常很低
+        threshold_start = 0.0 # 固定
+        threshold_final = trial.suggest_float("threshold_final", 0.0, 0.1)
+
+    else: # SEMI_SUPERVISED
+        # --- 半监督配置 ---
+        cfg.labeled_per_class = 10  # 每类 10 张
+        cfg.alpha_unlabeled = 1.0
+        
+        # [搜索空间 - 半监督]
+        # 策略：高自信，高门槛，强力纠偏
+        lr = trial.suggest_float("lr", 5e-5, 5e-4, log=True) # 稍微大一点的 LR
+        
+        # Scale 甚至可以更大一点，因为有标签拉着
+        target_scale = trial.suggest_float("target_scale", 500.0, 600.0)
+        
+        # 半监督不需要太长的 Warmup，因为一开始就有标签
+        warmup_epochs = trial.suggest_int("warmup_epochs", 5, 10)
+        
+        # [关键] 搜索门槛的“爬坡”曲线
+        # 起点：不能是 0 (太吵)，也不能是 0.9 (太硬)
+        threshold_start = trial.suggest_float("threshold_start", 0.3, 0.7)
+        # 终点：必须很高 (FixMatch 标准)
+        threshold_final = trial.suggest_float("threshold_final", 0.8, 0.99)
+    
+    # ------------------------------------------
+    # 3. 运行训练
+    # ------------------------------------------
+    
+    # 同样只跑 35 轮看趋势
     cfg.optuna_epochs = 35 
     
-    # 2. 定义搜索空间 (Search Space)
-    # 基于之前的经验，我们在敏感区间附近搜索
-    
-    # (A) 学习率: 之前 5e-5 太稳，1e-4 可能太冲，搜一下中间值
-    lr = trial.suggest_float("lr", 4e-5, 2e-4, log=True)
-    
-    # (B) 最终 Scale: 150 是个甜点，但可能 140 或 170 更好
-    target_scale = trial.suggest_float("target_scale", 120.0, 180.0)
-    
-    # (C) 预热轮数: 之前 15 轮，也许 10 轮就够了，或者 20 轮更稳
-    warmup_epochs = trial.suggest_int("warmup_epochs", 10, 20)
-    
-    # (D) 阈值: 虽然 0.0 最好，但也试探一下极小值 (0.0 ~ 0.1)
-    # 如果还是 0.0 胜出，说明结论非常硬
-    threshold_final = trial.suggest_float("threshold_final", 0.0, 0.1)
-    
+    # 打包参数传给 run_training_session
     hyperparams = {
         'target_scale': target_scale,
         'warmup_epochs': warmup_epochs,
+        'threshold_start': threshold_start, # 新增
         'threshold_final': threshold_final
     }
     
-    # 3. 初始化模型
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    _, unlabeled_loader, val_loader = get_semi_loaders(cfg)
     
-    # 4. 运行训练
+    # 获取数据 loader
+    labeled_loader, unlabeled_loader, val_loader = get_semi_loaders(cfg)
+    
+    # 运行
     accuracy, _ = run_training_session(
-        model, optimizer, None, unlabeled_loader, val_loader, cfg,
-        is_final_training=False, # 标记为搜索模式
+        model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg,
+        is_final_training=False, 
         trial=trial,
         hyperparams=hyperparams
     )
@@ -401,33 +444,21 @@ def objective(trial):
     return accuracy
 
 # mDPM.py 中的 main 函数替换为以下内容：
-
 def main():
     # ==========================
     # 全自动开关
     # ==========================
-    # True: 先搜参数，搜完自动跑最终训练
-    # False: 跳过搜索，直接用下方手动指定的参数跑最终训练
     ENABLE_AUTO_SEARCH = True 
     
-    cfg = Config()
+    # 当前任务模式：用于 main 函数里非搜索部分的配置
+    # 注意：objective 函数里的 SEARCH_MODE 需要单独改，或者你可以把 objective 定义在 main 里面闭包调用
+    CURRENT_MODE = "SEMI_SUPERVISED" 
     
-    # 强制配置
-    cfg.alpha_unlabeled = 1.0
-    cfg.labeled_per_class = 10
-    cfg.posterior_sample_steps = 5 
-    cfg.output_dir = "semi_final"
-    # -------------------------------------------
-    # 步骤 1: 参数搜索 (Optuna)
-    # -------------------------------------------
     if ENABLE_AUTO_SEARCH:
-        print("🔍 [Step 1] Starting Optuna Hyperparameter Search...")
-        
-        # 定义搜索轮数 (比如搜 20 次)
-        n_trials = 20 
+        print(f"🔍 [Step 1] Starting Optuna Search for {CURRENT_MODE}...")
         
         study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=n_trials)
+        study.optimize(objective, n_trials=20) # 跑 20 次
         
         print("\n" + "="*40)
         print("🎉 Search Finished!")
@@ -441,39 +472,41 @@ def main():
         best_params = {
             'target_scale': study.best_params['target_scale'],
             'warmup_epochs': study.best_params['warmup_epochs'],
+            'threshold_start': study.best_params.get('threshold_start', 0.0), # 兼容性写法
             'threshold_final': study.best_params['threshold_final']
         }
         best_lr = study.best_params['lr']
         
     else:
-        # 如果不搜参数，就用这里手动指定的默认值
         print("⏩ [Step 1] Skipping Search, using manual params...")
+        # 手动指定（示例）
         best_params = {
             'target_scale': 150.0,
-            'warmup_epochs': 15,
-            'threshold_final': 0.0
+            'warmup_epochs': 10,
+            'threshold_start': 0.5,
+            'threshold_final': 0.95
         }
         best_lr = 1e-4
 
     # -------------------------------------------
-    # 步骤 2: 最终训练 (Final Training)
+    # 步骤 2: 最终训练
     # -------------------------------------------
-    print("\n🚀 [Step 2] Starting Final Training with BEST parameters...")
-    print(f"   Configs: LR={best_lr:.2e}, Params={best_params}")
+    print("\n🚀 [Step 2] Starting Final Training...")
     
-    # 设置最终训练的时长
-    cfg.final_epochs = 60 
+    cfg = Config()
+    cfg.final_epochs = 60
     
-    # [关键] 必须重新实例化模型和优化器，确保是从头开始训练
+    if CURRENT_MODE == "SEMI_SUPERVISED":
+        cfg.labeled_per_class = 10
+    else:
+        cfg.labeled_per_class = 0
+        
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
-    _, unlabeled_loader, val_loader = get_semi_loaders(cfg)
+    labeled_loader, unlabeled_loader, val_loader = get_semi_loaders(cfg)
     
-    # 运行最终训练
-    # 注意：这里我们传入 best_params，并没有传入 resume_path，
-    # 意味着它是用最佳参数“从零开始”跑一个完美的 100 轮。
     run_training_session(
-        model, optimizer, None, unlabeled_loader, val_loader, cfg, 
+        model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg, 
         is_final_training=True,
         hyperparams=best_params
     )
