@@ -1,4 +1,4 @@
-# mDPM.py
+# mDPM_optuna.py
 import json
 import torch
 import torch.nn as nn
@@ -7,11 +7,26 @@ import optuna
 from optuna.trial import TrialState
 import os
 import gc
+import random
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from torchvision.utils import save_image
 import itertools
 from common_dpm import *
+
+# -----------------------
+# 0. 随机种子设置 (Reproducibility)
+# -----------------------
+def set_seed(seed=42):
+    """锁定所有随机种子，确保实验可复现"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"🔒 Seed locked to {seed}")
 
 # -----------------------
 # Model Definition (保持不变)
@@ -226,19 +241,14 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         "PosteriorAcc": []   # 记录 Accuracy
     }
     
-    
-
     for epoch in range(start_epoch, total_epochs + 1):
         progress = (epoch - 1) / total_epochs
-        # ==========================================
-        # [动态调度器] 由 Optuna 参数控制
-        # ==========================================
+        
         # ==========================================
         # [调度器] 根据模式选择策略
         # ==========================================
         if mode == "UNSUPERVISED":
             # --- 策略 A: 无监督 (Optuna 优化的探索策略) ---
-            # 特点：先软后硬，低门槛，适合从零发现结构
             if epoch <= warmup_epochs:
                 use_hard = False
                 p1 = epoch / warmup_epochs
@@ -252,24 +262,12 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
                 dynamic_threshold = 0.0 + (threshold_final - 0.0) * p2
                 status = "REFINE"
 
-         # SEMI_SUPERVISED
-            # --- 策略 B: 半监督 (FixMatch 策略) ---
-            # 特点：全程硬标签，高自信，中等门槛
-            # 既然有标签指路，直接自信地 Scale=150
-            # 半监督/监督模式保持原样
         elif mode == "SEMI_SUPERVISED":
+            # --- 策略 B: 半监督 (FixMatch 策略) ---
             use_hard = True 
-            # 搜索出来的 Scale
             dynamic_scale = target_scale 
-            
-            # 搜索出来的爬坡曲线
-            # 比如从 0.4 爬到 0.95
-            progress = (epoch - 1) / total_epochs
             dynamic_threshold = threshold_start + (threshold_final - threshold_start) * progress
-            
             status = "SEMI-SUP"
-        
-            
 
         if is_final_training and epoch % 1 == 0:
             print(f"🔥 [Scheduler] Ep {epoch} [{status}]: Scale={dynamic_scale:.1f}, Thres={dynamic_threshold:.2f}")
@@ -366,74 +364,49 @@ def objective(trial):
     cfg = Config()
     
     # ==========================================
-    # 1. 设置搜索模式 (从 main 函数外部控制，或在这里修改)
+    # 1. 设置搜索模式
     # ==========================================
-    # 选项: "UNSUPERVISED" 或 "SEMI_SUPERVISED"
-    # 注意：Optuna 运行时这里的变量需要能被访问，建议直接在这里硬编码当前想搜的模式
     SEARCH_MODE = "SEMI_SUPERVISED" 
     
     # ==========================================
-    # 2. 定义不同模式下的搜索空间
+    # 2. 定义搜索空间
     # ==========================================
-    
     if SEARCH_MODE == "UNSUPERVISED":
-        # --- 无监督配置 ---
         cfg.labeled_per_class = 0
         cfg.alpha_unlabeled = 1.0
         
-        # [搜索空间 - 无监督]
-        # 策略：低自信，低门槛，小心翼翼
         lr = trial.suggest_float("lr", 4e-5, 2e-4, log=True)
         target_scale = trial.suggest_float("target_scale", 120.0, 180.0)
         warmup_epochs = trial.suggest_int("warmup_epochs", 10, 20)
-        
-        # 无监督的门槛通常很低
-        threshold_start = 0.0 # 固定
+        threshold_start = 0.0 
         threshold_final = trial.suggest_float("threshold_final", 0.0, 0.1)
 
     else: # SEMI_SUPERVISED
-        # --- 半监督配置 ---
-        cfg.labeled_per_class = 10  # 每类 10 张
+        cfg.labeled_per_class = 10  
         cfg.alpha_unlabeled = 1.0
+        # 搜参时降 M 以加速
+        cfg.posterior_sample_steps = 1
         
-        # [搜索空间 - 半监督]
-        # 策略：高自信，高门槛，强力纠偏
-        lr = trial.suggest_float("lr", 5e-5, 5e-4, log=True) # 稍微大一点的 LR
-        
-        # Scale 甚至可以更大一点，因为有标签拉着
-        target_scale = trial.suggest_float("target_scale", 500.0, 600.0)
-        
-        # 半监督不需要太长的 Warmup，因为一开始就有标签
-        warmup_epochs = trial.suggest_int("warmup_epochs", 5, 10)
-        
-        # [关键] 搜索门槛的“爬坡”曲线
-        # 起点：不能是 0 (太吵)，也不能是 0.9 (太硬)
+        lr = trial.suggest_float("lr", 5e-5, 5e-4, log=True)
+        target_scale = trial.suggest_float("target_scale", 140.0, 220.0)
+        warmup_epochs = 0 # 半监督不用 warmup
         threshold_start = trial.suggest_float("threshold_start", 0.3, 0.7)
-        # 终点：必须很高 (FixMatch 标准)
         threshold_final = trial.suggest_float("threshold_final", 0.8, 0.99)
     
-    # ------------------------------------------
-    # 3. 运行训练
-    # ------------------------------------------
+    cfg.optuna_epochs = 15
     
-    # 同样只跑 35 轮看趋势
-    cfg.optuna_epochs = 35 
-    
-    # 打包参数传给 run_training_session
     hyperparams = {
         'target_scale': target_scale,
         'warmup_epochs': warmup_epochs,
-        'threshold_start': threshold_start, # 新增
+        'threshold_start': threshold_start,
         'threshold_final': threshold_final
     }
     
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
-    # 获取数据 loader
     labeled_loader, unlabeled_loader, val_loader = get_semi_loaders(cfg)
     
-    # 运行
     accuracy, _ = run_training_session(
         model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg,
         is_final_training=False, 
@@ -443,15 +416,17 @@ def objective(trial):
     
     return accuracy
 
-# mDPM.py 中的 main 函数替换为以下内容：
 def main():
+    # ==========================
+    # [设置] 随机种子 (例如 42)
+    # ==========================
+    set_seed(42)
+
     # ==========================
     # 全自动开关
     # ==========================
     ENABLE_AUTO_SEARCH = False 
     
-    # 当前任务模式：用于 main 函数里非搜索部分的配置
-    # 注意：objective 函数里的 SEARCH_MODE 需要单独改，或者你可以把 objective 定义在 main 里面闭包调用
     CURRENT_MODE = "SEMI_SUPERVISED" 
     
     if ENABLE_AUTO_SEARCH:
@@ -468,10 +443,9 @@ def main():
             print(f"    {k}: {v}")
         print("="*40)
         
-        # 提取最佳参数
         best_params = {
             'target_scale': study.best_params['target_scale'],
-            # [修复] 使用 .get(key, 0) 提供默认值 0
+            # [修复] 使用 .get(key, 0) 提供默认值
             'warmup_epochs': study.best_params.get('warmup_epochs', 0), 
             'threshold_start': study.best_params.get('threshold_start', 0.0),
             'threshold_final': study.best_params['threshold_final']
@@ -482,9 +456,9 @@ def main():
         print("⏩ [Step 1] Skipping Search, using manual params...")
         # 手动指定（示例）
         best_params = {
-            'target_scale': 219.0,      # 截图值
+            'target_scale': 150.0,      # 截图值
             'warmup_epochs': 0,         # 半监督不需要预热
-            'threshold_start': 0.55,    # 截图值
+            'threshold_start': 0.7,    # 截图值
             'threshold_final': 0.96     # 截图值
         }
         best_lr = 4.48e-4
@@ -496,6 +470,8 @@ def main():
     
     cfg = Config()
     cfg.final_epochs = 60
+    # [关键] 最终训练必须用 M=5 以保证精度
+    cfg.posterior_sample_steps = 5 
     
     if CURRENT_MODE == "SEMI_SUPERVISED":
         cfg.labeled_per_class = 10
