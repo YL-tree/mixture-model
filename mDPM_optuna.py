@@ -199,22 +199,16 @@ def sample_and_save_dpm(denoiser, dpm_process, num_classes, out_path, device, n_
 def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg,
                          is_final_training=False, trial=None, hyperparams=None):
     
-    # 如果是 Optuna 模式，epoch 数由 cfg.optuna_epochs 决定
-    # 如果是最终训练，由 cfg.final_epochs 决定
     total_epochs = cfg.final_epochs if is_final_training else cfg.optuna_epochs
     
     if hyperparams is None:
-        hyperparams = {
-            'target_scale': 150.0,
-            'warmup_epochs': 15,
-            'threshold_start': 0.0,  # 默认值
-            'threshold_final': 0.0
-        }
+        hyperparams = {}
 
     target_scale = hyperparams.get('target_scale', 150.0)
-    warmup_epochs = hyperparams.get('warmup_epochs', 15)
-    threshold_start = hyperparams.get('threshold_start', 0.0) # 新增接收
-    threshold_final = hyperparams.get('threshold_final', 0.0)
+    # [关键修改] 半监督也需要 Warmup 了！建议设为 5
+    warmup_epochs = hyperparams.get('warmup_epochs', 5) 
+    threshold_start = hyperparams.get('threshold_start', 0.5)
+    threshold_final = hyperparams.get('threshold_final', 0.95)
     
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
@@ -224,50 +218,62 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
 
     # 模式检测
     mode = "UNKNOWN"
-    if labeled_loader is not None and unlabeled_loader is not None: 
+    if cfg.labeled_per_class > 0 and labeled_loader is not None: 
         mode = "SEMI_SUPERVISED"
-    elif labeled_loader is not None: 
-        mode = "SUPERVISED"
-        cfg.alpha_unlabeled = 0.0
-    elif unlabeled_loader is not None: 
+    else:
         mode = "UNSUPERVISED"
         cfg.alpha_unlabeled = 1.0
-    
 
     print(f"🚀 Training Mode: {mode} (Total Epochs: {total_epochs})")
 
-    metrics = {
-        "DPM_Loss": [],      # 记录 Loss
-        "PosteriorAcc": []   # 记录 Accuracy
-    }
-    
+    metrics = {"DPM_Loss": [], "PosteriorAcc": []}
+
     for epoch in range(start_epoch, total_epochs + 1):
         progress = (epoch - 1) / total_epochs
         
         # ==========================================
-        # [调度器] 根据模式选择策略
+        # [新版调度器] 融合了无监督的柔性与半监督的刚性
         # ==========================================
-        if mode == "UNSUPERVISED":
-            # --- 策略 A: 无监督 (Optuna 优化的探索策略) ---
-            if epoch <= warmup_epochs:
-                use_hard = False
-                p1 = epoch / warmup_epochs
-                dynamic_scale = 5.0 + (20.0 - 5.0) * p1
-                dynamic_threshold = 0.0 
-                status = "EXPLORE"
-            else:
-                use_hard = True
+        
+        # 无论是无监督还是半监督，我们都允许一个“探索期”
+        is_warmup = (epoch <= warmup_epochs)
+        
+        if is_warmup:
+            # === 阶段一：探索 (Exploration) ===
+            # 就像无监督一样，先不要把话把死
+            use_hard = False  # 使用软标签 (Multinomial Sampling)
+            
+            # Scale 从 5 慢慢升到 20 (保持低自信，防止被带偏)
+            p_warm = epoch / warmup_epochs
+            dynamic_scale = 5.0 + (20.0 - 5.0) * p_warm
+            
+            # 门槛为 0，让所有无标签数据都参与进来（反正 Scale 低，不会造成破坏）
+            dynamic_threshold = 0.0 
+            
+            status = "EXPLORE (Soft)"
+        
+        else:
+            # === 阶段二：精炼 (Refine / FixMatch) ===
+            # 预热结束，开始“收网”
+            use_hard = True   # 切换为硬标签 (Argmax)
+            
+            if mode == "UNSUPERVISED":
+                # 无监督的后续逻辑
                 p2 = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
                 dynamic_scale = 20.0 + (target_scale - 20.0) * p2
                 dynamic_threshold = 0.0 + (threshold_final - 0.0) * p2
-                status = "REFINE"
-
-        elif mode == "SEMI_SUPERVISED":
-            # --- 策略 B: 半监督 (FixMatch 策略) ---
-            use_hard = True 
-            dynamic_scale = target_scale 
-            dynamic_threshold = threshold_start + (threshold_final - threshold_start) * progress
-            status = "SEMI-SUP"
+            
+            else: # SEMI_SUPERVISED
+                # 半监督的后续逻辑
+                # Scale 直接拉到目标值 (比如 150)
+                dynamic_scale = target_scale 
+                
+                # 门槛开始爬坡 (0.5 -> 0.95)
+                # 计算精炼阶段的进度
+                p_refine = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
+                dynamic_threshold = threshold_start + (threshold_final - threshold_start) * p_refine
+            
+            status = "REFINE (Hard)"
 
         if is_final_training and epoch % 1 == 0:
             print(f"🔥 [Scheduler] Ep {epoch} [{status}]: Scale={dynamic_scale:.1f}, Thres={dynamic_threshold:.2f}")
@@ -277,40 +283,36 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
         mask_rate_accum = 0.0
         n_batches = 0
         
-        # Iterator Setup
+        # Iterator Setup (保持半监督的双路加载)
         if mode == "SEMI_SUPERVISED": 
             iterator = zip(itertools.cycle(labeled_loader), unlabeled_loader)
-        elif mode == "SUPERVISED":
-            iterator = ((batch, None) for batch in labeled_loader)
-        elif mode == "UNSUPERVISED":
+        else:
             iterator = ((None, batch) for batch in unlabeled_loader)
-
 
         for batch_lab, batch_un in iterator:
             optimizer.zero_grad()
             total_loss = torch.tensor(0.0, device=cfg.device)
 
-            # --- 1. 计算监督 Loss (Anchor) ---
+            # --- 1. 有标签数据 (提供参考/锚点) ---
+            # 即使在 EXPLORE 阶段，这个 Loss 也会一直拉着模型，不让它乱跑
             if batch_lab is not None:
                 x_lab, y_lab = batch_lab
                 x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device).long()
-                # 监督 forward (Scale=1.0, 纯 MSE)
                 l_sup, _, _, _, _, _ = model(x_lab, cfg, y=y_lab)
                 total_loss += l_sup
 
-            # --- 2. 计算无监督 Loss (Consistency) ---
+            # --- 2. 无标签数据 (探索/一致性) ---
             if batch_un is not None:
                 x_un, _ = batch_un
                 x_un = x_un.to(cfg.device)
                 
-                # 传入调度器参数
+                # 在 EXPLORE 阶段，这里是软标签，非常温和
                 l_unsup, _, _, mask_rate, _, _ = model(x_un, cfg, y=None, 
                                                        current_scale=dynamic_scale,
                                                        current_lambda=0.01,
                                                        threshold=dynamic_threshold,
                                                        use_hard_label=use_hard)
                 
-                # 半监督时通常 alpha=1.0 即可
                 total_loss += cfg.alpha_unlabeled * l_unsup
                 mask_rate_accum += mask_rate
 
@@ -320,34 +322,24 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader, val
             loss_accum += total_loss.item()
             n_batches += 1
 
-        # Validation
+        # Validation ... (保持不变)
         val_acc, _, _ = evaluate_model(model, val_loader, cfg)
+        if val_acc > best_val_acc: best_val_acc = val_acc
         
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-
-        # ==========================================
-        # [Optuna] 保留剪枝功能
-        # ==========================================
         if trial is not None:
             trial.report(val_acc, epoch)
-            if trial.should_prune():
-                raise optuna.exceptions.TrialPruned()
+            if trial.should_prune(): raise optuna.exceptions.TrialPruned()
 
-        # 记录数据
         avg_loss = loss_accum / n_batches if n_batches > 0 else 0.0
         avg_mask = mask_rate_accum / n_batches if n_batches > 0 else 0
-        
         metrics["DPM_Loss"].append(avg_loss)
         metrics["PosteriorAcc"].append(val_acc)
         
-        # 绘图
         if trial is not None:
             curve_name = f"optuna_trial_{trial.number}_curve.png"
         else:
             curve_name = "training_curves_final.png"
-        plot_path = os.path.join(cfg.output_dir, curve_name)
-        plot_training_curves(metrics, plot_path)
+        plot_training_curves(metrics, os.path.join(cfg.output_dir, curve_name))
 
         if is_final_training:
             print(f"Ep {epoch} | Loss: {avg_loss:.4f} | Val Acc: {val_acc:.4f} | Pass: {avg_mask*100:.1f}%")
@@ -388,8 +380,9 @@ def objective(trial):
         cfg.posterior_sample_steps = 1
         
         lr = trial.suggest_float("lr", 5e-5, 5e-4, log=True)
-        target_scale = trial.suggest_float("target_scale", 140.0, 220.0)
-        warmup_epochs = 0 # 半监督不用 warmup
+        target_scale = trial.suggest_float("target_scale", 100.0, 160.0)
+        warmup_epochs = trial.suggest_int("warmup_epochs", 5, 10)
+        # warmup_epochs = 0 # 半监督不用 warmup
         threshold_start = trial.suggest_float("threshold_start", 0.3, 0.7)
         threshold_final = trial.suggest_float("threshold_final", 0.8, 0.99)
     
@@ -433,7 +426,7 @@ def main():
         print(f"🔍 [Step 1] Starting Optuna Search for {CURRENT_MODE}...")
         
         study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=20) # 跑 20 次
+        study.optimize(objective, n_trials=10) # 跑 20 次
         
         print("\n" + "="*40)
         print("🎉 Search Finished!")
