@@ -1,4 +1,4 @@
-# semi_mDPM_final_fix.py
+# semi_mDPM_resume.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,10 +9,10 @@ import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from torchvision.utils import save_image
 import itertools
-from common_dpm import * # 确保您的目录下有 common_dpm.py
+from common_dpm import * # Ensure common_dpm.py exists in your directory
 
 # -----------------------
-# 0. 基础设置 (Reproducibility)
+# 0. Basic Settings (Reproducibility)
 # -----------------------
 def set_seed(seed=42):
     random.seed(seed)
@@ -23,43 +23,36 @@ def set_seed(seed=42):
     print(f"🔒 Seed locked to {seed}")
 
 def plot_dashboard(history, outpath):
-    """绘制训练监控面板：Loss, Acc, Scale, PassRate"""
     epochs = range(1, len(history["loss"]) + 1)
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f'Training Dashboard (Ep {len(history["loss"])})', fontsize=16)
     
     # 1. Loss
-    ax = axes[0, 0]
-    ax.plot(epochs, history["loss"], 'b-', label='Total Loss')
-    ax.set_title('Loss')
-    ax.grid(True, alpha=0.3)
+    if len(history["loss"]) > 0:
+        ax = axes[0, 0]
+        ax.plot(epochs, history["loss"], 'b-', label='Total Loss')
+        ax.set_title('Loss')
+        ax.grid(True, alpha=0.3)
     
-    # 2. Accuracy
-    ax = axes[0, 1]
-    ax.plot(epochs, history["acc"], 'r-', label='Val Acc')
-    ax.set_title('Validation Accuracy')
-    ax.set_ylim(0, 1.0)
-    ax.grid(True, alpha=0.3)
+    # 2. Acc
+    if len(history["acc"]) > 0:
+        ax = axes[0, 1]
+        ax.plot(epochs, history["acc"], 'r-', label='Val Acc')
+        ax.set_title(f'Validation Acc (Best: {max(history["acc"]):.4f})')
+        ax.grid(True, alpha=0.3)
     
     # 3. Scale
-    ax = axes[1, 0]
-    ax.plot(epochs, history["scale"], 'g-', label='Scale')
-    ax.set_title('Dynamic Scale')
-    ax.grid(True, alpha=0.3)
-    
-    # 4. Pass Rate
-    ax = axes[1, 1]
-    ax.plot(epochs, history["pass_rate"], 'm-', label='Pass Rate (%)')
-    ax.set_title('Unlabeled Pass Rate')
-    ax.set_ylim(0, 105)
-    ax.grid(True, alpha=0.3)
+    if len(history["scale"]) > 0:
+        ax = axes[1, 0]
+        ax.plot(epochs, history["scale"], 'g-', label='Scale')
+        ax.set_title('Dynamic Scale')
+        ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(outpath)
     plt.close()
 
 # -----------------------
-# 1. 模型定义
+# 1. Model Definition (Soft-Only Logic)
 # -----------------------
 class mDPM_SemiSup(nn.Module):
     def __init__(self, cfg):
@@ -100,10 +93,10 @@ class mDPM_SemiSup(nn.Module):
         final_logits = log_pi + (avg_neg_mse * scale_factor)
         return final_logits
 
-    def forward(self, x_0, cfg, y=None, current_scale=1.0, threshold=0.0, use_hard_label=False):
+    def forward(self, x_0, cfg, y=None, current_scale=1.0):
         batch_size = x_0.size(0)
 
-        # Path A: 监督路径 (老师教)
+        # Path A: Supervised Path
         if y is not None:
             t = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
@@ -111,41 +104,30 @@ class mDPM_SemiSup(nn.Module):
             y_onehot = F.one_hot(y, num_classes=cfg.num_classes).float()
             pred_noise = self.cond_denoiser(x_t, t, y_onehot)
             dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean') 
-            return dpm_loss, 1.0 # mask_rate=1 for labeled
+            return dpm_loss
 
-        # Path B: 无监督路径 (自学)
+        # Path B: Unsupervised Path (Full Soft Mode)
         else:
+            # 1. Calc Distribution
             logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=current_scale)
             resp = F.softmax(logits, dim=1) 
             
-            if use_hard_label:
-                # [Phase 2: Hard Mode] 
-                # 严厉模式：只有置信度 > threshold (0.95) 才能通过
-                max_probs, pseudo_labels = resp.max(dim=1)
-                mask = (max_probs >= threshold).float()
-                y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
-            else:
-                # [Phase 1: Soft Mode]
-                # 探索模式：Multinomial 采样 + 全通过 (Mask=1)
-                # 即使猜错了也没关系，Scale很小，目的是学特征
-                pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
-                y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
-                mask = torch.ones(batch_size, device=x_0.device)
+            # 2. Soft Sampling (Multinomial)
+            pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
+            y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
 
+            # 3. Training
             t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
             pred_noise = self.cond_denoiser(x_t_train, t_train, y_target)
             
-            loss_per_sample = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
+            dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean')
             
-            # 只有 mask=1 的样本贡献 Loss
-            dpm_loss = (loss_per_sample * mask).sum() / (mask.sum() + 1e-8)
-            
-            return dpm_loss, mask.mean().item()
+            return dpm_loss
 
 # -----------------------
-# 2. 评估与可视化
+# 2. Evaluation Utils
 # -----------------------
 def evaluate_model(model, loader, cfg):
     try:
@@ -164,7 +146,7 @@ def evaluate_model(model, loader, cfg):
             cumulative_mse = torch.zeros(batch_size, cfg.num_classes, device=cfg.device)
             for t_val in eval_timesteps:
                 mse_t_sum = torch.zeros(batch_size, cfg.num_classes, device=cfg.device)
-                for _ in range(3): # n_repeats
+                for _ in range(3):
                     noise = torch.randn_like(x_0)
                     current_t = torch.full((batch_size,), t_val, device=cfg.device, dtype=torch.long)
                     x_t = model.dpm_process.q_sample(x_0, current_t, noise)
@@ -186,143 +168,121 @@ def evaluate_model(model, loader, cfg):
     row_ind, col_ind = linear_sum_assignment(cost_matrix)
     cluster2label = {int(c): int(l) for c, l in zip(col_ind, row_ind)}
     aligned_preds = np.array([cluster2label.get(p, 0) for p in preds])
-    
     return np.mean(aligned_preds == ys_true)
 
-def sample_visual(model, cfg, epoch, save_dir):
-    model.eval()
-    with torch.no_grad():
-        shape = (100, cfg.image_channels, 28, 28)
-        x_t = torch.randn(shape, device=cfg.device)
-        y_cond = torch.arange(10).to(cfg.device).repeat_interleave(10).long()
-        y_vec = F.one_hot(y_cond, 10).float()
-        
-        for i in reversed(range(0, cfg.timesteps)):
-            t = torch.full((100,), i, device=cfg.device).long()
-            pred = model.cond_denoiser(x_t, t, y_vec)
-            
-            alpha_t = model.dpm_process._extract_t(model.dpm_process.alphas, t, shape)
-            one_minus_bar = model.dpm_process._extract_t(model.dpm_process.sqrt_one_minus_alphas_cumprod, t, shape)
-            mu = (x_t - (1-alpha_t)/one_minus_bar * pred) / alpha_t.sqrt()
-            sigma = model.dpm_process._extract_t(model.dpm_process.posterior_variance, t, shape).sqrt()
-            
-            noise = torch.randn_like(x_t) if i > 0 else 0
-            x_t = mu + sigma * noise
-            
-        save_image(x_t.clamp(-1, 1), os.path.join(save_dir, f"ep_{epoch:03d}.png"), nrow=10, normalize=True)
-
 # -----------------------
-# 3. 训练引擎 (修正版)
+# 3. Training Engine (With Resume)
 # -----------------------
-def run_training(model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg):
-    history = {"loss": [], "acc": [], "scale": [], "pass_rate": []}
-    sample_dir = os.path.join(cfg.output_dir, "sample_progress")
-    os.makedirs(sample_dir, exist_ok=True)
+def run_training(model, optimizer, labeled_loader, unlabeled_loader, val_loader, cfg, resume=False):
+    history = {"loss": [], "acc": [], "scale": []}
+    start_epoch = 1
     
-    # === [核心参数配置] ===
-    warmup_epochs = 20      # Phase 1 探索期
-    final_scale = 150.0     # 最终 Scale
+    # === Resume Logic ===
+    ckpt_path = os.path.join(cfg.output_dir, "last_model.pt")
     
-    # [关键] 门槛锁死 0.95
-    fixed_threshold = 0.95  
-    
-    # [关键] Alpha 恒定 0.1
-    alpha_unlabeled = 0.1   
-
-    print(f"🚀 Strategy: Soft-to-Hard | Warmup={warmup_epochs} | Alpha={alpha_unlabeled} | Thres={fixed_threshold}")
-
-    for epoch in range(1, cfg.final_epochs + 1):
+    if resume and os.path.exists(ckpt_path):
+        print(f"🔄 Found checkpoint at {ckpt_path}, loading...")
+        checkpoint = torch.load(ckpt_path, map_location=cfg.device)
         
-        # === Scheduler ===
-        if epoch <= warmup_epochs:
-            # Phase 1: EXPLORE (Soft)
-            status = "EXPLORE"
-            use_hard = False
-            # Scale: 5 -> 20 (温和)
-            p = epoch / warmup_epochs
-            curr_scale = 5.0 + (20.0 - 5.0) * p
-            # 软模式不需要门槛
-            curr_thres = 0.0
-            
+        # Load Model & Optimizer
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        # Restore Epoch & History
+        start_epoch = checkpoint['epoch'] + 1
+        history = checkpoint.get('history', history)
+        
+        print(f"✅ Successfully resumed from Epoch {start_epoch - 1}")
+        print(f"   Last Acc: {history['acc'][-1] if history['acc'] else 'N/A'}")
+    else:
+        if resume:
+            print("⚠️ Resume requested but no checkpoint found. Starting from scratch.")
         else:
-            # Phase 2: REFINE (Hard)
-            status = "REFINE"
-            use_hard = True
-            # Scale: 50 -> 150 (跳变起步，为了过 0.95 门槛)
-            p = (epoch - warmup_epochs) / (cfg.final_epochs - warmup_epochs)
-            curr_scale = 50.0 + (final_scale - 50.0) * p
-            # 硬模式门槛直接锁死 0.95
-            curr_thres = fixed_threshold
+            print("🆕 Starting fresh training.")
+
+    # === [Optimized Strategy: Full Soft Mode] ===
+    # Start high to avoid "ambiguity trap"
+    start_scale = 30.0
+    end_scale = 100.0
+    alpha_unlabeled = 0.1 
+
+    print(f"🚀 Strategy: Full Soft Mode | Scale: {start_scale}->{end_scale} | Alpha={alpha_unlabeled}")
+    print(f"   Labeled Weight: x5.0 (Important!)")
+
+    for epoch in range(start_epoch, cfg.final_epochs + 1):
+        
+        # Linear Scale Increase
+        p = (epoch - 1) / cfg.final_epochs
+        curr_scale = start_scale + (end_scale - start_scale) * p
+        
+        status = "SOFT_TRAIN"
 
         model.train()
         loss_acc = 0
-        mask_acc = 0
         batches = 0
         
-        # 混合数据流
         iterator = zip(itertools.cycle(labeled_loader), unlabeled_loader)
         
         for batch_lab, batch_un in iterator:
             optimizer.zero_grad()
             total_loss = torch.tensor(0.0, device=cfg.device)
             
-            # 1. Labeled Data (Teacher)
+            # 1. Teacher (Labeled) - Weight x5.0
             x_lab, y_lab = batch_lab
             x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device).long()
-            l_sup, _ = model(x_lab, cfg, y=y_lab)
-            total_loss += l_sup
+            l_sup = model(x_lab, cfg, y=y_lab)
+            total_loss += 5.0 * l_sup  # Anchoring
             
-            # 2. Unlabeled Data (Student)
+            # 2. Student (Unlabeled Soft)
             x_un, _ = batch_un
             x_un = x_un.to(cfg.device)
+            l_unsup = model(x_un, cfg, y=None, current_scale=curr_scale)
             
-            l_unsup, mask_rate = model(x_un, cfg, y=None, 
-                                       current_scale=curr_scale, 
-                                       threshold=curr_thres,
-                                       use_hard_label=use_hard)
-            
-            # [关键] 乘以 0.1 的保护系数
             total_loss += alpha_unlabeled * l_unsup
             
             total_loss.backward()
             optimizer.step()
-            
             loss_acc += total_loss.item()
-            mask_acc += mask_rate
             batches += 1
             
         # Logging
         val_acc = evaluate_model(model, val_loader, cfg)
         avg_loss = loss_acc/batches if batches > 0 else 0
-        avg_pass = (mask_acc/batches)*100 if batches > 0 else 0
         
         history["loss"].append(avg_loss)
         history["acc"].append(val_acc)
         history["scale"].append(curr_scale)
-        history["pass_rate"].append(avg_pass)
         
-        print(f"Ep {epoch} [{status}] Scale={curr_scale:.1f} Thres={curr_thres:.2f} | Loss: {avg_loss:.4f} | Acc: {val_acc:.4f} | Pass: {avg_pass:.1f}%")
+        print(f"Ep {epoch} [{status}] Scale={curr_scale:.1f} | Loss: {avg_loss:.4f} | Acc: {val_acc:.4f}")
         
         plot_dashboard(history, os.path.join(cfg.output_dir, "training_dashboard.png"))
         
-        if epoch % 5 == 0:
-            sample_visual(model, cfg, epoch, sample_dir)
-            # 保存 Checkpoint
-            torch.save(model.state_dict(), os.path.join(cfg.output_dir, "last_model.pt"))
+        # Save Checkpoint (Every Epoch)
+        # Includes epoch, state_dict, and history for resuming
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'history': history
+        }, os.path.join(cfg.output_dir, "last_model.pt"))
 
 def main():
     set_seed(42)
     cfg = Config()
-    
-    # [关键] 必须设置每类标签数，否则 labeled_loader 为空
     cfg.labeled_per_class = 10 
-    
     cfg.final_epochs = 60
     cfg.posterior_sample_steps = 5
     
+    # ================================
+    # [CONTROL SWITCH]
+    # Set to True to load 'last_model.pt' and continue
+    # Set to False to start a new training
+    # ================================
+    RESUME_TRAINING = False  
+    
     print("="*40)
-    print(">>> FINAL FIXED SEMI-SUPERVISED TRAINING <<<")
-    print(f"Config: Labeled={cfg.labeled_per_class}, Ep={cfg.final_epochs}")
+    print(">>> FULL SOFT-MODE SEMI-SUPERVISED TRAINING <<<")
+    print(f"RESUME MODE: {RESUME_TRAINING}")
     print("="*40)
     
     model = mDPM_SemiSup(cfg).to(cfg.device)
@@ -330,7 +290,7 @@ def main():
     
     lab_loader, unlab_loader, val_loader = get_semi_loaders(cfg)
     
-    run_training(model, optimizer, lab_loader, unlab_loader, val_loader, cfg)
+    run_training(model, optimizer, lab_loader, unlab_loader, val_loader, cfg, resume=RESUME_TRAINING)
 
 if __name__ == "__main__":
     main()
