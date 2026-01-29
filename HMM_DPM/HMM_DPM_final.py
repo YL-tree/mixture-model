@@ -69,16 +69,6 @@ class ConditionalDiffusionNet(nn.Module):
             nn.Linear(hidden_dim, input_dim)
         )
 
-        # 【新增】解码器 p(y | z_1, x)
-        # 将 z_1 (维度 input_dim) 和 状态嵌入 映射回 y (维度 input_dim)
-        self.decoder = nn.Sequential(
-            nn.Linear(input_dim + hidden_dim, hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
-
     def forward(self, x, t, state):
         """预测噪声 (Denoising)"""
         t_emb = self.time_mlp(t)
@@ -86,12 +76,6 @@ class ConditionalDiffusionNet(nn.Module):
         s_emb = self.state_emb(state)
         h = torch.cat([x_emb, t_emb, s_emb], dim=1)
         return self.mid_block(h)
-
-    def decode(self, z_1, state):
-        """解码: p(y | z_1, x)"""
-        s_emb = self.state_emb(state)
-        h = torch.cat([z_1, s_emb], dim=-1)
-        return self.decoder(h)
 
 class HMM_DPM(nn.Module):
     def __init__(self, input_dim, n_states=2, n_steps=100, hidden_dim=128):
@@ -131,68 +115,12 @@ class HMM_DPM(nn.Module):
         predicted_noise = self.net(x_t, t, state_flat)
         return F.mse_loss(predicted_noise, noise)
 
-    # 【新增】前向扩散采样: 获取完整轨迹 z_0 ... z_T
-    def forward_diffusion(self, y):
+    def compute_emission_logprob(self, x, n_time_samples=8):
         """
-        前向扩散: y -> z_T
-        q(z_t | z_{t-1}) = N(√α_t z_{t-1}, (1-α_t)I)
-        """
-        z = [y]  # z_0 = y
-        for t in range(1, self.n_steps):
-            noise = torch.randn_like(z[-1])
-            alpha_t = self.alphas[t]
-            z_t = torch.sqrt(alpha_t) * z[-1] + torch.sqrt(1 - alpha_t) * noise
-            z.append(z_t)
-        return torch.stack(z, dim=1)  # (batch, T+1, dim)
-
-    # 【新增】计算反向扩散概率
-    def compute_reverse_logprob(self, z_traj, state):
-        """
-        蒙特卡洛近似计算 Σ log p(z_t | z_{t+1}, x=state)
-        """
-        B, T_plus_1, D = z_traj.shape
-        T = T_plus_1 - 1
-        
-        # 随机采样 M 个时间步来近似求和 (论文 P9)
-        n_samples = min(10, T)
-        sampled_t = torch.randint(0, T, (n_samples,), device=z_traj.device)
-        
-        log_prob = 0
-        for t in sampled_t:
-            z_t = z_traj[:, t, :]      # Target
-            z_t_plus_1 = z_traj[:, t+1, :] # Input
-            
-            t_tensor = torch.full((B,), t, device=z_traj.device).long()
-            
-            # 预测噪声
-            pred_noise = self.net(z_t_plus_1, t_tensor, state)
-            
-            # 计算 p(z_t | z_{t+1}) 的均值和方差
-            alpha_t = self.alphas[t]
-            alpha_bar_t = self.alphas_cumprod[t]
-            alpha_bar_t_plus_1 = self.alphas_cumprod[t+1] if t < T-1 else torch.tensor(0.0).to(z_traj.device)
-            
-            # DDPM 后验均值公式 (简化版，用于 reverse process p)
-            # 注意: 这里计算的是 p_theta 的均值，近似于 q 的后验
-            # mu_theta = 1/sqrt(alpha_t) * (x_t - (1-alpha_t)/sqrt(1-alpha_bar_t) * epsilon)
-            coef = (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t_plus_1) #近似
-            mu_pred = (z_t_plus_1 - coef * pred_noise) / torch.sqrt(alpha_t)
-            
-            # 方差 (简化为 fixed variance)
-            sigma2_t = (1 - alpha_bar_t) / (1 - alpha_bar_t_plus_1) * (1 - alpha_t)
-            sigma2_t = torch.clamp(sigma2_t, min=1e-5)
-            
-            # log N(z_t | mu_pred, sigma2)
-            # 忽略常数项 -0.5 * log(2pi * sigma2)
-            log_prob += -0.5 * ((z_t - mu_pred)**2 / sigma2_t).sum(dim=-1)
-            
-        # 缩放回完整的时间步
-        return log_prob * (T / n_samples)
-
-    # 【修正】计算发射概率 log p(y, z | x)
-    def compute_emission_probs(self, x, n_traj_samples=1):
-        """
-        论文公式: log p(y, z | x=k) = log p(y|z_1) + log p(z_reverse) + log p(z_T)
+        用 diffusion MSE loss 作为 emission probability:
+        log p(y | state=k) ∝ -E_t[ ||eps - eps_theta(x_t, t, k)||^2 ]
+        对每个状态 k，计算去噪误差的负值作为 log emission prob。
+        多时间步采样取平均以降低方差。
         """
         if x.dim() == 3:
             B, L, D = x.shape
@@ -201,49 +129,38 @@ class HMM_DPM(nn.Module):
             B, D = x.shape
             L = 1
             x_flat = x
-            
+
         flat_batch = x_flat.shape[0]
-        log_probs_flat = torch.zeros(flat_batch, self.n_states).to(x.device)
-        
+        log_probs_flat = torch.zeros(flat_batch, self.n_states, device=x.device)
+
+        # 采样共享的时间步和噪声（所有状态共享，保证公平比较）
+        t_samples = torch.randint(0, self.n_steps, (n_time_samples, flat_batch), device=x.device).long()
+        noise_samples = torch.randn(n_time_samples, flat_batch, D, device=x.device)
+
         for k in range(self.n_states):
             state_tensor = torch.full((flat_batch,), k, device=x.device).long()
-            
-            traj_log_probs = []
-            for _ in range(n_traj_samples):
-                # 1. 前向扩散采样轨迹: y -> z_0...z_T
-                # 注意: 这里的 z_traj[0] 是 y (z_0)
-                z_trajectory = self.forward_diffusion(x_flat) 
-                
-                # 2. 解码器概率: log p(y | z_1, x)
-                # 论文中 y 是观测，z_1 是第一个潜变量
-                z_1 = z_trajectory[:, 1, :] # index 1 corresponds to t=1
-                y_recon = self.net.decode(z_1, state_tensor)
-                log_p_y = -0.5 * ((x_flat - y_recon)**2).sum(dim=-1)
-                
-                # 3. 反向扩散概率
-                log_p_reverse = self.compute_reverse_logprob(z_trajectory, state_tensor)
-                
-                # 4. 先验概率 log p(z_T)
-                z_T = z_trajectory[:, -1, :]
-                log_p_prior = -0.5 * (z_T**2).sum(dim=-1)
-                
-                total = log_p_y + log_p_reverse + log_p_prior
-                traj_log_probs.append(total)
-            
-            # 蒙特卡洛平均
-            if n_traj_samples > 1:
-                avg_log_prob = torch.logsumexp(torch.stack(traj_log_probs, dim=0), dim=0) - np.log(n_traj_samples)
-            else:
-                avg_log_prob = traj_log_probs[0]
-                
-            log_probs_flat[:, k] = avg_log_prob
-            
+            mse_accum = torch.zeros(flat_batch, device=x.device)
+
+            for s in range(n_time_samples):
+                t = t_samples[s]
+                noise = noise_samples[s]
+                alpha_bar = self.alphas_cumprod[t].view(-1, 1)
+                x_t = torch.sqrt(alpha_bar) * x_flat + torch.sqrt(1 - alpha_bar) * noise
+                pred_noise = self.net(x_t, t, state_tensor)
+                # 每样本的 MSE（对特征维度取均值）
+                mse = ((pred_noise - noise) ** 2).mean(dim=-1)
+                mse_accum += mse
+
+            # 取时间步平均，然后取负值作为 log emission prob
+            avg_mse = mse_accum / n_time_samples
+            log_probs_flat[:, k] = -avg_mse
+
         return log_probs_flat.reshape(B, L, self.n_states)
 
     def forward_backward_sampling(self, x):
         # 使用修正后的发射概率
         with torch.no_grad():
-            log_emission = self.compute_emission_probs(x, n_traj_samples=1)
+            log_emission = self.compute_emission_logprob(x)
             
         B, L, K = log_emission.shape
         log_trans = F.log_softmax(self.trans_logits, dim=1)
@@ -273,7 +190,7 @@ class HMM_DPM(nn.Module):
 
     def viterbi_decode(self, x):
         with torch.no_grad():
-            log_emission = self.compute_emission_probs(x, n_traj_samples=1)
+            log_emission = self.compute_emission_logprob(x)
         
         B, L, K = log_emission.shape
         log_trans = F.log_softmax(self.trans_logits, dim=1)
@@ -312,7 +229,7 @@ class ShowcasePlotter:
             axes[0].legend()
         if 'pvem_loss' in history and len(history['pvem_loss']) > 0:
             axes[1].plot(history['pvem_loss'], label='PVEM Loss', color='blue')
-            axes[1].set_title("Stage 2: Joint Training (Diffusion + Recon)")
+            axes[1].set_title("Stage 2: Joint Training (Diffusion)")
             axes[1].legend()
         plt.tight_layout()
         plt.savefig(filename)
@@ -406,8 +323,7 @@ def train_and_evaluate(params, raw_data, device, is_final_run=False):
     HIDDEN_DIM = params['hidden_dim']
     BATCH_SIZE = params['batch_size']
     
-    # 增加 Epoch，因为 M-step 变复杂了
-    WARMUP_EPOCHS = 20 if is_final_run else 2
+    WARMUP_EPOCHS = 50 if is_final_run else 2
     PVEM_EPOCHS = 100 if is_final_run else 2
     
     # 1. 准备数据 (无泄露)
@@ -466,66 +382,43 @@ def train_and_evaluate(params, raw_data, device, is_final_run=False):
 
     # --- Stage 2: Joint PVEM Training ---
     print(">>> Stage 2: PVEM Training...")
-    
+    EMA_ALPHA = 0.3  # EMA 平滑系数
+
     for epoch in range(PVEM_EPOCHS):
         model.train()
         t_loss = 0
         n_batches = len(train_loader)
-        
+
+        # 每个 epoch 收集全局转移统计量
+        epoch_trans_counts = torch.zeros(N_STATES, N_STATES, device=device)
+
         for i, (bx,) in enumerate(train_loader):
             # --- E-Step: Sampling States ---
-            # 使用 forward-backward 算法采样状态
             with torch.no_grad():
                 sampled_states = model.forward_backward_sampling(bx)
-            
-            # --- M-Step: Optimizing Parameters ---
+
+            # 累积转移统计量
+            with torch.no_grad():
+                for b in range(sampled_states.shape[0]):
+                    for t in range(sampled_states.shape[1] - 1):
+                        s_curr = sampled_states[b, t]
+                        s_next = sampled_states[b, t + 1]
+                        epoch_trans_counts[s_curr, s_next] += 1
+
+            # --- M-Step: 只优化 diffusion loss ---
             optimizer.zero_grad()
-            
-            # 1. 扩散损失 (L_diffusion)
             loss_diff = model.get_diffusion_loss(bx, sampled_states)
-            
-            # 2. 重建损失 (L_recon) - 【新增】优化解码器
-            # 我们需要 z_1 来做解码。这里简单地通过 forward_diffusion 获取 z_1
-            # 注意: 为了效率，我们可以只采样一步或者复用逻辑
-            # 这里为了准确，我们做一次前向扩散到 t=1
-            t1 = torch.ones(bx.shape[0] * bx.shape[1], device=device).long()
-            bx_flat = bx.reshape(-1, bx.shape[-1])
-            states_flat = sampled_states.reshape(-1)
-            
-            # Forward diffusion to t=1
-            noise = torch.randn_like(bx_flat)
-            alpha_1 = model.alphas[1] # t=1
-            z_1 = torch.sqrt(alpha_1) * bx_flat + torch.sqrt(1 - alpha_1) * noise
-            
-            # Decode
-            y_recon = model.net.decode(z_1, states_flat)
-            loss_recon = F.mse_loss(y_recon, bx_flat)
-            
-            # 3. 总损失
-            # 赋予重建损失较高权重，保证状态具有物理意义
-            total_loss = loss_diff + 10.0 * loss_recon
-            
-            total_loss.backward()
+            loss_diff.backward()
             optimizer.step()
-            t_loss += total_loss.item()
-            
-            # 4. 【新增】显式更新 HMM 参数
-            # 每隔几个 batch 更新一次 HMM，或者每个 batch 都更新
-            if (i + 1) % 5 == 0:
-                with torch.no_grad():
-                    # 统计转移
-                    trans_counts = torch.zeros(N_STATES, N_STATES, device=device)
-                    for b in range(sampled_states.shape[0]):
-                        for t in range(sampled_states.shape[1]-1):
-                            s_curr = sampled_states[b, t]
-                            s_next = sampled_states[b, t+1]
-                            trans_counts[s_curr, s_next] += 1
-                    
-                    # 平滑 + 归一化
-                    trans_counts += 1.0 
-                    trans_probs = trans_counts / trans_counts.sum(dim=1, keepdim=True)
-                    # 更新 logits
-                    model.trans_logits.data = torch.log(trans_probs)
+            t_loss += loss_diff.item()
+
+        # Epoch 结束后：用 EMA 更新 HMM 转移矩阵
+        with torch.no_grad():
+            epoch_trans_counts += 1.0  # Laplace 平滑
+            new_trans_probs = epoch_trans_counts / epoch_trans_counts.sum(dim=1, keepdim=True)
+            old_trans_probs = F.softmax(model.trans_logits, dim=1)
+            smoothed_probs = EMA_ALPHA * new_trans_probs + (1 - EMA_ALPHA) * old_trans_probs
+            model.trans_logits.data = torch.log(smoothed_probs + 1e-8)
 
         avg_loss = t_loss / n_batches
         history['pvem_loss'].append(avg_loss)
