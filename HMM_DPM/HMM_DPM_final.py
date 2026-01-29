@@ -607,49 +607,68 @@ def train_hmm_dpm(returns_data, config, device):
     
     # ===== Stage 2: EM Training =====
     print("\n>>> Stage 2: EM联合训练...")
-    
+    EMA_ALPHA = 0.3  # 转移矩阵 EMA 平滑系数
+
     for epoch in range(config['em_epochs']):
         model.train()
         epoch_diff_loss = 0
         epoch_recon_loss = 0
-        
+
+        # 每个 epoch 收集全局转移统计量
+        epoch_trans_counts = torch.zeros(config['n_states'], config['n_states'], device=device)
+
         # 打乱数据
         perm = torch.randperm(len(X_train))
         X_shuffled = X_train[perm]
         n_batches = len(X_train) // config['batch_size']
-        
+
         for i in range(n_batches):
             bx = X_shuffled[i * config['batch_size'] : (i+1) * config['batch_size']]
-            
+
             # E-step: 采样状态
             with torch.no_grad():
                 sampled_states = model.forward_backward_sampling(bx)
-            
+
+            # 累积转移统计量
+            with torch.no_grad():
+                for b in range(sampled_states.shape[0]):
+                    for t in range(sampled_states.shape[1] - 1):
+                        s_curr = sampled_states[b, t]
+                        s_next = sampled_states[b, t + 1]
+                        epoch_trans_counts[s_curr, s_next] += 1
+
             # M-step: 优化模型
             optimizer.zero_grad()
-            
+
             # 1. 扩散损失
             diff_loss = model.get_diffusion_loss(bx, sampled_states)
-            
+
             # 2. 重建损失
             with torch.no_grad():
-                # 简化: 用原始y作为z_1的近似
                 z_1 = bx + torch.randn_like(bx) * 0.1
             recon_loss = model.get_reconstruction_loss(bx, z_1, sampled_states)
-            
+
             # 总损失
             total_loss = diff_loss + 5.0 * recon_loss
-            
+
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            
+
             epoch_diff_loss += diff_loss.item()
             epoch_recon_loss += recon_loss.item()
-        
+
+        # Epoch 结束后：用 EMA 更新 HMM 转移矩阵
+        with torch.no_grad():
+            epoch_trans_counts += 1.0  # Laplace 平滑
+            new_trans_probs = epoch_trans_counts / epoch_trans_counts.sum(dim=1, keepdim=True)
+            old_trans_probs = F.softmax(model.trans_logits, dim=1)
+            smoothed_probs = EMA_ALPHA * new_trans_probs + (1 - EMA_ALPHA) * old_trans_probs
+            model.trans_logits.data = torch.log(smoothed_probs + 1e-8)
+
         history['em_diffusion'].append(epoch_diff_loss / n_batches)
         history['em_reconstruction'].append(epoch_recon_loss / n_batches)
-        
+
         # 计算状态分离度
         with torch.no_grad():
             trans_matrix = F.softmax(model.trans_logits, dim=1).cpu().numpy()
