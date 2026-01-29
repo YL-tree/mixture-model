@@ -6,6 +6,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.cluster import KMeans
@@ -147,13 +149,14 @@ class HMM_DPM(nn.Module):
                 alpha_bar = self.alphas_cumprod[t].view(-1, 1)
                 x_t = torch.sqrt(alpha_bar) * x_flat + torch.sqrt(1 - alpha_bar) * noise
                 pred_noise = self.net(x_t, t, state_tensor)
-                # 每样本的 MSE（对特征维度取均值）
-                mse = ((pred_noise - noise) ** 2).mean(dim=-1)
-                mse_accum += mse
+                # 每样本的 SSE（对特征维度求和，对应高斯 log-likelihood）
+                sse = ((pred_noise - noise) ** 2).sum(dim=-1)
+                mse_accum += sse
 
             # 取时间步平均，然后取负值作为 log emission prob
-            avg_mse = mse_accum / n_time_samples
-            log_probs_flat[:, k] = -avg_mse
+            # 除以 2*sigma^2，这里 sigma=1，所以除以 2
+            avg_sse = mse_accum / n_time_samples
+            log_probs_flat[:, k] = -0.5 * avg_sse
 
         return log_probs_flat.reshape(B, L, self.n_states)
 
