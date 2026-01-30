@@ -376,3 +376,58 @@ MIT License
 ## 联系方式
 
 Issues and Pull Requests are welcome!
+
+
+---                                                                                                                                        
+  核心问题：预训练时 VAE 的状态条件输入是常量，导致解码器学会了忽略状态信息                                                                  
+                                                                                                                                             
+  这是最根本的问题。看 hmm_vae_complete.py:103-114 的 forward 方法：                                                                         
+                                                                                                                                             
+  def forward(self, y, state_onehot=None):                                                                                                   
+      if state_onehot is None:                                                                                                               
+          # 训练初期,使用均匀状态分布                                                                                                        
+          state_onehot = torch.ones(batch, seq_len, self.n_states).to(y.device) / self.n_states                                              
+      recon = self.decode(z, state_onehot)                                                                                                   
+                                                                                                                                             
+  预训练阶段 (run_experiment.py:95) 调用 vae(batch_x) 时不传 state_onehot，所以每次输入到解码器的状态都是 [1/3, 1/3,                         
+  1/3]。50个epoch的预训练下来，解码器完全学会了忽略状态输入——因为它是常量，梯度为零，与状态相关的权重几乎没有更新。                          
+                                                                                                                                             
+  这直接导致了一个鸡生蛋的死循环：                                                                                                           
+  1. 解码器不区分状态 → 不同状态的发射概率几乎相同                                                                                           
+  2. 发射概率相同 → HMM 无法区分状态 → 采样出的状态接近随机                                                                                  
+  3. 随机状态 → 解码器仍然学不到有意义的状态条件模式                                                                                         
+                                                                                                                                             
+  从你的结果可以直接验证这一点：                                                                                                             
+                                                                                                                                             
+  - 转移矩阵接近均匀分布：对角线值 (0.269, 0.495, 0.340) 没有明显的自持性，说明 HMM 没学到有意义的状态结构                                   
+  - Stage1 和 Stage2 的 VAE 质量差异不大：R² 从 0.5086 → 0.6920，说明 EM 联合训练对 VAE 的提升有限，状态条件没真正起作用                     
+                                                                                                                                             
+  ---                                                                                                                                        
+  其他问题                                                                                                                                   
+                                                                                                                                             
+  1. 压缩比过高：500维 → 12维                                                                                                                
+                                                                                                                                             
+  500个股票的特征压缩到12维潜空间，R² 只有 0.5，说明信息损失严重。Latent Distribution vs Prior 图中，latent z 的实际分布 N(0.00, 0.81)       
+  方差偏小，说明 VAE 的表达能力受限。                                                                                                        
+                                                                                                                                             
+  2. Training Dashboard 中 Recon Loss 在 EM 阶段先降后升                                                                                     
+                                                                                                                                             
+  底部的 "VAE Components Over Time" 图显示，Reconstruction Loss 在 EM 训练后半段（约 epoch 60 之后）开始反弹上升，同时 KL Divergence         
+  持续增长。这是典型的 KL-Recon 冲突——HMM 采样出的状态引入了噪声，但由于状态条件不起作用，VAE 无法利用这些信息来改善重建，反而被干扰。       
+                                                                                                                                             
+  3. compute_emission_logprob 中解码器用了 torch.no_grad()                                                                                   
+                                                                                                                                             
+  hmm_vae_complete.py:170-171：                                                                                                              
+  with torch.no_grad():                                                                                                                      
+      y_recon = self.vae.decode(z, state_onehot)                                                                                             
+                                                                                                                                             
+  这意味着 HMM 优化发射概率时，VAE 解码器是完全冻结的。虽然这在标准 EM                                                                       
+  中是合理的，但在你的情况下加剧了问题——因为解码器本身就不区分状态，冻住它让 HMM 更难学到好的状态分配。                                      
+                                                                                                                                             
+  ---                                                                                                                                        
+  建议修复方向                                                                                                                               
+                                                                                                                                             
+  1. 预训练时使用随机状态采样，而不是固定均匀分布，让解码器从一开始就学会利用状态信息                                                        
+  2. 增大 latent_dim（比如 32 或 64），或增加 encoder/decoder 层数，提升 VAE 表达能力                                                        
+  3. EM 训练初期，先冻结 HMM 只更新 VAE 几轮，让 VAE 先适应状态条件解码                                                                      
+  4. 考虑用 KL annealing（从 0 逐渐增加到目标权重），避免 KL-Recon 冲突    

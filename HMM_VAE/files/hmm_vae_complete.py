@@ -47,31 +47,45 @@ class ConditionalVAE(nn.Module):
     - 编码器: q_φ(z | y)
     - 解码器: p_θ(y | z, x_state) [关键: 以状态为条件]
     """
-    def __init__(self, input_dim, latent_dim, n_states, hidden_dim=256):
+    def __init__(self, input_dim, latent_dim, n_states, hidden_dim=512):
         super(ConditionalVAE, self).__init__()
         self.input_dim = input_dim
         self.latent_dim = latent_dim
         self.n_states = n_states
-        
-        # 编码器: y -> (mu, logvar)
+
+        # 编码器: y -> (mu, logvar) [4层]
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
         self.fc_mu = nn.Linear(hidden_dim, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
-        
-        # 解码器: (z, x_state) -> y
-        # 输入维度 = latent_dim + n_states (one-hot)
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim + n_states, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, input_dim)
-        )
+
+        # 解码器: FiLM条件解码 (z, x_state) -> y
+        # 独立线性层 (输入不含 n_states，状态通过 FiLM 调制注入)
+        self.dec_fc1 = nn.Linear(latent_dim, hidden_dim)
+        self.dec_fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.dec_fc3 = nn.Linear(hidden_dim, hidden_dim)
+        self.dec_out = nn.Linear(hidden_dim, input_dim)
+
+        # FiLM生成器: state one-hot -> (gamma, beta) 对每层
+        self.film1 = nn.Linear(n_states, hidden_dim * 2)
+        self.film2 = nn.Linear(n_states, hidden_dim * 2)
+        self.film3 = nn.Linear(n_states, hidden_dim * 2)
+
+        # State-Conditional Prior: p(z|x=k) = N(μ_k, σ²_k)
+        # 每个状态有独立的先验中心,KL项会把不同状态的z推向不同区域
+        # 初始化要小 (0.5): 太大会让KL压倒重建,导致z坍缩
+        # 模型训练中会自动学习合适的分离度
+        init_prior_mu = torch.zeros(n_states, latent_dim)
+        for k in range(n_states):
+            init_prior_mu[k, k % latent_dim] = 0.5
+        self.prior_mu = nn.Parameter(init_prior_mu)
+        self.prior_logvar = nn.Parameter(torch.zeros(n_states, latent_dim))
     
     def encode(self, y):
         """
@@ -90,29 +104,77 @@ class ConditionalVAE(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
     
+    def kl_divergence(self, mu, logvar, state_onehot):
+        """
+        State-Conditional KL: KL(q(z|y) || p(z|x))
+
+        不同状态有不同的先验中心,KL项会把z推向对应状态的先验区域,
+        从而在潜空间中形成按状态分离的聚类。
+
+        mu, logvar: (..., latent_dim)
+        state_onehot: (..., n_states) — 可以是hard one-hot或soft概率
+        返回: scalar (mean KL)
+        """
+        # 根据状态加权得到当前样本的先验参数
+        # state_onehot @ prior_mu: (..., n_states) x (n_states, latent_dim) → (..., latent_dim)
+        p_mu = torch.matmul(state_onehot, self.prior_mu)
+        p_logvar = torch.matmul(state_onehot, self.prior_logvar)
+
+        # KL(N(mu, sigma²) || N(p_mu, p_sigma²))
+        kl = 0.5 * (p_logvar - logvar
+                     + (logvar.exp() + (mu - p_mu) ** 2) / (p_logvar.exp() + 1e-8)
+                     - 1)
+        return kl.sum(dim=-1).mean()
+
+    def _film_layer(self, h, film_gen, state_onehot):
+        """FiLM调制: h' = gamma * h + beta"""
+        film_params = film_gen(state_onehot)  # (..., hidden_dim * 2)
+        gamma, beta = film_params.chunk(2, dim=-1)  # 各 (..., hidden_dim)
+        gamma = gamma + 1.0  # 中心化在1附近，避免初始化时缩放过大
+        return gamma * h + beta
+
     def decode(self, z, state_onehot):
         """
-        条件解码器: p_θ(y | z, x_state)
+        FiLM条件解码器: p_θ(y | z, x_state)
         z: (batch, seq_len, latent_dim) 或 (batch, latent_dim)
         state_onehot: (batch, seq_len, n_states) 或 (batch, n_states)
         """
-        # 拼接z和状态信息
-        z_cond = torch.cat([z, state_onehot], dim=-1)
-        return self.decoder(z_cond)
+        h = self.dec_fc1(z)
+        h = self._film_layer(h, self.film1, state_onehot)
+        h = F.relu(h)
+
+        h = self.dec_fc2(h)
+        h = self._film_layer(h, self.film2, state_onehot)
+        h = F.relu(h)
+
+        h = self.dec_fc3(h)
+        h = self._film_layer(h, self.film3, state_onehot)
+        h = F.relu(h)
+
+        return self.dec_out(h)
     
     def forward(self, y, state_onehot=None):
         """
         完整前向传播
-        如果state_onehot为None,则使用均匀分布作为状态
+        如果state_onehot为None,使用均匀软状态(预训练模式),
+        FiLM解码器下均匀分布不引入噪声,保护重建质量
         """
         mu, logvar = self.encode(y)
         z = self.reparameterize(mu, logvar)
-        
+
         if state_onehot is None:
-            # 训练初期,使用均匀状态分布
-            batch, seq_len = y.shape[0], y.shape[1]
-            state_onehot = torch.ones(batch, seq_len, self.n_states).to(y.device) / self.n_states
-        
+            # 使用均匀软状态,避免FiLM随机调制破坏重建质量
+            # 均匀分布让所有样本获得相同的gamma/beta,无噪声
+            uniform_val = 1.0 / self.n_states
+            if y.dim() == 3:
+                batch, seq_len = y.shape[0], y.shape[1]
+                state_onehot = torch.full((batch, seq_len, self.n_states),
+                                          uniform_val, device=y.device)
+            else:
+                batch = y.shape[0]
+                state_onehot = torch.full((batch, self.n_states),
+                                          uniform_val, device=y.device)
+
         recon = self.decode(z, state_onehot)
         return recon, mu, logvar, z
 
@@ -137,7 +199,9 @@ class HMM_ForwardBackward(nn.Module):
         
         # HMM参数
         self.start_logits = nn.Parameter(torch.zeros(n_states))
-        self.trans_logits = nn.Parameter(torch.randn(n_states, n_states) * 0.1)
+        init_logits = torch.randn(n_states, n_states) * 0.1
+        init_logits += torch.eye(n_states) * 2.0  # softmax后对角≈0.7
+        self.trans_logits = nn.Parameter(init_logits)
     
     def get_transition_matrix(self):
         """获取转移矩阵 A"""
@@ -150,36 +214,43 @@ class HMM_ForwardBackward(nn.Module):
     def compute_emission_logprob(self, y, z):
         """
         计算发射概率: log p(y, z | x_k)
-        
+
         根据论文:
-        p(y_i, z_i | x_i = s_k) = p(y_i | z_i, x_i = s_k) · p(z_i)
-        
+        p(y_i, z_i | x_i = s_k) = p(y_i | z_i, x_i = s_k) · p(z_i | x_i = s_k)
+
+        使用 State-Conditional Prior: p(z|x=k) = N(μ_k, σ²_k)
+        不同状态有不同的先验,z靠近哪个状态中心就更可能属于该状态。
+
         y: (batch, input_dim)
         z: (batch, latent_dim)
         返回: (batch, n_states)
         """
         batch = y.shape[0]
         log_probs = torch.zeros(batch, self.n_states).to(y.device)
-        
+
         for k in range(self.n_states):
             # 创建状态one-hot编码
             state_onehot = torch.zeros(batch, self.n_states).to(y.device)
             state_onehot[:, k] = 1.0
-            
+
             # 1. 计算 log p(y | z, x=k) 通过VAE解码器
             with torch.no_grad():
                 y_recon = self.vae.decode(z, state_onehot)
-            
-            # 使用MSE作为似然 (假设高斯分布)
-            # log p(y|z,x) ∝ -||y - y_recon||^2
+
             log_p_y_given_z = -0.5 * ((y - y_recon) ** 2).sum(dim=-1)
-            
-            # 2. 计算 log p(z) = log N(0, I)
-            log_p_z = -0.5 * (z ** 2).sum(dim=-1) - 0.5 * self.latent_dim * np.log(2 * np.pi)
-            
+
+            # 2. 计算 log p(z | x=k) = log N(z; μ_k, σ²_k) — State-Conditional Prior
+            prior_mu_k = self.vae.prior_mu[k]           # (latent_dim,)
+            prior_logvar_k = self.vae.prior_logvar[k]    # (latent_dim,)
+            log_p_z = -0.5 * (
+                prior_logvar_k.sum()
+                + ((z - prior_mu_k.unsqueeze(0)) ** 2 / (prior_logvar_k.exp().unsqueeze(0) + 1e-8)).sum(dim=-1)
+                + self.latent_dim * np.log(2 * np.pi)
+            )
+
             # 3. 组合
             log_probs[:, k] = log_p_y_given_z + log_p_z
-        
+
         return log_probs
     
     def forward_algorithm(self, y_seq, z_seq):
@@ -325,70 +396,83 @@ class EM_Trainer:
         self.optimizer_vae = optim.Adam(vae.parameters(), lr=1e-3)
         self.optimizer_hmm = optim.Adam(hmm.parameters(), lr=1e-2)
     
-    def em_step(self, y_batch, temperature=1.0):
+    def em_step(self, y_batch, temperature=1.0, warmup=False, kl_weight=0.1,
+                freeze_hmm=False):
         """
         一次EM迭代
-        
+
         y_batch: (batch, seq_len, input_dim)
+        warmup: 若为True,使用更大recon权重、更小KL权重
+        kl_weight: KL散度权重(可由外部KL annealing控制)
+        freeze_hmm: 若为True,只更新VAE(冻结HMM)
         返回: loss_dict
         """
         batch, seq_len, input_dim = y_batch.shape
-        
+
+        # warm-up阶段调整权重
+        if warmup:
+            effective_kl_weight = kl_weight * 0.1  # 更小KL
+        else:
+            effective_kl_weight = kl_weight
+
         # ================== E-step ==================
         # 1. 编码: 获取 z ~ q_φ(z | y)
         with torch.no_grad():
             mu, logvar = self.vae.encode(y_batch)
             z = self.vae.reparameterize(mu, logvar)
-        
+
         # 2. Forward算法: 计算α
         with torch.no_grad():
             alpha = self.hmm.forward_algorithm(y_batch, z)
-        
+
         # 3. Backward采样: 采样 X ~ p(X | Z, Y)
         with torch.no_grad():
             sampled_states = self.hmm.backward_sampling(alpha, temperature)  # (batch, seq_len, n_states)
-        
+
         # ================== M-step ==================
         # 1. 更新VAE参数
         self.optimizer_vae.zero_grad()
-        
+
         # 重新编码(带梯度)
         mu, logvar = self.vae.encode(y_batch)
         z = self.vae.reparameterize(mu, logvar)
-        
+
         # 条件解码
         y_recon = self.vae.decode(z, sampled_states)
-        
-        # VAE损失
+
+        # VAE损失 (State-Conditional KL)
         recon_loss = F.mse_loss(y_recon, y_batch)
-        kld_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-        vae_loss = recon_loss + 0.1 * kld_loss
-        
+        kld_loss = self.vae.kl_divergence(mu, logvar, sampled_states)
+        vae_loss = recon_loss + effective_kl_weight * kld_loss
+
         vae_loss.backward()
         self.optimizer_vae.step()
-        
-        # 2. 更新HMM参数
-        self.optimizer_hmm.zero_grad()
-        
-        # 重新计算z(带梯度)
-        with torch.no_grad():
-            mu, logvar = self.vae.encode(y_batch)
-        z = self.vae.reparameterize(mu, logvar)
-        
-        # 计算HMM负对数似然
-        alpha = self.hmm.forward_algorithm(y_batch, z)
-        log_likelihood = torch.logsumexp(alpha[:, -1, :], dim=1)
-        hmm_loss = -log_likelihood.mean()
-        
-        hmm_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.hmm.parameters(), 1.0)
-        self.optimizer_hmm.step()
-        
+
+        # 2. 更新HMM参数 (freeze_hmm时跳过)
+        hmm_loss_val = 0.0
+        if not freeze_hmm:
+            self.optimizer_hmm.zero_grad()
+
+            # 重新计算z(带梯度)
+            with torch.no_grad():
+                mu, logvar = self.vae.encode(y_batch)
+            z = self.vae.reparameterize(mu, logvar)
+
+            # 计算HMM负对数似然
+            alpha = self.hmm.forward_algorithm(y_batch, z)
+            log_likelihood = torch.logsumexp(alpha[:, -1, :], dim=1)
+            hmm_loss = -log_likelihood.mean()
+
+            hmm_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.hmm.parameters(), 1.0)
+            self.optimizer_hmm.step()
+            hmm_loss_val = hmm_loss.item()
+
         return {
             'vae_recon': recon_loss.item(),
             'vae_kld': kld_loss.item(),
-            'hmm_nll': hmm_loss.item(),
-            'total': vae_loss.item() + hmm_loss.item()
+            'hmm_nll': hmm_loss_val,
+            'total': vae_loss.item() + hmm_loss_val
         }
 
 
