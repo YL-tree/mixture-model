@@ -64,8 +64,8 @@ class AdaLN(nn.Module):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_dim)
         self.proj = nn.Linear(cond_dim, hidden_dim * 2)
-        # 初始化为 identity transform (scale=1, shift=0)
-        nn.init.zeros_(self.proj.weight)
+        # 用小随机值初始化，让不同状态从一开始就产生不同的 scale/shift
+        nn.init.normal_(self.proj.weight, std=0.02)
         nn.init.zeros_(self.proj.bias)
 
     def forward(self, x, cond):
@@ -206,10 +206,11 @@ class HMM_DPM(nn.Module):
 
         return log_probs_flat.reshape(B, L, self.n_states)
 
-    def forward_backward_sampling(self, y):
+    def forward_backward_sampling(self, y, emission_scale=1.0):
         """Forward-Backward 采样"""
         with torch.no_grad():
             log_emission = self.compute_emission_logprob(y)
+            log_emission = log_emission * emission_scale
 
         B, L, K = log_emission.shape
         log_trans = F.log_softmax(self.trans_logits, dim=1)
@@ -237,10 +238,11 @@ class HMM_DPM(nn.Module):
 
         return sampled_states
 
-    def viterbi_decode(self, y):
+    def viterbi_decode(self, y, emission_scale=1.0):
         """Viterbi 解码"""
         with torch.no_grad():
             log_emission = self.compute_emission_logprob(y, n_time_samples=16)
+            log_emission = log_emission * emission_scale
 
         B, L, K = log_emission.shape
         log_trans = F.log_softmax(self.trans_logits, dim=1)
@@ -359,8 +361,52 @@ class DPMVisualizer:
 
 
 # ==========================================
-# 5. 交易策略
+# 5. 绩效指标 & 交易策略 (与 HMM_VAE 对齐)
 # ==========================================
+def calculate_metrics(strategy_returns, benchmark_returns):
+    """计算绩效指标"""
+    n_days = len(strategy_returns)
+    total_return = (1 + strategy_returns).prod() - 1
+    annual_return = (1 + total_return) ** (252 / max(n_days, 1)) - 1
+    annual_vol = strategy_returns.std() * np.sqrt(252)
+    sharpe = (strategy_returns.mean() / (strategy_returns.std() + 1e-9)) * np.sqrt(252)
+
+    cum_returns = np.cumprod(1 + strategy_returns)
+    running_max = np.maximum.accumulate(cum_returns)
+    drawdown = (cum_returns - running_max) / running_max
+    max_drawdown = drawdown.min()
+
+    win_rate = np.mean(strategy_returns > 0)
+
+    excess_returns = strategy_returns - benchmark_returns
+    ir = (excess_returns.mean() / (excess_returns.std() + 1e-9)) * np.sqrt(252)
+    calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
+
+    return {
+        'annual_return': annual_return,
+        'annual_vol': annual_vol,
+        'sharpe': sharpe,
+        'max_drawdown': max_drawdown,
+        'win_rate': win_rate,
+        'information_ratio': ir,
+        'calmar': calmar,
+        'total_return': total_return
+    }
+
+
+def print_metrics(metrics, strategy_name):
+    """打印指标"""
+    print(f"\n{strategy_name} 绩效指标:")
+    print(f"  总收益率:        {metrics['total_return']:.2%}")
+    print(f"  年化收益率:      {metrics['annual_return']:.2%}")
+    print(f"  年化波动率:      {metrics['annual_vol']:.2%}")
+    print(f"  夏普比率:        {metrics['sharpe']:.4f}")
+    print(f"  信息比率:        {metrics['information_ratio']:.4f}")
+    print(f"  Calmar比率:      {metrics['calmar']:.4f}")
+    print(f"  最大回撤:        {metrics['max_drawdown']:.2%}")
+    print(f"  胜率:            {metrics['win_rate']:.2%}")
+
+
 class TradingStrategy:
     def __init__(self, model, device):
         self.model = model
@@ -370,48 +416,49 @@ class TradingStrategy:
         self.model.eval()
         with torch.no_grad():
             X_test_tensor = torch.from_numpy(X_test).float().to(self.device)
-            states = self.model.viterbi_decode(X_test_tensor)
+            es = getattr(self.model, 'emission_scale', 0.1)
+            states = self.model.viterbi_decode(X_test_tensor, emission_scale=es)
         return states.cpu().numpy()
 
-    def backtest_state_timing(self, states, returns):
+    def strategy_state_timing(self, test_data_np, real_returns):
+        """
+        策略: 状态择时 — 牛市持有，非牛市空仓
+
+        test_data_np: (n_samples, seq_len, n_stocks) numpy
+        real_returns:  (n_samples, n_stocks) numpy — 每个序列最后一天的原始收益
+        返回: nav, states, portfolio_returns
+        """
+        # Viterbi 解码
+        states_all = self.predict_states(test_data_np)   # (n_samples, seq_len)
+        final_states = states_all[:, -1]                  # 每个序列最后一步的状态
+
+        # 每个状态的平均日收益（所有股票等权）
         state_returns = {}
         for s in range(self.model.n_states):
-            mask = states[:, -1] == s
+            mask = final_states == s
             if np.any(mask):
-                state_returns[s] = np.mean(returns[mask])
+                state_returns[s] = np.mean(real_returns[mask].mean(axis=1))
             else:
-                state_returns[s] = -999.0
+                state_returns[s] = 0.0
 
         bull_state = max(state_returns, key=state_returns.get)
 
-        print(f"\n状态分析:")
+        print(f"\n  识别的牛市状态: {bull_state}")
         for s, ret in state_returns.items():
-            print(f"  State {s}: 平均收益 = {ret:.4%}")
-        print(f"  识别的牛市状态: {bull_state}")
+            print(f"    State {s}: 平均收益 = {ret:.4%}")
 
-        final_states = states[:, -1]
-        strategy_returns = np.where(final_states == bull_state, returns, 0)
+        # 执行策略
+        portfolio_returns = []
+        for i in range(len(final_states)):
+            if final_states[i] == bull_state:
+                daily_return = real_returns[i].mean()   # 等权持有所有股票
+            else:
+                daily_return = 0.0
+            portfolio_returns.append(daily_return)
+        portfolio_returns = np.array(portfolio_returns)
 
-        nav = np.cumprod(1 + strategy_returns)
-        nav_benchmark = np.cumprod(1 + returns)
-
-        sharpe = (np.mean(strategy_returns) / (np.std(strategy_returns) + 1e-9)) * np.sqrt(252)
-        win_rate = np.mean(strategy_returns > 0)
-
-        running_max = np.maximum.accumulate(nav)
-        drawdown = (nav - running_max) / running_max
-        max_dd = drawdown.min()
-
-        return {
-            'nav': nav,
-            'nav_benchmark': nav_benchmark,
-            'returns': strategy_returns,
-            'states': final_states,
-            'bull_state': bull_state,
-            'sharpe': sharpe,
-            'win_rate': win_rate,
-            'max_drawdown': max_dd
-        }
+        nav = np.cumprod(1 + portfolio_returns)
+        return nav, final_states, portfolio_returns
 
 
 # ==========================================
@@ -491,10 +538,20 @@ def train_hmm_dpm(returns_data, config, device):
     # ===== Stage 2: EM Training =====
     print(f"\n>>> Stage 2: EM 联合训练 ({config['em_epochs']} epochs)...")
     EMA_ALPHA = 0.3
+    # Emission scale 退火: 从 0.005 (transition 主导) 到 0.1 (emission 有意义但不碾压)
+    # raw emission diff ≈ 1.0/step, transition diff ≈ 2.84/step
+    # scale=0.005 → effective emission diff ≈ 0.005 (transition 主导 500x)
+    # scale=0.1   → effective emission diff ≈ 0.1   (transition 仍主导 ~30x, 但 emission 有影响)
+    EMISSION_SCALE_START = 0.005
+    EMISSION_SCALE_END = 0.1
 
     for epoch in range(config['em_epochs']):
         model.train()
         epoch_diff_loss = 0
+
+        # 退火 emission scale
+        progress = epoch / max(config['em_epochs'] - 1, 1)
+        emission_scale = EMISSION_SCALE_START + (EMISSION_SCALE_END - EMISSION_SCALE_START) * progress
 
         # 每 epoch 收集全局转移统计量
         epoch_trans_counts = torch.zeros(config['n_states'], config['n_states'], device=device)
@@ -506,9 +563,9 @@ def train_hmm_dpm(returns_data, config, device):
         for i in range(n_batches):
             bx = X_shuffled[i * config['batch_size'] : (i+1) * config['batch_size']]
 
-            # E-step
+            # E-step (with emission scaling)
             with torch.no_grad():
-                sampled_states = model.forward_backward_sampling(bx)
+                sampled_states = model.forward_backward_sampling(bx, emission_scale=emission_scale)
 
             # 累积转移统计
             with torch.no_grad():
@@ -546,8 +603,11 @@ def train_hmm_dpm(returns_data, config, device):
         if (epoch + 1) % 20 == 0:
             print(f"  Epoch {epoch+1}/{config['em_epochs']}: "
                   f"Diff = {avg_diff:.4f}, "
-                  f"StatePer = {state_persistence:.3f}")
+                  f"StatePer = {state_persistence:.3f}, "
+                  f"EmScale = {emission_scale:.4f}")
 
+    # 保存最终 emission_scale 供测试时使用
+    model.emission_scale = EMISSION_SCALE_END
     print("\n  训练完成!")
     return model, history, (X_train, X_test, X_test_np, scaler)
 
@@ -555,6 +615,64 @@ def train_hmm_dpm(returns_data, config, device):
 # ==========================================
 # 7. 主函数
 # ==========================================
+def plot_backtest(nav_strategy, nav_benchmark, ret_strategy, ret_benchmark, states,
+                  filename="dpm_backtest_results.png"):
+    """回测可视化 (与 HMM_VAE 对齐)"""
+    fig = plt.figure(figsize=(16, 12))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+
+    # 1. 净值曲线
+    ax1 = fig.add_subplot(gs[0, :])
+    ax1.plot(nav_strategy, label='Strategy: State Timing', linewidth=2)
+    ax1.plot(nav_benchmark, label='Benchmark: Buy & Hold', linewidth=2, alpha=0.7, linestyle='--')
+    ax1.set_title('NAV Comparison', fontsize=14, fontweight='bold')
+    ax1.legend(loc='best', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylabel('NAV')
+
+    # 2. 日收益率分布
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax2.hist(ret_strategy, bins=50, alpha=0.6, label='Strategy', density=True)
+    ax2.hist(ret_benchmark, bins=50, alpha=0.6, label='Benchmark', density=True)
+    ax2.set_title('Return Distribution', fontsize=12)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlabel('Daily Return')
+
+    # 3. 回撤曲线
+    ax3 = fig.add_subplot(gs[1, 1])
+    dd_s = (nav_strategy - np.maximum.accumulate(nav_strategy)) / np.maximum.accumulate(nav_strategy)
+    dd_b = (nav_benchmark - np.maximum.accumulate(nav_benchmark)) / np.maximum.accumulate(nav_benchmark)
+    ax3.fill_between(range(len(dd_s)), dd_s, 0, alpha=0.5, label='Strategy')
+    ax3.plot(dd_b, label='Benchmark', linewidth=2, alpha=0.7, linestyle='--')
+    ax3.set_title('Drawdown', fontsize=12)
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    ax3.set_ylabel('Drawdown')
+
+    # 4. 状态时序
+    ax4 = fig.add_subplot(gs[2, 0])
+    ax4.plot(states, drawstyle='steps-post', linewidth=2, color='purple')
+    ax4.set_title('Predicted Market States', fontsize=12)
+    ax4.set_ylabel('State')
+    ax4.set_xlabel('Time')
+    ax4.grid(True, alpha=0.3)
+
+    # 5. 累计超额收益
+    ax5 = fig.add_subplot(gs[2, 1])
+    excess = np.cumprod(1 + ret_strategy) / np.cumprod(1 + ret_benchmark)
+    ax5.plot(excess, linewidth=2, color='green')
+    ax5.axhline(1.0, color='black', linestyle='--', linewidth=1)
+    ax5.set_title('Cumulative Excess Return', fontsize=12)
+    ax5.set_ylabel('Strategy / Benchmark')
+    ax5.set_xlabel('Time')
+    ax5.grid(True, alpha=0.3)
+
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved: {filename}")
+
+
 def main():
     setup_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -585,54 +703,76 @@ def main():
     model, history, data = train_hmm_dpm(returns_data, config, device)
     _, _, X_test_np, _ = data
 
-    # 可视化
+    # 可视化训练过程
     print("\n>>> 生成可视化...")
     visualizer = DPMVisualizer()
     visualizer.plot_training_dashboard(history)
 
     trans_matrix = F.softmax(model.trans_logits, dim=1).detach().cpu().numpy()
 
-    # 回测
-    print("\n>>> 回测策略...")
-    strategy = TradingStrategy(model, device)
-    states = strategy.predict_states(X_test_np)
-
-    test_start = int(len(returns_data) * 0.8) + config['seq_len']
-    test_returns = returns_data[test_start : test_start + len(states)].mean(axis=1)
-
-    results = strategy.backtest_state_timing(states, test_returns)
-
-    visualizer.plot_state_analysis(trans_matrix, results['states'], test_returns)
-
-    # 绩效报告
+    # ==========================================
+    # 回测: 对齐真实收益率 (与 HMM_VAE 完全一致)
+    # ==========================================
     print("\n" + "="*60)
-    print("回测结果")
+    print("回测分析")
     print("="*60)
-    print(f"Sharpe Ratio:    {results['sharpe']:.4f}")
-    print(f"Win Rate:        {results['win_rate']:.2%}")
-    print(f"Max Drawdown:    {results['max_drawdown']:.2%}")
-    print(f"Final NAV:       {results['nav'][-1]:.4f}")
-    print(f"Benchmark NAV:   {results['nav_benchmark'][-1]:.4f}")
 
-    # 净值曲线
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
-    axes[0].plot(results['nav'], label='Strategy', linewidth=2)
-    axes[0].plot(results['nav_benchmark'], label='Benchmark', linewidth=2, alpha=0.7, linestyle='--')
-    axes[0].set_title('Net Asset Value', fontsize=12, fontweight='bold')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    split_idx = int(len(returns_data) * 0.8)
+    seq_len = config['seq_len']
+    n_test_samples = X_test_np.shape[0]
 
-    axes[1].plot(results['states'], drawstyle='steps-post', linewidth=1.5, color='purple')
-    axes[1].set_title('Predicted States', fontsize=12, fontweight='bold')
-    axes[1].set_xlabel('Time')
-    axes[1].set_ylabel('State')
-    axes[1].grid(True, alpha=0.3)
+    # 每个测试序列最后一天的原始收益率 (n_samples, n_stocks)
+    real_returns_test = []
+    for i in range(n_test_samples):
+        day_idx = split_idx + i + seq_len - 1
+        if day_idx < len(returns_data):
+            real_returns_test.append(returns_data[day_idx])
+        else:
+            break
+    real_returns_test = np.array(real_returns_test)
 
-    plt.tight_layout()
-    plt.savefig('dpm_backtest_results.png', dpi=150)
-    plt.close()
-    print("\n  Saved: dpm_backtest_results.png")
-    print("\n  所有流程完成!")
+    # 截断到相同长度
+    min_len = min(n_test_samples, len(real_returns_test))
+    X_test_backtest = X_test_np[:min_len]
+    real_returns_test = real_returns_test[:min_len]
+
+    print(f"回测样本数: {min_len}")
+    print(f"测试集收益率均值: {real_returns_test.mean():.6f}")
+
+    # 执行策略
+    print("\n### 策略: 状态择时 ###")
+    strategy = TradingStrategy(model, device)
+    nav_strategy, states, ret_strategy = strategy.strategy_state_timing(
+        X_test_backtest, real_returns_test
+    )
+
+    # 基准: 等权买入持有
+    benchmark_ret = real_returns_test.mean(axis=1)
+    nav_benchmark = np.cumprod(1 + benchmark_ret)
+
+    # 绩效指标
+    metrics = calculate_metrics(ret_strategy, benchmark_ret)
+    print_metrics(metrics, "状态择时")
+
+    # 状态分析图
+    visualizer.plot_state_analysis(trans_matrix, states, benchmark_ret)
+
+    # 回测可视化
+    plot_backtest(nav_strategy, nav_benchmark, ret_strategy, benchmark_ret, states)
+
+    # 总结
+    print("\n" + "="*60)
+    print("全部完成!")
+    print("="*60)
+    print(f"\n状态择时: Sharpe={metrics['sharpe']:.4f}, "
+          f"MaxDD={metrics['max_drawdown']:.2%}, "
+          f"Annual={metrics['annual_return']:.2%}")
+    print(f"Benchmark: Total={benchmark_ret.sum():.2%}")
+
+    print("\n生成的文件:")
+    print("  dpm_training_dashboard.png - 训练监控面板")
+    print("  dpm_state_analysis.png     - 状态分析")
+    print("  dpm_backtest_results.png   - 回测对比图")
 
 
 if __name__ == "__main__":
