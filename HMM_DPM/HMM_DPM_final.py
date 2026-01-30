@@ -408,8 +408,7 @@ class TradingStrategy:
             else:
                 X_test_tensor = X_test
             
-            # 使用稍大的scale进行预测，增强区分度
-            es = 0.5 
+            es = getattr(self.model, 'emission_scale', 1.0)
             states = self.model.viterbi_decode(X_test_tensor, emission_scale=es)
         return states.cpu().numpy()
 
@@ -537,8 +536,8 @@ def train_hmm_dpm(returns_data, config, device):
     # Stage 2: EM
     print(f"\n>>> Stage 2: EM 联合训练 ({config['em_epochs']} epochs)...")
     EMA_ALPHA = 0.3
-    EMISSION_SCALE_START = 0.01
-    EMISSION_SCALE_END = 0.5
+    EMISSION_SCALE_START = 0.3
+    EMISSION_SCALE_END = 1.0
 
     for epoch in range(config['em_epochs']):
         model.train()
@@ -574,15 +573,11 @@ def train_hmm_dpm(returns_data, config, device):
             optimizer.step()
             ep_diff_loss += diff_loss.item()
 
-        # Epoch End: M-Step (HMM) with dynamic sticky bias
+        # Epoch End: M-Step (HMM) — 纯 Laplace 平滑 + EMA，不加 sticky bias
         with torch.no_grad():
-            total_samples = len(X_train_tensor)
-            bias_strength = total_samples / config['n_states'] * 0.5
-            sticky_bias = torch.eye(config['n_states'], device=device) * bias_strength
-            
-            epoch_trans_counts = epoch_trans_counts + sticky_bias + 1.0
+            epoch_trans_counts += 1.0  # Laplace 平滑
             new_probs = epoch_trans_counts / epoch_trans_counts.sum(dim=1, keepdim=True)
-            
+
             old_probs = F.softmax(model.trans_logits, dim=1)
             smoothed = EMA_ALPHA * new_probs + (1 - EMA_ALPHA) * old_probs
             model.trans_logits.data = torch.log(smoothed + 1e-8)
