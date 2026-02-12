@@ -19,6 +19,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import normalized_mutual_info_score as NMI
+from sklearn.cluster import KMeans
 from torchvision.utils import save_image
 import itertools
 from common_dpm import *
@@ -250,10 +251,16 @@ def evaluate_model(model, loader, cfg):
 # ============================================================
 
 # --- fig01: Training Curves (2x2) ---
-def fig01_training_curves(logger, save_path):
+def fig01_training_curves(logger, save_path, pretrain_epochs=0):
     """Loss, Acc/NMI, π evolution, Posterior confidence"""
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     epochs = logger.records['epoch']
+
+    def _add_boundary(ax):
+        """在 pretrain/EM 分界处画竖线"""
+        if pretrain_epochs > 0:
+            ax.axvline(pretrain_epochs + 0.5, color='gray', linestyle=':',
+                       alpha=0.6, linewidth=1.5)
 
     # (0,0) Loss components
     ax = axes[0, 0]
@@ -265,6 +272,7 @@ def fig01_training_curves(logger, save_path):
         ax.plot(epochs, logger.records['label_loss'], color=COLORS[2], linewidth=1,
                 alpha=0.7, label='Label Loss')
     ax.legend(fontsize=9); ax.set_title("Training Loss"); ax.grid(alpha=0.3)
+    _add_boundary(ax)
 
     # (0,1) Acc & NMI
     ax = axes[0, 1]
@@ -273,6 +281,7 @@ def fig01_training_curves(logger, save_path):
             linewidth=2, linestyle='--')
     ax.legend(fontsize=10); ax.set_title("Clustering Quality")
     ax.set_ylim(-0.05, 1.05); ax.grid(alpha=0.3)
+    _add_boundary(ax)
 
     # (1,0) π evolution
     ax = axes[1, 0]
@@ -285,6 +294,7 @@ def fig01_training_curves(logger, save_path):
         ax.set_ylim(0, max(0.5, pi_array.max() * 1.2))
         ax.legend(fontsize=7, ncol=2, loc='upper right')
     ax.set_title("Class Prior π"); ax.grid(alpha=0.3)
+    _add_boundary(ax)
 
     # (1,1) Posterior confidence & entropy
     ax = axes[1, 1]
@@ -297,8 +307,11 @@ def fig01_training_curves(logger, save_path):
         ax.legend(handles=[l1, l2], loc='center right', fontsize=9)
         ax2.set_ylabel('Entropy')
     ax.set_title("Posterior Confidence"); ax.grid(alpha=0.3)
+    _add_boundary(ax)
 
-    fig.suptitle("mDPM Training Curves", fontsize=16, fontweight='bold')
+    fig.suptitle("mDPM Training (pretrain | EM)" if pretrain_epochs > 0
+                 else "mDPM Training Curves",
+                 fontsize=16, fontweight='bold')
     plt.tight_layout(); plt.savefig(save_path); plt.close()
     print(f"  ✓ fig01 → {save_path}")
 
@@ -621,10 +634,13 @@ def generate_all_figures(model, logger, loader, cfg, cluster_mapping=None):
         cluster_mapping = ckpt.get('cluster_mapping', cluster_mapping)
     model.eval()
 
+    pretrain_ep = getattr(cfg, 'pretrain_epochs', 0)
+
     print("\n" + "=" * 50 + "\nGenerating diagnostic figures...\n" + "=" * 50)
 
     fig01_training_curves(logger,
-                          os.path.join(fig_dir, "fig01_training_curves.png"))
+                          os.path.join(fig_dir, "fig01_training_curves.png"),
+                          pretrain_epochs=pretrain_ep)
     fig02_posterior_histogram(model, loader, cfg,
                               os.path.join(fig_dir, "fig02_posterior_histogram.png"))
     fig03_generated_samples(model, cfg,
@@ -646,11 +662,104 @@ def generate_all_figures(model, logger, loader, cfg, cluster_mapping=None):
 
 
 # ============================================================
-# 5. Training Engine
+# 5. KMeans Pretrain (打破 EM 冷启动)
 # ============================================================
+def kmeans_init(loader, cfg):
+    """
+    对训练数据做 KMeans 聚类，返回:
+      - centroids: [K, D] tensor，后续用于在线分配
+      - cluster_props: 每个 cluster 的比例，用于初始化 π
+    """
+    print("\n🔬 Computing KMeans initialization...")
+    all_features, all_true = [], []
+    for x_0, y_true in loader:
+        all_features.append(x_0.view(x_0.size(0), -1).numpy())
+        all_true.append(y_true.numpy())
+
+    features = np.concatenate(all_features)
+    true_labels = np.concatenate(all_true)
+
+    K = cfg.num_classes
+    km = KMeans(n_clusters=K, n_init=10, random_state=42)
+    km_labels = km.fit_predict(features)
+
+    # 评估质量
+    cost_matrix = np.zeros((K, K))
+    for i in range(K):
+        for j in range(K):
+            cost_matrix[i, j] = -np.sum((true_labels == i) & (km_labels == j))
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    c2l = {int(c): int(l) for c, l in zip(col_ind, row_ind)}
+    aligned = np.array([c2l.get(p, 0) for p in km_labels])
+    km_acc = np.mean(aligned == true_labels)
+    km_nmi = NMI(true_labels, km_labels)
+
+    cluster_counts = np.bincount(km_labels, minlength=K).astype(float)
+    cluster_props = cluster_counts / cluster_counts.sum()
+
+    print(f"   KMeans Acc: {km_acc:.4f}  NMI: {km_nmi:.4f}")
+    print(f"   Cluster sizes: {cluster_counts.astype(int).tolist()}")
+
+    centroids = torch.tensor(km.cluster_centers_, dtype=torch.float32)
+    return centroids, cluster_props
+
+
+def pretrain_with_kmeans(model, optimizer, loader, val_loader, cfg,
+                         centroids, pretrain_epochs=10, logger=None):
+    """
+    Phase 0: 用 KMeans 伪标签做 supervised DDPM 训练。
+    每个 batch 在线通过 centroid 最近邻分配伪标签。
+    """
+    print(f"\n🏋️ Pretrain: {pretrain_epochs} epochs with KMeans pseudo-labels")
+    centroids_dev = centroids.to(cfg.device)
+
+    for epoch in range(1, pretrain_epochs + 1):
+        model.train()
+        ep_loss = 0.0
+        n_batches = 0
+
+        for x_0, _ in loader:
+            x_0 = x_0.to(cfg.device)
+            B = x_0.size(0)
+
+            # 在线分配: 到各 centroid 的欧氏距离
+            with torch.no_grad():
+                flat = x_0.view(B, -1)
+                dists = torch.cdist(flat, centroids_dev)  # [B, K]
+                pseudo_y = dists.argmin(dim=1)             # [B]
+
+            # 标准 supervised DDPM loss
+            loss, info = model(x_0, cfg, y=pseudo_y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            ep_loss += loss.item()
+            n_batches += 1
+
+        avg_loss = ep_loss / max(n_batches, 1)
+        val_acc, _, val_nmi = evaluate_model(model, val_loader, cfg)
+
+        if logger:
+            pi_np = model.pi.detach().cpu().numpy()
+            logger.log(
+                epoch=epoch, loss=avg_loss, dpm_loss=avg_loss, label_loss=0.0,
+                acc=val_acc, nmi=val_nmi, mask_rate=1.0,
+                resp_entropy=0.0, max_conf=1.0,
+                pi_values=pi_np,
+                pi_entropy=float(-(pi_np * np.log(pi_np + 1e-9)).sum()),
+                threshold=0.0,
+            )
+
+        print(f"  [Pretrain] Ep {epoch}/{pretrain_epochs} "
+              f"| Loss: {avg_loss:.4f} | Acc: {val_acc:.4f} NMI: {val_nmi:.4f}")
+
+    print("  ✅ Pretrain complete\n")
 def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
                          val_loader, cfg, is_final_training=False, trial=None,
-                         hyperparams=None, logger=None):
+                         hyperparams=None, logger=None, epoch_offset=0):
 
     total_epochs = cfg.final_epochs if is_final_training else cfg.optuna_epochs
 
@@ -745,7 +854,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
         # Logger
         if logger:
             logger.log(
-                epoch=epoch,
+                epoch=epoch + epoch_offset,
                 loss=avg_loss,
                 dpm_loss=avg_dpm,
                 label_loss=avg_label,
@@ -813,6 +922,7 @@ def main():
     cfg.alpha_unlabeled = 1.0
     cfg.labeled_per_class = 0
     cfg.posterior_sample_steps = 5
+    cfg.pretrain_epochs = 10  # KMeans 预训练轮数
 
     if ENABLE_AUTO_SEARCH:
         print("🔍 [Step 1] Starting Optuna Search...")
@@ -834,7 +944,7 @@ def main():
         }
         best_lr = 4.01e-05
 
-    print("\n🚀 [Step 2] Starting Final Training...")
+    print("\n🚀 [Step 2] Starting Training...")
     print(f"   Configs: LR={best_lr:.2e}, Params={best_params}")
 
     cfg.final_epochs = 60
@@ -846,11 +956,29 @@ def main():
 
     logger = TrainingLogger()
 
+    # ---- Phase 0: KMeans Pretrain ----
+    centroids, cluster_props = kmeans_init(unlabeled_loader, cfg)
+
+    # 用 KMeans 比例初始化 π
+    with torch.no_grad():
+        init_log_pi = torch.log(torch.tensor(cluster_props, dtype=torch.float32).clamp(min=1e-6))
+        model.log_pi.copy_(init_log_pi)
+    print(f"   π initialized from KMeans: {model.pi.detach().cpu().numpy().round(3).tolist()}")
+
+    pretrain_with_kmeans(model, optimizer, unlabeled_loader, val_loader, cfg,
+                         centroids, pretrain_epochs=cfg.pretrain_epochs, logger=logger)
+
+    # ---- Phase 1: EM Training ----
+    print("=" * 50)
+    print("🔄 Switching to EM training...")
+    print("=" * 50)
+
     best_acc, best_mapping = run_training_session(
         model, optimizer, None, unlabeled_loader, val_loader, cfg,
         is_final_training=True,
         hyperparams=best_params,
         logger=logger,
+        epoch_offset=cfg.pretrain_epochs,
     )
 
     print(f"\n✅ Done. Best Acc: {best_acc:.4f}")
