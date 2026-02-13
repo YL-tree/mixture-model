@@ -94,58 +94,42 @@ class mDPM_SemiSup(nn.Module):
         return F.softmax(self.log_pi, dim=0)
 
     def estimate_posterior_logits(self, x_0, cfg):
-        """论文公式: 直接 conditional MSE (input-level conditioning 保证信号够强)"""
+        """
+        简化版 posterior estimation:
+        - 不用 SNR 权重 (会放大噪声)
+        - 只用低 t (class 信号更强)
+        - 更多采样减少方差
+        
+        evaluate_model_simple 用同样方法能到 40%, 这里对齐它。
+        """
         batch_size = x_0.size(0)
-        num_classes = cfg.num_classes
-        M = cfg.posterior_sample_steps
-        T = cfg.timesteps
-
-        betas = self.dpm_process.betas
-        alphas = self.dpm_process.alphas
-        alphas_cumprod = self.dpm_process.alphas_cumprod
-        posterior_var = self.dpm_process.posterior_variance
-
-        snr_weights = (betas ** 2) / (
-            2.0 * posterior_var.clamp(min=1e-8) * alphas * (1 - alphas_cumprod).clamp(min=1e-8)
-        )
-        snr_weights = snr_weights.clamp(max=20.0)
-
-        recon_logprob = torch.zeros(batch_size, num_classes, device=x_0.device)
-        diffusion_logprob = torch.zeros(batch_size, num_classes, device=x_0.device)
-
+        K = cfg.num_classes
+        M = getattr(cfg, 'posterior_sample_steps', 5)
+        device = x_0.device
+        
+        # 低 t 范围: 在 t<200 时图像结构保留较好, class 条件差异最明显
+        t_max = min(200, cfg.timesteps)
+        
+        logits = torch.zeros(batch_size, K, device=device)
+        
         with torch.no_grad():
-            # (a) 重构项
-            t_recon = torch.ones(batch_size, device=x_0.device, dtype=torch.long)
-            noise_recon = torch.randn_like(x_0)
-            z_1 = self.dpm_process.q_sample(x_0, t_recon, noise_recon)
-            w_recon = snr_weights[1]
-
-            for k in range(num_classes):
-                y_oh = F.one_hot(torch.full((batch_size,), k, device=x_0.device,
-                                             dtype=torch.long), num_classes).float()
-                pred = self.cond_denoiser(z_1, t_recon, y_oh)
-                mse = F.mse_loss(pred, noise_recon, reduction='none').view(batch_size, -1).mean(dim=1)
-                recon_logprob[:, k] = -w_recon * mse
-
-            # (b) 扩散转移项
             for _ in range(M):
-                t = torch.randint(1, T, (batch_size,), device=x_0.device).long()
+                t = torch.randint(1, t_max, (batch_size,), device=device).long()
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
-                w_t = snr_weights[t]
-
-                for k in range(num_classes):
-                    y_oh = F.one_hot(torch.full((batch_size,), k, device=x_0.device,
-                                                 dtype=torch.long), num_classes).float()
+                
+                for k in range(K):
+                    y_oh = F.one_hot(torch.full((batch_size,), k, device=device,
+                                                 dtype=torch.long), K).float()
                     pred = self.cond_denoiser(x_t, t, y_oh)
                     mse = F.mse_loss(pred, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                    diffusion_logprob[:, k] += -w_t * mse
-
-            diffusion_logprob = diffusion_logprob * (T - 1) / M
+                    logits[:, k] += -mse   # 简单累加, 不加权
+            
+            # 加上 prior
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
-            final_logits = log_pi + recon_logprob + diffusion_logprob
-
-        return final_logits
+            logits = logits + log_pi
+        
+        return logits
 
     def forward(self, x_0, cfg, y=None, threshold=0.0, use_hard_label=False):
         batch_size = x_0.size(0)
@@ -238,13 +222,13 @@ def evaluate_model(model, loader, cfg):
 @torch.no_grad()
 def evaluate_model_simple(model, loader, cfg):
     """
-    简化版评估: 直接用 conditional MSE (不用 CFG)。
-    用于 pretrain 阶段，因为此时 unconditional 路径还没训好。
+    简化版评估: 直接用 conditional MSE, 低 t 范围。
     """
     model.eval()
     preds, ys_true = [], []
     K = cfg.num_classes
-    M = 3  # 少量采样即可
+    M = 5
+    t_max = min(200, cfg.timesteps)
 
     for x_0, y_true in loader:
         x_0 = x_0.to(cfg.device)
@@ -252,7 +236,7 @@ def evaluate_model_simple(model, loader, cfg):
         logits = torch.zeros(B, K, device=x_0.device)
 
         for _ in range(M):
-            t = torch.randint(1, cfg.timesteps, (B,), device=x_0.device).long()
+            t = torch.randint(1, t_max, (B,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t = model.dpm_process.q_sample(x_0, t, noise)
 
@@ -808,8 +792,8 @@ def pretrain_with_kmeans(model, optimizer, loader, val_loader, cfg,
 @torch.no_grad()
 def _diagnose_conditioning(model, loader, cfg):
     """
-    直接测量: 同一个 (x_t, t)，不同 class k 的 UNet 输出是否不同。
-    如果 avg_diff ≈ 0，说明 class 条件被忽略（架构问题）。
+    测量: 同一个 (x_t, t)，不同 class k 的 UNet 输出差异。
+    在多个 t 值测试，找到 class 信号最强的区间。
     """
     model.eval()
     device = cfg.device
@@ -817,43 +801,35 @@ def _diagnose_conditioning(model, loader, cfg):
 
     x_0, _ = next(iter(loader))
     x_0 = x_0[:16].to(device)
-    t = torch.full((16,), 200, device=device, dtype=torch.long)
-    noise = torch.randn_like(x_0)
-    x_t = model.dpm_process.q_sample(x_0, t, noise)
 
-    # 收集每个 class 的 UNet 输出
-    outputs = []
-    for k in range(K):
-        y_oh = F.one_hot(torch.full((16,), k, device=device, dtype=torch.long), K).float()
-        eps_k = model.cond_denoiser(x_t, t, y_oh)
-        outputs.append(eps_k)
+    print(f"\n🔬 Conditioning Diagnostic (per timestep):")
+    print(f"   {'t':>6s}  {'diff':>10s}  {'norm':>10s}  {'ratio':>10s}")
+    print(f"   {'-'*42}")
 
-    # 计算所有 class 对之间的 L2 差异
-    diffs = []
-    for i in range(K):
-        for j in range(i + 1, K):
-            d = (outputs[i] - outputs[j]).pow(2).mean().item()
-            diffs.append(d)
+    for t_val in [5, 20, 50, 100, 200, 500]:
+        t = torch.full((16,), t_val, device=device, dtype=torch.long)
+        noise = torch.randn_like(x_0)
+        x_t = model.dpm_process.q_sample(x_0, t, noise)
 
-    avg_diff = np.mean(diffs)
-    max_diff = np.max(diffs)
+        outputs = []
+        for k in range(K):
+            y_oh = F.one_hot(torch.full((16,), k, device=device, dtype=torch.long), K).float()
+            eps_k = model.cond_denoiser(x_t, t, y_oh)
+            outputs.append(eps_k)
 
-    # 与自身预测的 scale 比较
-    avg_norm = np.mean([o.pow(2).mean().item() for o in outputs])
+        diffs = []
+        for i in range(K):
+            for j in range(i + 1, K):
+                d = (outputs[i] - outputs[j]).pow(2).mean().item()
+                diffs.append(d)
 
-    print(f"\n🔬 Conditioning Diagnostic:")
-    print(f"   Avg pairwise diff between classes: {avg_diff:.6f}")
-    print(f"   Max pairwise diff between classes: {max_diff:.6f}")
-    print(f"   Avg output norm:                   {avg_norm:.6f}")
-    print(f"   Ratio (diff/norm):                 {avg_diff / (avg_norm + 1e-9):.6f}")
+        avg_diff = np.mean(diffs)
+        avg_norm = np.mean([o.pow(2).mean().item() for o in outputs])
+        ratio = avg_diff / (avg_norm + 1e-9)
+        marker = " ✅" if ratio > 0.001 else " ⚠️"
+        print(f"   t={t_val:>4d}  {avg_diff:>10.6f}  {avg_norm:>10.6f}  {ratio:>10.6f}{marker}")
 
-    if avg_diff / (avg_norm + 1e-9) < 0.001:
-        print("   ⚠️  CLASS CONDITIONING IS BEING IGNORED!")
-        print("   → UNet 输出对不同 class 几乎完全一样")
-        print("   → 需要更强的架构级修复")
-    else:
-        print("   ✅ Class conditioning IS working")
-        print("   → 如果 Acc 仍低，可能是 posterior estimation 的问题")
+    print()
 def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
                          val_loader, cfg, is_final_training=False, trial=None,
                          hyperparams=None, logger=None, epoch_offset=0):
@@ -1043,7 +1019,7 @@ def main():
 
     cfg = Config()
     cfg.alpha_unlabeled = 1.0
-    cfg.posterior_sample_steps = 5
+    cfg.posterior_sample_steps = 10  # 增加采样减少方差
     cfg.pretrain_epochs = 20
     cfg.pretrain_lr = 2e-4
 
