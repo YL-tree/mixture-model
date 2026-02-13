@@ -78,69 +78,36 @@ class mDPM_SemiSup(nn.Module):
     def pi(self):
         return F.softmax(self.log_pi, dim=0)
 
-    def _compute_snr_weights(self):
-        """
-        论文公式: w_t = β_t² / (2 σ_t² α_t (1-ᾱ_t))
-        Clamp 避免 t≈1 时的数值爆炸, 但保留合理的放大效果。
-        """
-        betas = self.dpm_process.betas
-        alphas = self.dpm_process.alphas
-        alphas_cumprod = self.dpm_process.alphas_cumprod
-        posterior_var = self.dpm_process.posterior_variance
-
-        w = (betas ** 2) / (
-            2.0 * posterior_var.clamp(min=1e-8) * alphas * (1 - alphas_cumprod).clamp(min=1e-8)
-        )
-        # Clamp: 下限 0.01 保留信号, 上限 5.0 避免 t≈1 爆炸
-        return w.clamp(min=0.01, max=5.0)
+    # SNR weights 已去掉 (实验证明无 SNR 效果更好)
 
     def estimate_posterior_logits(self, x_0, cfg, scale_factor=1.0):
         """
-        论文结构 + 实用调整:
-        - SNR 权重 (论文公式, clamp 防爆炸)
-        - 重构项 t=1 + 扩散项 t∈[2,T) (论文结构)
-        - scale_factor 替代 (T-1)/M (论文的 (T-1)/M 在 M<100 时方差太大)
+        后验估计: 简单 -MSE + scale_factor。
+        验证过能到 Acc=0.5, SNR 权重反而有害 (压制高 t 的有效信号)。
         """
         B = x_0.size(0)
         K = cfg.num_classes
         M = getattr(cfg, 'posterior_sample_steps', 5)
-        T = cfg.timesteps
         device = x_0.device
-        snr_w = self._compute_snr_weights()
 
-        recon_logprob = torch.zeros(B, K, device=device)
-        diff_logprob = torch.zeros(B, K, device=device)
+        accum_neg_mse = torch.zeros(B, K, device=device)
 
         with torch.no_grad():
-            # (a) 重构项: t=1
-            t1 = torch.ones(B, device=device, dtype=torch.long)
-            noise1 = torch.randn_like(x_0)
-            z_1 = self.dpm_process.q_sample(x_0, t1, noise1)
-            w1 = snr_w[1]
-
-            for k in range(K):
-                y_oh = F.one_hot(torch.full((B,), k, device=device, dtype=torch.long), K).float()
-                pred = self.cond_denoiser(z_1, t1, y_oh)
-                mse = F.mse_loss(pred, noise1, reduction='none').view(B, -1).mean(dim=1)
-                recon_logprob[:, k] = -w1 * mse
-
-            # (b) 扩散项: t∈[2, T), M 次采样, 取平均 (不乘 (T-1)/M)
             for _ in range(M):
-                t = torch.randint(2, T, (B,), device=device).long()
+                t = torch.randint(1, cfg.timesteps, (B,), device=device).long()
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
-                wt = snr_w[t]
 
                 for k in range(K):
-                    y_oh = F.one_hot(torch.full((B,), k, device=device, dtype=torch.long), K).float()
+                    y_oh = F.one_hot(torch.full((B,), k, device=device,
+                                                 dtype=torch.long), K).float()
                     pred = self.cond_denoiser(x_t, t, y_oh)
                     mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
-                    diff_logprob[:, k] += -wt * mse
+                    accum_neg_mse[:, k] += -mse
 
-            diff_logprob = diff_logprob / M  # 取平均, 不乘 (T-1)/M
-
+            avg_neg_mse = accum_neg_mse / M
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
-            logits = log_pi + (recon_logprob + diff_logprob) * scale_factor
+            logits = log_pi + avg_neg_mse * scale_factor
 
         return logits
 
@@ -197,16 +164,34 @@ class mDPM_SemiSup(nn.Module):
 # ============================================================
 # 2. Evaluation (用论文的 posterior 估计)
 # ============================================================
-def evaluate_model(model, loader, cfg, eval_scale=100.0):
-    """用 posterior 估计 + 匈牙利匹配。eval_scale 用较高值确保可区分。"""
+def evaluate_model(model, loader, cfg):
+    """
+    稳定评估: 固定 t=500, 重复 3 次, argmin MSE。
+    训练用随机 t 的 posterior (EM 需要), 评估用固定 t (消除方差)。
+    """
     model.eval()
     preds, ys_true = [], []
+    eval_t = 500
+    n_repeats = 3
 
     with torch.no_grad():
         for x_0, y_true in loader:
             x_0 = x_0.to(cfg.device)
-            logits = model.estimate_posterior_logits(x_0, cfg, scale_factor=eval_scale)
-            pred_cluster = torch.argmax(logits, dim=1).cpu().numpy()
+            B = x_0.size(0)
+            cumulative_mse = torch.zeros(B, cfg.num_classes, device=cfg.device)
+
+            for _ in range(n_repeats):
+                noise = torch.randn_like(x_0)
+                t = torch.full((B,), eval_t, device=cfg.device, dtype=torch.long)
+                x_t = model.dpm_process.q_sample(x_0, t, noise)
+                for k in range(cfg.num_classes):
+                    y_oh = F.one_hot(torch.full((B,), k, device=x_0.device,
+                                                 dtype=torch.long), cfg.num_classes).float()
+                    pred = model.cond_denoiser(x_t, t, y_oh)
+                    mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
+                    cumulative_mse[:, k] += mse
+
+            pred_cluster = torch.argmin(cumulative_mse, dim=1).cpu().numpy()
             preds.append(pred_cluster)
             ys_true.append(y_true.numpy())
 
@@ -337,11 +322,8 @@ def diagnose_conditioning(model, loader, cfg):
         marker = " ✅" if ratio > 0.001 else " ⚠️"
         print(f"   t={t_val:>4d}  {avg_diff:>10.6f}  {avg_norm:>10.6f}  {ratio:>10.6f}{marker}")
 
-    # 打印 SNR 权重分布
-    snr_w = model._compute_snr_weights()
-    print(f"\n   SNR weights: t=1→{snr_w[1]:.3f}, t=50→{snr_w[50]:.3f}, "
-          f"t=200→{snr_w[200]:.3f}, t=500→{snr_w[500]:.3f}")
-    print(f"   M={getattr(cfg, 'posterior_sample_steps', 5)}, SNR加权 + scale_factor")
+    # 打印配置
+    print(f"\n   M={getattr(cfg, 'posterior_sample_steps', 5)}, 无SNR权重, scale_factor控制放大")
     print()
 
 
