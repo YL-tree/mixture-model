@@ -1,8 +1,9 @@
 # mDPM.py
 # ═══════════════════════════════════════════════════════════════
-# Mixture DPM — 论文对齐版
-#   Section 2.2.3: log s̃_k = log π_k + recon_term + diffusion_terms
-#   SNR 权重 (论文公式) + (T-1)/M 缩放 + label_loss (π 更新)
+# Mixture DPM — 最终版
+#   基于验证过的 scale_factor 机制 (Acc=0.5)
+#   + KMeans pretrain (可选) + label_loss (加系数防坍缩)
+#   + 半监督支持 + checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 import torch
@@ -72,18 +73,18 @@ class mDPM_SemiSup(nn.Module):
             schedule='linear',
             image_channels=cfg.image_channels
         )
+        # π: 可学习, 但 label_loss 加系数防止被过度拉扯
         self.log_pi = nn.Parameter(torch.zeros(cfg.num_classes))
 
     @property
     def pi(self):
         return F.softmax(self.log_pi, dim=0)
 
-    # SNR weights 已去掉 (实验证明无 SNR 效果更好)
-
     def estimate_posterior_logits(self, x_0, cfg, scale_factor=1.0):
         """
-        后验估计: 简单 -MSE + scale_factor。
-        验证过能到 Acc=0.5, SNR 权重反而有害 (压制高 t 的有效信号)。
+        E-step: 简单 -MSE/M × scale_factor
+        无 SNR 权重 (实验证明有害), t ∈ [1, T) 完整范围
+        scale_factor 等价于 tempered posterior 的温度参数
         """
         B = x_0.size(0)
         K = cfg.num_classes
@@ -111,7 +112,8 @@ class mDPM_SemiSup(nn.Module):
 
         return logits
 
-    def forward(self, x_0, cfg, y=None, threshold=0.0, use_hard_label=False, scale_factor=1.0):
+    def forward(self, x_0, cfg, y=None, scale_factor=1.0,
+                threshold=0.0, use_hard_label=False):
         B = x_0.size(0)
 
         # Path A: 监督
@@ -125,7 +127,7 @@ class mDPM_SemiSup(nn.Module):
             return dpm_loss, {'dpm_loss': dpm_loss.item(), 'label_loss': 0.0,
                               'mask_rate': 1.0}
 
-        # Path B: 无监督 (论文 EM)
+        # Path B: 无监督 EM
         else:
             logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
             resp = F.softmax(logits, dim=1)
@@ -139,7 +141,7 @@ class mDPM_SemiSup(nn.Module):
                 y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
                 mask = torch.ones(B, device=x_0.device)
 
-            # Denoising loss
+            # M-step: denoiser loss
             t_train = torch.randint(0, cfg.timesteps, (B,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
@@ -147,28 +149,25 @@ class mDPM_SemiSup(nn.Module):
             loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
             dpm_loss = (loss_per * mask).sum() / (mask.sum() + 1e-8)
 
-            # π 更新项 (论文 M-step)
+            # M-step: π 更新 (论文公式, 加系数防止主导)
+            # label_loss ≈ 2.3 vs dpm_loss ≈ 0.02, 所以乘 0.01 平衡
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
             label_loss = -(resp.detach() * log_pi).sum(dim=1).mean()
 
-            total_loss = dpm_loss + label_loss
-            mask_rate = mask.mean().item()
+            lambda_pi = getattr(cfg, 'lambda_pi', 0.01)
+            total_loss = dpm_loss + lambda_pi * label_loss
 
             return total_loss, {
                 'dpm_loss': dpm_loss.item(),
                 'label_loss': label_loss.item(),
-                'mask_rate': mask_rate,
+                'mask_rate': mask.mean().item(),
             }
 
 
 # ============================================================
-# 2. Evaluation (用论文的 posterior 估计)
+# 2. Evaluation (固定 t=500, argmin MSE — 稳定无方差)
 # ============================================================
 def evaluate_model(model, loader, cfg):
-    """
-    稳定评估: 固定 t=500, 重复 3 次, argmin MSE。
-    训练用随机 t 的 posterior (EM 需要), 评估用固定 t (消除方差)。
-    """
     model.eval()
     preds, ys_true = [], []
     eval_t = 500
@@ -238,9 +237,8 @@ def plot_dashboard(history, outpath):
     ax.set_title('Pass Rate (%)'); ax.set_ylim(0, 105); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 0]
-    if "label_loss" in history:
-        ax.plot(epochs, history["label_loss"], 'c-')
-    ax.set_title('Label Loss (π)'); ax.grid(True, alpha=0.3)
+    ax.plot(epochs, history["scale"], 'c-')
+    ax.set_title('Dynamic Scale'); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
     ax.plot(epochs, history["threshold"], 'orange')
@@ -249,6 +247,7 @@ def plot_dashboard(history, outpath):
     ax = axes[1, 2]; ax.axis('off')
     info = (f"Current Acc: {history['acc'][-1]:.4f}\n"
             f"Best Acc:    {max(history['acc']):.4f}\n"
+            f"Scale:       {history['scale'][-1]:.1f}\n"
             f"Pass Rate:   {history['pass_rate'][-1]:.1f}%")
     ax.text(0.1, 0.5, info, fontsize=16, family='monospace')
 
@@ -275,14 +274,14 @@ def sample_and_save(model, cfg, out_path, n_per_class=10, cluster_mapping=None):
     y_vec = F.one_hot(y_cond, K).float()
 
     for i in reversed(range(0, T)):
-        t = torch.full((shape[0],), i, device=device, dtype=torch.long)
-        alpha_t = model.dpm_process._extract_t(model.dpm_process.alphas, t, shape)
+        t_batch = torch.full((shape[0],), i, device=device, dtype=torch.long)
+        alpha_t = model.dpm_process._extract_t(model.dpm_process.alphas, t_batch, shape)
         sqrt_oma = model.dpm_process._extract_t(
-            model.dpm_process.sqrt_one_minus_alphas_cumprod, t, shape)
-        pred_noise = model.cond_denoiser(x_t, t, y_vec)
+            model.dpm_process.sqrt_one_minus_alphas_cumprod, t_batch, shape)
+        pred_noise = model.cond_denoiser(x_t, t_batch, y_vec)
         mu = (x_t - (1 - alpha_t) / sqrt_oma * pred_noise) / alpha_t.sqrt()
         sigma = model.dpm_process._extract_t(
-            model.dpm_process.posterior_variance, t, shape).sqrt()
+            model.dpm_process.posterior_variance, t_batch, shape).sqrt()
         noise = torch.randn_like(x_t) if i > 0 else torch.zeros_like(x_t)
         x_t = mu + sigma * noise
 
@@ -321,14 +320,11 @@ def diagnose_conditioning(model, loader, cfg):
         ratio = avg_diff / (avg_norm + 1e-9)
         marker = " ✅" if ratio > 0.001 else " ⚠️"
         print(f"   t={t_val:>4d}  {avg_diff:>10.6f}  {avg_norm:>10.6f}  {ratio:>10.6f}{marker}")
-
-    # 打印配置
-    print(f"\n   M={getattr(cfg, 'posterior_sample_steps', 5)}, 无SNR权重, scale_factor控制放大")
     print()
 
 
 # ============================================================
-# 4. KMeans Initialization
+# 4. KMeans Initialization (可选)
 # ============================================================
 def kmeans_init(loader, cfg):
     print("🔄 Computing KMeans initialization...")
@@ -386,7 +382,7 @@ def pretrain_with_kmeans(model, unlabeled_loader, val_loader, cfg,
         val_acc, _, val_nmi = evaluate_model(model, val_loader, cfg)
         if logger:
             logger.log(epoch=epoch, loss=avg_loss, acc=val_acc, nmi=val_nmi,
-                       pass_rate=100.0, label_loss=0.0, threshold=0.0)
+                       pass_rate=100.0, scale=0.0, threshold=0.0)
         print(f"  [Pretrain] Ep {epoch}/{pretrain_epochs} "
               f"| Loss: {avg_loss:.4f} | Acc: {val_acc:.4f} NMI: {val_nmi:.4f}")
 
@@ -417,11 +413,11 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
     has_labeled = labeled_loader is not None
 
     history = {"loss": [], "acc": [], "nmi": [],
-               "pass_rate": [], "label_loss": [], "threshold": []}
+               "pass_rate": [], "scale": [], "threshold": []}
 
     for epoch in range(1, total_epochs + 1):
 
-        # ── 调度器 ──
+        # ── Scale 调度: 5 → 20 → target_scale ──
         if epoch <= warmup_epochs:
             use_hard = False
             p1 = epoch / warmup_epochs
@@ -444,7 +440,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
         ep_loss, ep_dpm, ep_label, ep_mask = 0.0, 0.0, 0.0, 0.0
         n_batches = 0
 
-        # Labeled
+        # Labeled (半监督)
         if has_labeled:
             for x_lab, y_lab in labeled_loader:
                 x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device)
@@ -461,9 +457,9 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
                 optimizer.zero_grad()
 
                 loss, info = model(x_un, cfg, y=None,
+                                   scale_factor=dynamic_scale,
                                    threshold=dynamic_threshold,
-                                   use_hard_label=use_hard,
-                                   scale_factor=dynamic_scale)
+                                   use_hard_label=use_hard)
 
                 total_loss = cfg.alpha_unlabeled * loss
                 total_loss.backward()
@@ -500,15 +496,15 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
         history["acc"].append(val_acc)
         history["nmi"].append(val_nmi)
         history["pass_rate"].append(pass_pct)
-        history["label_loss"].append(avg_label)
+        history["scale"].append(dynamic_scale)
         history["threshold"].append(dynamic_threshold)
 
         if logger:
             logger.log(epoch=epoch, loss=avg_loss, acc=val_acc, nmi=val_nmi,
-                       pass_rate=pass_pct, label_loss=avg_label, threshold=dynamic_threshold)
+                       pass_rate=pass_pct, scale=dynamic_scale, threshold=dynamic_threshold)
 
         if is_final_training:
-            print(f"  → Loss={avg_loss:.4f} (dpm={avg_dpm:.4f} label={avg_label:.4f}) "
+            print(f"  → Loss={avg_loss:.4f} (dpm={avg_dpm:.4f} π={avg_label:.4f}×{getattr(cfg, 'lambda_pi', 0.01)}) "
                   f"| Acc={val_acc:.4f} NMI={val_nmi:.4f} | Pass={pass_pct:.1f}%")
             plot_dashboard(history, os.path.join(cfg.output_dir, "dashboard.png"))
             if epoch % 5 == 0:
@@ -532,6 +528,7 @@ def objective(trial):
     cfg.alpha_unlabeled = 1.0
     cfg.labeled_per_class = 0
     cfg.posterior_sample_steps = 5
+    cfg.lambda_pi = 0.01
     cfg.optuna_epochs = 35
 
     lr = trial.suggest_float("lr", 4e-5, 2e-4, log=True)
@@ -539,7 +536,10 @@ def objective(trial):
     warmup_epochs = trial.suggest_int("warmup_epochs", 10, 20)
     threshold_final = trial.suggest_float("threshold_final", 0.0, 0.1)
 
-    hyperparams = {'target_scale': target_scale, 'warmup_epochs': warmup_epochs, 'threshold_final': threshold_final}
+    hyperparams = {'target_scale': target_scale,
+                   'warmup_epochs': warmup_epochs,
+                   'threshold_final': threshold_final}
+
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     _, unlabeled_loader, val_loader = get_semi_loaders(cfg)
@@ -557,14 +557,16 @@ def main():
     # ╔══════════════════════════════════════════════════════════╗
     # ║  配置区                                                  ║
     # ╚══════════════════════════════════════════════════════════╝
-    TRAINING_MODE = "unsupervised"   # "unsupervised" 或 "semi_supervised"
-    LABELED_PER_CLASS = 100
-    SKIP_PRETRAIN = False
+    TRAINING_MODE = "unsupervised"    # "unsupervised" 或 "semi_supervised"
+    LABELED_PER_CLASS = 100           # 半监督: 每类标注数量
+    ENABLE_PRETRAIN = True            # True = KMeans pretrain, False = 直接 EM
+    SKIP_PRETRAIN = False             # True = 从 checkpoint 恢复
     ENABLE_AUTO_SEARCH = False
 
     cfg = Config()
     cfg.alpha_unlabeled = 1.0
     cfg.posterior_sample_steps = 5
+    cfg.lambda_pi = 0.01              # label_loss 系数 (防止 π 被过度拉扯)
     cfg.pretrain_epochs = 20
     cfg.pretrain_lr = 2e-4
 
@@ -583,6 +585,7 @@ def main():
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=20)
         best_params = {
+            'target_scale': study.best_params['target_scale'],
             'warmup_epochs': study.best_params['warmup_epochs'],
             'threshold_final': study.best_params['threshold_final']
         }
@@ -591,7 +594,7 @@ def main():
         best_params = {'target_scale': 134.37, 'warmup_epochs': 10, 'threshold_final': 0.036}
         best_lr = 4.01e-05
 
-    print(f"\n🚀 Training: LR={best_lr:.2e}, Params={best_params}")
+    print(f"\n🚀 Training: LR={best_lr:.2e}, λ_π={cfg.lambda_pi}, Params={best_params}")
 
     cfg.final_epochs = 60
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -603,55 +606,59 @@ def main():
     logger = TrainingLogger()
     pretrain_ckpt = os.path.join(cfg.output_dir, "pretrain_checkpoint.pt")
 
-    # ── Phase 0 ──
-    if SKIP_PRETRAIN and os.path.exists(pretrain_ckpt):
-        print(f"\n⏩ Loading checkpoint: {pretrain_ckpt}")
-        ckpt = torch.load(pretrain_ckpt, map_location=cfg.device, weights_only=False)
-        model.load_state_dict(ckpt['model_state_dict'])
-        if 'logger_records' in ckpt:
-            logger.records = ckpt['logger_records']
-        print(f"   Acc={ckpt.get('acc', '?')}, π={model.pi.detach().cpu().numpy().round(3).tolist()}")
-        diagnose_conditioning(model, val_loader, cfg)
+    # ── Phase 0: Pretrain (可选) ──
+    if ENABLE_PRETRAIN:
+        if SKIP_PRETRAIN and os.path.exists(pretrain_ckpt):
+            print(f"\n⏩ Loading checkpoint: {pretrain_ckpt}")
+            ckpt = torch.load(pretrain_ckpt, map_location=cfg.device, weights_only=False)
+            model.load_state_dict(ckpt['model_state_dict'])
+            if 'logger_records' in ckpt:
+                logger.records = ckpt['logger_records']
+            print(f"   Acc={ckpt.get('acc', '?')}")
+            diagnose_conditioning(model, val_loader, cfg)
+        else:
+            if TRAINING_MODE == "unsupervised":
+                centroids, cluster_props = kmeans_init(unlabeled_loader, cfg)
+                with torch.no_grad():
+                    model.log_pi.copy_(torch.log(torch.tensor(cluster_props).clamp(min=1e-6)))
+                print(f"   π from KMeans: {model.pi.detach().cpu().numpy().round(3).tolist()}")
+                pretrain_with_kmeans(model, unlabeled_loader, val_loader, cfg,
+                                     centroids, pretrain_epochs=cfg.pretrain_epochs, logger=logger)
+
+            elif TRAINING_MODE == "semi_supervised" and labeled_loader is not None:
+                print(f"\n🏋️ Pretrain with REAL labels ({cfg.pretrain_epochs} ep)")
+                pt_opt = torch.optim.Adam(model.parameters(), lr=cfg.pretrain_lr)
+                for ep in range(1, cfg.pretrain_epochs + 1):
+                    model.train()
+                    ep_loss, n = 0.0, 0
+                    for x, y in labeled_loader:
+                        x, y = x.to(cfg.device), y.to(cfg.device)
+                        loss, _ = model(x, cfg, y=y)
+                        pt_opt.zero_grad(); loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        pt_opt.step(); ep_loss += loss.item(); n += 1
+                    acc, _, nmi = evaluate_model(model, val_loader, cfg)
+                    if logger:
+                        logger.log(epoch=ep, loss=ep_loss/max(n,1), acc=acc, nmi=nmi,
+                                   pass_rate=100, scale=0, threshold=0)
+                    print(f"  [Pretrain] Ep {ep}/{cfg.pretrain_epochs} "
+                          f"| Loss: {ep_loss/max(n,1):.4f} | Acc: {acc:.4f} NMI: {nmi:.4f}")
+                print("  ✅ Pretrain complete\n")
+
+            diagnose_conditioning(model, val_loader, cfg)
+            acc_now, _, nmi_now = evaluate_model(model, val_loader, cfg)
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'logger_records': logger.records,
+                'acc': acc_now, 'nmi': nmi_now,
+            }, pretrain_ckpt)
+            print(f"💾 Checkpoint saved → {pretrain_ckpt} (Acc={acc_now:.4f})")
+            print(f"   下次设 SKIP_PRETRAIN=True 即可跳过\n")
     else:
-        if TRAINING_MODE == "unsupervised":
-            centroids, cluster_props = kmeans_init(unlabeled_loader, cfg)
-            with torch.no_grad():
-                model.log_pi.copy_(torch.log(torch.tensor(cluster_props).clamp(min=1e-6)))
-            print(f"   π from KMeans: {model.pi.detach().cpu().numpy().round(3).tolist()}")
-            pretrain_with_kmeans(model, unlabeled_loader, val_loader, cfg,
-                                 centroids, pretrain_epochs=cfg.pretrain_epochs, logger=logger)
-
-        elif TRAINING_MODE == "semi_supervised" and labeled_loader is not None:
-            print(f"\n🏋️ Pretrain with REAL labels ({cfg.pretrain_epochs} ep)")
-            pt_opt = torch.optim.Adam(model.parameters(), lr=cfg.pretrain_lr)
-            for ep in range(1, cfg.pretrain_epochs + 1):
-                model.train()
-                ep_loss, n = 0.0, 0
-                for x, y in labeled_loader:
-                    x, y = x.to(cfg.device), y.to(cfg.device)
-                    loss, _ = model(x, cfg, y=y)
-                    pt_opt.zero_grad(); loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    pt_opt.step(); ep_loss += loss.item(); n += 1
-                acc, _, nmi = evaluate_model(model, val_loader, cfg)
-                if logger:
-                    logger.log(epoch=ep, loss=ep_loss/max(n,1), acc=acc, nmi=nmi,
-                               pass_rate=100, label_loss=0, threshold=0)
-                print(f"  [Pretrain] Ep {ep}/{cfg.pretrain_epochs} "
-                      f"| Loss: {ep_loss/max(n,1):.4f} | Acc: {acc:.4f} NMI: {nmi:.4f}")
-            print("  ✅ Pretrain complete\n")
-
+        print("\n⏩ No pretrain, starting EM directly")
         diagnose_conditioning(model, val_loader, cfg)
-        acc_now, _, nmi_now = evaluate_model(model, val_loader, cfg)
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'logger_records': logger.records,
-            'acc': acc_now, 'nmi': nmi_now,
-        }, pretrain_ckpt)
-        print(f"💾 Checkpoint saved → {pretrain_ckpt} (Acc={acc_now:.4f})")
-        print(f"   下次设 SKIP_PRETRAIN=True 即可跳过\n")
 
-    # ── Phase 1 ──
+    # ── Phase 1: EM Training ──
     print("=" * 50)
     print("🔄 EM Training...")
     print("=" * 50)
