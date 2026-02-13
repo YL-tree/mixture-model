@@ -87,25 +87,42 @@ class mDPM_SemiSup(nn.Module):
             schedule='linear',
             image_channels=cfg.image_channels
         )
-        # π 作为可学习参数（log 空间优化，softmax 映射到概率单纯形）
         self.log_pi = nn.Parameter(torch.zeros(cfg.num_classes))
+        # ---- Classifier-Free Guidance (CFG) ----
+        self.cond_drop_prob = getattr(cfg, 'cond_drop_prob', 0.15)
+        self.guidance_weight = getattr(cfg, 'guidance_weight', 3.0)
 
     @property
     def pi(self):
         return F.softmax(self.log_pi, dim=0)
 
+    def _predict_noise_cfg(self, x_t, t, y_onehot):
+        """训练时: 随机将部分样本的 class 条件置零, 迫使模型同时学会 conditional 和 unconditional"""
+        if self.training and self.cond_drop_prob > 0:
+            drop_mask = (torch.rand(x_t.size(0), device=x_t.device) < self.cond_drop_prob)
+            y_onehot = y_onehot.clone()
+            y_onehot[drop_mask] = 0.0
+        return self.cond_denoiser(x_t, t, y_onehot)
+
+    def _guided_mse(self, x_t, t, noise, y_onehot):
+        """
+        推断时: Classifier-Free Guidance
+        ε_guided = ε_uncond + w * (ε_cond - ε_uncond)
+        """
+        y_null = torch.zeros_like(y_onehot)
+        eps_uncond = self.cond_denoiser(x_t, t, y_null)
+        eps_cond = self.cond_denoiser(x_t, t, y_onehot)
+        eps_guided = eps_uncond + self.guidance_weight * (eps_cond - eps_uncond)
+        mse = F.mse_loss(eps_guided, noise, reduction='none').view(x_t.size(0), -1).mean(dim=1)
+        return mse
+
     def estimate_posterior_logits(self, x_0, cfg):
-        """
-        论文公式:
-        log s̃_k(z) = log π_k + log p(y|x=k,z₁,θ) + (T-1)/M Σ_m log p(z_tm|x=k,z_{tm+1},θ)
-        (log p(z_T) 对所有 k 相同，softmax 中消掉)
-        """
+        """论文公式 + CFG guidance 计算各类别 log-score"""
         batch_size = x_0.size(0)
         num_classes = cfg.num_classes
         M = cfg.posterior_sample_steps
         T = cfg.timesteps
 
-        # SNR 权重: w_t = β²_t / (2 σ²_t α_t (1-ᾱ_t))
         betas = self.dpm_process.betas
         alphas = self.dpm_process.alphas
         alphas_cumprod = self.dpm_process.alphas_cumprod
@@ -120,20 +137,19 @@ class mDPM_SemiSup(nn.Module):
         diffusion_logprob = torch.zeros(batch_size, num_classes, device=x_0.device)
 
         with torch.no_grad():
-            # (a) 重构项: log p(y | x=k, z₁, θ)
+            # (a) 重构项
             t_recon = torch.ones(batch_size, device=x_0.device, dtype=torch.long)
             noise_recon = torch.randn_like(x_0)
             z_1 = self.dpm_process.q_sample(x_0, t_recon, noise_recon)
             w_recon = snr_weights[1]
 
             for k in range(num_classes):
-                y_cond = torch.full((batch_size,), k, device=x_0.device, dtype=torch.long)
-                y_onehot = F.one_hot(y_cond, num_classes=num_classes).float()
-                pred_noise = self.cond_denoiser(z_1, t_recon, y_onehot)
-                mse = F.mse_loss(pred_noise, noise_recon, reduction='none').view(batch_size, -1).mean(dim=1)
+                y_oh = F.one_hot(torch.full((batch_size,), k, device=x_0.device,
+                                             dtype=torch.long), num_classes).float()
+                mse = self._guided_mse(z_1, t_recon, noise_recon, y_oh)
                 recon_logprob[:, k] = -w_recon * mse
 
-            # (b) 扩散转移项: (T-1)/M Σ_m log p(z_tm | x=k, z_{tm+1}, θ)
+            # (b) 扩散转移项
             for _ in range(M):
                 t = torch.randint(1, T, (batch_size,), device=x_0.device).long()
                 noise = torch.randn_like(x_0)
@@ -141,17 +157,13 @@ class mDPM_SemiSup(nn.Module):
                 w_t = snr_weights[t]
 
                 for k in range(num_classes):
-                    y_cond = torch.full((batch_size,), k, device=x_0.device, dtype=torch.long)
-                    y_onehot = F.one_hot(y_cond, num_classes=num_classes).float()
-                    pred_noise = self.cond_denoiser(x_t, t, y_onehot)
-                    mse = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
+                    y_oh = F.one_hot(torch.full((batch_size,), k, device=x_0.device,
+                                                 dtype=torch.long), num_classes).float()
+                    mse = self._guided_mse(x_t, t, noise, y_oh)
                     diffusion_logprob[:, k] += -w_t * mse
 
             diffusion_logprob = diffusion_logprob * (T - 1) / M
-
-            # (c) 先验项: log π_k
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
-
             final_logits = log_pi + recon_logprob + diffusion_logprob
 
         return final_logits
@@ -159,19 +171,19 @@ class mDPM_SemiSup(nn.Module):
     def forward(self, x_0, cfg, y=None, threshold=0.0, use_hard_label=False):
         batch_size = x_0.size(0)
 
-        # Path A: 监督
+        # Path A: 监督 (带 CFG dropout)
         if y is not None:
             t = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t = self.dpm_process.q_sample(x_0, t, noise)
             y_onehot = F.one_hot(y, num_classes=cfg.num_classes).float()
-            pred_noise = self.cond_denoiser(x_t, t, y_onehot)
+            pred_noise = self._predict_noise_cfg(x_t, t, y_onehot)
             dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean')
             return dpm_loss, {'dpm_loss': dpm_loss.item(), 'label_loss': 0.0,
                               'mask_rate': 1.0, 'resp': None,
                               'resp_entropy': 0.0, 'max_conf': 1.0}
 
-        # Path B: 无监督
+        # Path B: 无监督 (带 CFG dropout)
         else:
             logits = self.estimate_posterior_logits(x_0, cfg)
             resp = F.softmax(logits, dim=1)
@@ -185,16 +197,14 @@ class mDPM_SemiSup(nn.Module):
                 y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
                 mask = torch.ones(batch_size, device=x_0.device)
 
-            # L_diffusion
             t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
-            pred_noise = self.cond_denoiser(x_t_train, t_train, y_target)
+            pred_noise = self._predict_noise_cfg(x_t_train, t_train, y_target)
 
             loss_per_sample = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
             dpm_loss = (loss_per_sample * mask).sum() / (mask.sum() + 1e-8)
 
-            # L_label: E[log p(x | Π)]
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
             label_loss = -(resp.detach() * log_pi).sum(dim=1).mean()
 
@@ -396,12 +406,13 @@ def fig02_posterior_histogram(model, loader, cfg, save_path):
 # --- fig03: Generated Samples (enhanced) ---
 @torch.no_grad()
 def fig03_generated_samples(model, cfg, save_path, n_per_class=10, cluster_mapping=None):
-    """按映射后的真实数字顺序生成图像网格"""
+    """按映射后的真实数字顺序，用 CFG 采样生成图像网格"""
     T = model.dpm_process.timesteps
     model.cond_denoiser.eval()
     image_c = model.dpm_process.image_channels
     K = cfg.num_classes
     device = cfg.device
+    w = model.guidance_weight  # CFG guidance scale
 
     shape = (n_per_class * K, image_c, 28, 28)
     x_t = torch.randn(shape, device=device)
@@ -414,13 +425,19 @@ def fig03_generated_samples(model, cfg, save_path, n_per_class=10, cluster_mappi
         y_cond = torch.arange(K).to(device).repeat_interleave(n_per_class).long()
 
     y_cond_vec = F.one_hot(y_cond, K).float()
+    y_null = torch.zeros_like(y_cond_vec)
 
     for i in reversed(range(0, T)):
         t = torch.full((shape[0],), i, device=device, dtype=torch.long)
         alpha_t = model.dpm_process._extract_t(model.dpm_process.alphas, t, shape)
         one_minus_alpha_t_bar = model.dpm_process._extract_t(
             model.dpm_process.sqrt_one_minus_alphas_cumprod, t, shape)
-        pred_noise = model.cond_denoiser(x_t, t, y_cond_vec)
+
+        # CFG: ε_guided = ε_uncond + w * (ε_cond - ε_uncond)
+        eps_uncond = model.cond_denoiser(x_t, t, y_null)
+        eps_cond = model.cond_denoiser(x_t, t, y_cond_vec)
+        pred_noise = eps_uncond + w * (eps_cond - eps_uncond)
+
         mu_t_1 = (x_t - (1 - alpha_t) / one_minus_alpha_t_bar * pred_noise) / alpha_t.sqrt()
         sigma_t_1 = model.dpm_process._extract_t(
             model.dpm_process.posterior_variance, t, shape).sqrt()
@@ -470,15 +487,21 @@ def fig04_x_conditionality(model, loader, cfg, save_path, n_samples=6):
         ax.imshow(x_t[j, 0].cpu().clamp(-1, 1) * 0.5 + 0.5, cmap='gray'); ax.axis('off')
     axes[1, 0].set_ylabel(f"Noisy\nt={t_vis}", fontsize=9, rotation=0, labelpad=50)
 
-    # Row 2..K+1: 不同 class 条件一步去噪
+    # Row 2..K+1: 不同 class 条件一步 CFG 去噪
     alpha_t_val = model.dpm_process.alphas[t_vis]
     sqrt_oma = model.dpm_process.sqrt_one_minus_alphas_cumprod[t_vis]
+    w = model.guidance_weight
+
+    # unconditional prediction (shared)
+    y_null = torch.zeros(n_samples, K, device=device)
+    eps_uncond = model.cond_denoiser(x_t, t, y_null)
 
     for k in range(K):
         y_oh = F.one_hot(torch.full((n_samples,), k, device=device,
                                      dtype=torch.long), K).float()
-        pred_noise = model.cond_denoiser(x_t, t, y_oh)
-        x_denoised = (x_t - (1 - alpha_t_val) / sqrt_oma * pred_noise) / alpha_t_val.sqrt()
+        eps_cond = model.cond_denoiser(x_t, t, y_oh)
+        eps_guided = eps_uncond + w * (eps_cond - eps_uncond)
+        x_denoised = (x_t - (1 - alpha_t_val) / sqrt_oma * eps_guided) / alpha_t_val.sqrt()
 
         for j in range(n_samples):
             ax = axes[k + 2, j]
@@ -517,13 +540,19 @@ def measure_x_conditionality(model, loader, cfg, n_samples=100):
 
     alpha_t = model.dpm_process.alphas[t_val]
     sqrt_oma = model.dpm_process.sqrt_one_minus_alphas_cumprod[t_val]
+    w = model.guidance_weight
+
+    # unconditional prediction (shared)
+    y_null = torch.zeros(n_samples, K, device=device)
+    eps_uncond = model.cond_denoiser(x_t, t, y_null)
 
     outputs = []
     for k in range(K):
         y_oh = F.one_hot(torch.full((n_samples,), k, device=device,
                                      dtype=torch.long), K).float()
-        pred = model.cond_denoiser(x_t, t, y_oh)
-        denoised = (x_t - (1 - alpha_t) / sqrt_oma * pred) / alpha_t.sqrt()
+        eps_cond = model.cond_denoiser(x_t, t, y_oh)
+        eps_guided = eps_uncond + w * (eps_cond - eps_uncond)
+        denoised = (x_t - (1 - alpha_t) / sqrt_oma * eps_guided) / alpha_t.sqrt()
         outputs.append(denoised)
 
     outputs = torch.stack(outputs, dim=0)  # [K, N, C, H, W]
@@ -569,7 +598,10 @@ def fig05_per_class_denoising(model, loader, cfg, save_path,
 
         ck = label2cluster.get(k, k) if label2cluster else k
         y_oh = F.one_hot(torch.full((B,), ck, device=device, dtype=torch.long), K).float()
-        pred_noise = model.cond_denoiser(x_t, t, y_oh)
+        y_null = torch.zeros_like(y_oh)
+        eps_uncond = model.cond_denoiser(x_t, t, y_null)
+        eps_cond = model.cond_denoiser(x_t, t, y_oh)
+        pred_noise = eps_uncond + model.guidance_weight * (eps_cond - eps_uncond)
         alpha_t_val = model.dpm_process.alphas[t_vis]
         sqrt_oma = model.dpm_process.sqrt_one_minus_alphas_cumprod[t_vis]
         x_denoised = (x_t - (1 - alpha_t_val) / sqrt_oma * pred_noise) / alpha_t_val.sqrt()
@@ -923,6 +955,8 @@ def main():
     cfg.labeled_per_class = 0
     cfg.posterior_sample_steps = 5
     cfg.pretrain_epochs = 10  # KMeans 预训练轮数
+    cfg.cond_drop_prob = 0.15  # CFG: 训练时 15% 概率 drop class 条件
+    cfg.guidance_weight = 3.0   # CFG: 推断时 guidance scale
 
     if ENABLE_AUTO_SEARCH:
         print("🔍 [Step 1] Starting Optuna Search...")
