@@ -352,16 +352,17 @@ def diagnose_conditioning(model, loader, cfg):
 # ============================================================
 def kmeans_init(loader, cfg):
     print("🔄 Computing KMeans initialization...")
-    features = []
-    for x, _ in loader:
+    features, true_labels = [], []
+    for x, y in loader:
         features.append(x.view(x.size(0), -1))
+        true_labels.append(y)
     features = torch.cat(features).numpy()
+    ys = torch.cat(true_labels).numpy()
 
     kmeans = KMeans(n_clusters=cfg.num_classes, n_init=10, random_state=42)
     labels = kmeans.fit_predict(features)
     centroids = torch.tensor(kmeans.cluster_centers_, dtype=torch.float32)
 
-    ys = np.concatenate([y.numpy() for _, y in loader])
     K = cfg.num_classes
     cost = np.zeros((K, K))
     for i in range(K):
@@ -565,7 +566,7 @@ def objective(trial):
 
 
 def main():
-    set_seed(42)
+    set_seed(2026)
 
     # ╔══════════════════════════════════════════════════════════╗
     # ║  配置区                                                  ║
