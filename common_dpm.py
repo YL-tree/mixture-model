@@ -24,7 +24,7 @@ class Config:
         # ---------------------
         # 自动检测可用设备
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.output_dir = "./mDPM_results_unsupervised_optuna"
+        self.output_dir = "./mDPM_qiuqiu"
         self.batch_size = 64
         self.final_epochs = 100
         self.optuna_epochs = 10 
@@ -140,66 +140,64 @@ class SinusoidalPositionalEmbedding(nn.Module):
 
 class ResidualBlock(nn.Module):
     """
-    Dual-FiLM ResidualBlock:
-    - time_mlp → scale/shift (控制去噪强度)
-    - class_mlp → 独立的 scale/shift (控制类别特征)
-    两路 FiLM 依次作用, class 无法被忽略
+    改进版 ResidualBlock：使用 AdaGN (Adaptive Group Norm) 替代简单的加法。
+    增强了条件 y 对生成过程的控制力，大幅提升分类时的判别度。
     """
-    def __init__(self, in_channels, out_channels, time_embed_dim, class_embed_dim=None, kernel_size=3):
+    def __init__(self, in_channels, out_channels, time_embed_dim, kernel_size=3):
         super().__init__()
-        if class_embed_dim is None:
-            class_embed_dim = time_embed_dim
-
+        
         padding = kernel_size // 2
-
+        
+        # 1. 正常的卷积层
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
         self.norm1 = nn.GroupNorm(8, out_channels)
         self.act1 = nn.SiLU()
-
+        
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act2 = nn.SiLU()
-
-        # Time FiLM: scale + shift (作用在 norm1 之后)
+        
+        # [核心修改 1] 输出维度翻倍 (out_channels * 2)
+        # 因为我们要同时预测 Scale (乘法系数) 和 Shift (加法偏置)
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_embed_dim, out_channels * 2)
         )
-
-        # Class FiLM: 独立的 scale + shift (作用在 norm2 之后)
-        self.class_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(class_embed_dim, out_channels * 2)
-        )
-
+        
         self.residual_conv = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
-    def forward(self, x, t_emb, c_emb=None):
+    def forward(self, x, t_emb):
         """
         x: (B, C, H, W)
-        t_emb: (B, time_embed_dim) - 纯时间信息
-        c_emb: (B, class_embed_dim) - 纯类别信息 (可选)
+        t_emb: (B, time_embed_dim) -> 包含了 time + label 的信息
         """
+        # --- 主干路径 ---
+        
+        # 1. 第一层卷积
         h = self.conv1(x)
+        
+        # 2. [核心修改 2] AdaGN 注入机制
+        # 先归一化
         h = self.norm1(h)
-
-        # Time FiLM
-        t_style = self.time_mlp(t_emb)[:, :, None, None]
-        t_scale, t_shift = t_style.chunk(2, dim=1)
-        h = h * (1 + t_scale) + t_shift
+        
+        # 计算 Scale 和 Shift
+        # style shape: (B, 2*C) -> (B, 2*C, 1, 1)
+        style = self.time_mlp(t_emb)[:, :, None, None]
+        scale, shift = style.chunk(2, dim=1) # 分割成两半
+        
+        # 执行仿射变换: h = h * (1 + scale) + shift
+        # 这种乘法交互让条件 y 能强力控制特征图
+        h = h * (1 + scale) + shift
+        
+        # 激活函数
         h = self.act1(h)
-
-        # 第二层卷积
+        
+        # 3. 第二层卷积
         h = self.conv2(h)
         h = self.norm2(h)
-
-        # Class FiLM (独立通路, 不经过 time)
-        if c_emb is not None:
-            c_style = self.class_mlp(c_emb)[:, :, None, None]
-            c_scale, c_shift = c_style.chunk(2, dim=1)
-            h = h * (1 + c_scale) + c_shift
-
         h = self.act2(h)
+        
+        # --- 残差连接 ---
         return h + self.residual_conv(x)
 
 class AttentionBlock(nn.Module):
@@ -222,62 +220,49 @@ class AttentionBlock(nn.Module):
         return x + self.proj_out(out)
 
 class ConditionalUnet(nn.Module):
-    """
-    Input-level + Dual-FiLM Conditional UNet.
-    Class one-hot 直接拼到图像通道上 (不可能被忽略),
-    同时保留 FiLM 调制用于细粒度控制.
-    """
     def __init__(self, in_channels=1, base_channels=64, num_classes=10, time_emb_dim=256):
         super().__init__()
         self.time_emb_dim = time_emb_dim
         self.num_classes = num_classes
-        self.in_channels = in_channels
 
-        # Time 通路
         self.time_mlp = nn.Sequential(
             SinusoidalPositionalEmbedding(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
-        # Class 通路 (用于 FiLM)
         self.label_emb = nn.Embedding(num_classes, time_emb_dim)
-        self.label_mlp = nn.Sequential(
-            nn.Linear(time_emb_dim, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
-        )
+        nn.init.normal_(self.label_emb.weight, mean=0.0, std=1.0)
 
         ch = [base_channels, base_channels * 2, base_channels * 4]
-        # ★ 输入通道 = 图像通道 + K 个 class 通道
-        self.init_conv = nn.Conv2d(in_channels + num_classes, ch[0], 3, padding=1)
+        self.init_conv = nn.Conv2d(in_channels, ch[0], 3, padding=1)
 
         self.downs = nn.ModuleList([
             nn.ModuleList([
-                ResidualBlock(ch[0], ch[0], time_emb_dim, time_emb_dim),
-                ResidualBlock(ch[0], ch[1], time_emb_dim, time_emb_dim),
+                ResidualBlock(ch[0], ch[0], time_emb_dim),
+                ResidualBlock(ch[0], ch[1], time_emb_dim), 
                 nn.MaxPool2d(2)
             ]),
             nn.ModuleList([
-                ResidualBlock(ch[1], ch[2], time_emb_dim, time_emb_dim),
+                ResidualBlock(ch[1], ch[2], time_emb_dim), 
                 AttentionBlock(ch[2]),
                 nn.MaxPool2d(2)
             ]),
         ])
 
         self.bottleneck = nn.ModuleList([
-            ResidualBlock(ch[2], ch[2], time_emb_dim, time_emb_dim),
+            ResidualBlock(ch[2], ch[2], time_emb_dim),
             AttentionBlock(ch[2]),
-            ResidualBlock(ch[2], ch[2], time_emb_dim, time_emb_dim),
+            ResidualBlock(ch[2], ch[2], time_emb_dim),
         ])
 
         self.ups = nn.ModuleList([
             nn.ModuleList([
-                ResidualBlock(ch[2] + ch[1], ch[1], time_emb_dim, time_emb_dim),
+                ResidualBlock(ch[2] + ch[1], ch[1], time_emb_dim),
                 AttentionBlock(ch[1])
             ]),
             nn.ModuleList([
-                ResidualBlock(ch[1] + ch[0], ch[0], time_emb_dim, time_emb_dim),
+                ResidualBlock(ch[1] + ch[0], ch[0], time_emb_dim),
             ]),
         ])
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
@@ -288,64 +273,57 @@ class ConditionalUnet(nn.Module):
         )
 
     def forward(self, x, t, y_cond):
-        # 1. Time embedding
+        # 1. 计算时间嵌入
         t_emb = self.time_mlp(t)
-
-        # 2. Class → one-hot (处理多种输入格式)
-        if y_cond.dim() == 1:
-            y_onehot = F.one_hot(y_cond, self.num_classes).float()
-        elif y_cond.dim() == 2 and y_cond.size(1) == self.num_classes:
-            y_onehot = y_cond
+        
+        # 2. 计算标签嵌入
+        if y_cond.dim() == 2 and y_cond.size(1) == self.num_classes:
+            y_emb = y_cond @ self.label_emb.weight
+        elif y_cond.dim() == 1:
+            y_emb = self.label_emb(y_cond)
         else:
             raise ValueError("y_cond format error")
+            
+        # ==========================================
+        # [关键修改] 动态调整注入强度
+        # ==========================================
+        # 获取当前 batch 每个样本的时间权重
+        w_t = get_time_weight(t, self.time_mlp[0].dim * 2).to(t.device) # 这里的 dim * 2 只是为了获取 max_steps 对应的参数，或者直接传 1000
+        # 修正：直接用 cfg.timesteps 或者硬编码 1000
+        w_t = get_time_weight(t, max_steps=1000).to(t.device)
+        
+        # 增强/抑制条件信号
+        y_emb = y_emb * w_t
+        
+        # 3. 融合 (条件 = 时间 + 加权后的标签)
+        cond_emb = t_emb + y_emb
 
-        # 3. Class embedding for FiLM
-        y_emb = y_onehot @ self.label_emb.weight
-        c_emb = self.label_mlp(y_emb)
-
-        # 4. ★ Input-level conditioning: 拼到图像通道上
-        # x_t 在 t=200 时幅度约 ±2~3, class 通道需要同等量级才不会被淹没
-        # 用双极编码: 选中的 class = +1, 未选中 = -1, 再乘 scale
-        B, _, H, W = x.shape
-        c_bipolar = 2.0 * y_onehot - 1.0   # [B, K]: 选中 → +1, 未选中 → -1
-        cond_scale = 3.0  # 让 class 通道幅度 ≈ x_t 幅度
-        c_spatial = (c_bipolar * cond_scale)[:, :, None, None].expand(B, self.num_classes, H, W)
-        x_in = torch.cat([x, c_spatial], dim=1)  # [B, C+K, H, W]
-
-        # 5. UNet
-        x = self.init_conv(x_in)
+        x = self.init_conv(x)
         skips = [x]
-
+        
         for down_block_set in self.downs:
             for module in down_block_set:
-                if isinstance(module, ResidualBlock):
-                    x = module(x, t_emb, c_emb)
-                elif isinstance(module, AttentionBlock):
-                    x = module(x)
+                if isinstance(module, (ResidualBlock, AttentionBlock)):
+                    x = module(x, cond_emb)
                 else:
                     x = module(x)
             skips.append(x)
-
+            
         skips.pop()
-
+        
         for block in self.bottleneck:
-            if isinstance(block, ResidualBlock):
-                x = block(x, t_emb, c_emb)
-            else:
-                x = block(x)
+            x = block(x, cond_emb)
 
         for up_block_set, skip in zip(self.ups, reversed(skips)):
             x = self.upsample(x)
             if x.shape[2] != skip.shape[2]:
-                skip = skip[:, :, :x.shape[2], :x.shape[3]]
-            x = torch.cat([x, skip], dim=1)
+                 skip = skip[:, :, :x.shape[2], :x.shape[3]] 
+            x = torch.cat([x, skip], dim=1) 
             for module in up_block_set:
-                if isinstance(module, ResidualBlock):
-                    x = module(x, t_emb, c_emb)
-                elif isinstance(module, AttentionBlock):
-                    x = module(x)
+                if isinstance(module, (ResidualBlock, AttentionBlock)):
+                    x = module(x, cond_emb)
                 else:
-                    x = module(x)
+                    x = module(x) 
 
         return self.final_conv(x)
 # -----------------------------------------------------

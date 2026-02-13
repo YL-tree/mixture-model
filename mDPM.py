@@ -1,9 +1,9 @@
 # mDPM.py
 # ═══════════════════════════════════════════════════════════════
-# Mixture DPM — 最终版
-#   基于验证过的 scale_factor 机制 (Acc=0.5)
-#   + KMeans pretrain (可选) + label_loss (加系数防坍缩)
-#   + 半监督支持 + checkpoint
+# Mixture DPM — 综合版
+#   基于验证过的 Acc=0.5 机制 (Embedding + AdaGN + get_time_weight)
+#   + 论文 M-step π 更新 (label_loss, λ_π 平衡)
+#   + KMeans pretrain (可选) + 半监督 + checkpoint
 # ═══════════════════════════════════════════════════════════════
 
 import torch
@@ -21,14 +21,13 @@ from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import normalized_mutual_info_score as NMI
 from sklearn.cluster import KMeans
 from torchvision.utils import save_image
-import itertools
 from common_dpm import *
 
 
 # ============================================================
 # 0. Utilities
 # ============================================================
-def set_seed(seed=42):
+def set_seed(seed=2026):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -36,24 +35,6 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     print(f"🔒 Seed locked to {seed}")
-
-
-class TrainingLogger:
-    def __init__(self):
-        self.records = {}
-
-    def log(self, **kwargs):
-        for k, v in kwargs.items():
-            if k not in self.records:
-                self.records[k] = []
-            if isinstance(v, np.ndarray):
-                v = v.tolist()
-            self.records[k].append(v)
-
-    def save(self, path):
-        with open(path, 'w') as f:
-            json.dump(self.records, f, indent=2)
-        print(f"  ✓ log → {path}")
 
 
 # ============================================================
@@ -73,18 +54,32 @@ class mDPM_SemiSup(nn.Module):
             schedule='linear',
             image_channels=cfg.image_channels
         )
-        # π: 可学习, 但 label_loss 加系数防止被过度拉扯
-        self.log_pi = nn.Parameter(torch.zeros(cfg.num_classes))
+        # π: register_buffer 作为默认值, log_pi 作为可学习参数
+        # 当 enable_pi_update=True 时通过 label_loss 更新
+        self.register_buffer('default_pi', torch.ones(cfg.num_classes) / cfg.num_classes)
+        self.log_pi = nn.Parameter(torch.zeros(cfg.num_classes), requires_grad=False)
+        # requires_grad 默认 False, 只在 enable_pi_update 时开启
 
     @property
     def pi(self):
-        return F.softmax(self.log_pi, dim=0)
+        if self.log_pi.requires_grad:
+            return F.softmax(self.log_pi, dim=0)
+        else:
+            return self.default_pi
+
+    def enable_pi_update(self, enable=True):
+        """开启/关闭 π 的梯度更新"""
+        self.log_pi.requires_grad_(enable)
+        if enable:
+            # 用当前 default_pi 初始化 log_pi
+            with torch.no_grad():
+                self.log_pi.copy_(torch.log(self.default_pi.clamp(min=1e-6)))
 
     def estimate_posterior_logits(self, x_0, cfg, scale_factor=1.0):
         """
-        E-step: 简单 -MSE/M × scale_factor
-        无 SNR 权重 (实验证明有害), t ∈ [1, T) 完整范围
-        scale_factor 等价于 tempered posterior 的温度参数
+        E-step: -MSE/M × scale_factor
+        t ∈ [100, 900]: 验证过有效, 过滤极端 t 减少方差
+        scale_factor = tempered posterior 温度参数
         """
         B = x_0.size(0)
         K = cfg.num_classes
@@ -95,7 +90,7 @@ class mDPM_SemiSup(nn.Module):
 
         with torch.no_grad():
             for _ in range(M):
-                t = torch.randint(1, cfg.timesteps, (B,), device=device).long()
+                t = torch.randint(100, 900, (B,), device=device).long()
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
 
@@ -113,7 +108,7 @@ class mDPM_SemiSup(nn.Module):
         return logits
 
     def forward(self, x_0, cfg, y=None, scale_factor=1.0,
-                threshold=0.0, use_hard_label=False):
+                threshold=0.0, use_hard_label=False, lambda_pi=0.0):
         B = x_0.size(0)
 
         # Path A: 监督
@@ -128,44 +123,45 @@ class mDPM_SemiSup(nn.Module):
                               'mask_rate': 1.0}
 
         # Path B: 无监督 EM
+        logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
+        resp = F.softmax(logits, dim=1)
+
+        if use_hard_label:
+            max_probs, pseudo_labels = resp.max(dim=1)
+            mask = (max_probs >= threshold).float()
+            y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
         else:
-            logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
-            resp = F.softmax(logits, dim=1)
+            pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
+            y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
+            mask = torch.ones(B, device=x_0.device)
 
-            if use_hard_label:
-                max_probs, pseudo_labels = resp.max(dim=1)
-                mask = (max_probs >= threshold).float()
-                y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
-            else:
-                pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
-                y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
-                mask = torch.ones(B, device=x_0.device)
+        # M-step: denoiser loss
+        t_train = torch.randint(0, cfg.timesteps, (B,), device=x_0.device).long()
+        noise = torch.randn_like(x_0)
+        x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
+        pred_noise = self.cond_denoiser(x_t_train, t_train, y_target)
+        loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
+        dpm_loss = (loss_per * mask).sum() / (mask.sum() + 1e-8)
 
-            # M-step: denoiser loss
-            t_train = torch.randint(0, cfg.timesteps, (B,), device=x_0.device).long()
-            noise = torch.randn_like(x_0)
-            x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
-            pred_noise = self.cond_denoiser(x_t_train, t_train, y_target)
-            loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
-            dpm_loss = (loss_per * mask).sum() / (mask.sum() + 1e-8)
-
-            # M-step: π 更新 (论文公式, 加系数防止主导)
-            # label_loss ≈ 2.3 vs dpm_loss ≈ 0.02, 所以乘 0.01 平衡
+        # M-step: π 更新 (论文公式)
+        # label_loss ≈ 2.3, dpm_loss ≈ 0.02 → 需要 lambda_pi 平衡
+        label_loss_val = 0.0
+        total_loss = dpm_loss
+        if lambda_pi > 0 and self.log_pi.requires_grad:
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
             label_loss = -(resp.detach() * log_pi).sum(dim=1).mean()
-
-            lambda_pi = getattr(cfg, 'lambda_pi', 0.01)
             total_loss = dpm_loss + lambda_pi * label_loss
+            label_loss_val = label_loss.item()
 
-            return total_loss, {
-                'dpm_loss': dpm_loss.item(),
-                'label_loss': label_loss.item(),
-                'mask_rate': mask.mean().item(),
-            }
+        return total_loss, {
+            'dpm_loss': dpm_loss.item(),
+            'label_loss': label_loss_val,
+            'mask_rate': mask.mean().item(),
+        }
 
 
 # ============================================================
-# 2. Evaluation (固定 t=500, argmin MSE — 稳定无方差)
+# 2. Evaluation (固定 t=500, argmin MSE)
 # ============================================================
 def evaluate_model(model, loader, cfg):
     model.eval()
@@ -212,7 +208,7 @@ def evaluate_model(model, loader, cfg):
 
 
 # ============================================================
-# 3. Figures & Diagnostics
+# 3. Dashboard & Diagnostics
 # ============================================================
 def plot_dashboard(history, outpath):
     n = len(history.get("loss", []))
@@ -220,7 +216,7 @@ def plot_dashboard(history, outpath):
         return
     epochs = range(1, n + 1)
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle(f'Training Dashboard (Ep {n})', fontsize=18)
+    fig.suptitle(f'Training Dashboard (Ep {n})', fontsize=16)
 
     ax = axes[0, 0]
     ax.plot(epochs, history["loss"], 'b-')
@@ -241,15 +237,24 @@ def plot_dashboard(history, outpath):
     ax.set_title('Dynamic Scale'); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
-    ax.plot(epochs, history["threshold"], 'orange')
-    ax.set_title('Threshold'); ax.grid(True, alpha=0.3)
+    if "pi_entropy" in history and len(history["pi_entropy"]) > 0:
+        ax.plot(epochs, history["pi_entropy"], 'orange', label='π entropy')
+        ax.axhline(y=np.log(10), color='gray', linestyle='--', alpha=0.5, label='uniform')
+        ax.set_title('π Entropy'); ax.grid(True, alpha=0.3); ax.legend()
+    else:
+        ax.plot(epochs, history["threshold"], 'orange')
+        ax.set_title('Threshold'); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 2]; ax.axis('off')
+    pi_str = ""
+    if "pi_values" in history and len(history["pi_values"]) > 0:
+        pi_str = f"\nπ: {history['pi_values'][-1]}"
     info = (f"Current Acc: {history['acc'][-1]:.4f}\n"
             f"Best Acc:    {max(history['acc']):.4f}\n"
             f"Scale:       {history['scale'][-1]:.1f}\n"
-            f"Pass Rate:   {history['pass_rate'][-1]:.1f}%")
-    ax.text(0.1, 0.5, info, fontsize=16, family='monospace')
+            f"Pass Rate:   {history['pass_rate'][-1]:.1f}%"
+            f"{pi_str}")
+    ax.text(0.05, 0.5, info, fontsize=13, family='monospace')
 
     plt.tight_layout(); plt.savefig(outpath); plt.close()
 
@@ -295,7 +300,6 @@ def diagnose_conditioning(model, loader, cfg):
     model.eval()
     device = cfg.device
     K = cfg.num_classes
-
     x_0, _ = next(iter(loader))
     x_0 = x_0[:16].to(device)
 
@@ -307,12 +311,10 @@ def diagnose_conditioning(model, loader, cfg):
         t = torch.full((16,), t_val, device=device, dtype=torch.long)
         noise = torch.randn_like(x_0)
         x_t = model.dpm_process.q_sample(x_0, t, noise)
-
         outputs = []
         for k in range(K):
             y_oh = F.one_hot(torch.full((16,), k, device=device, dtype=torch.long), K).float()
             outputs.append(model.cond_denoiser(x_t, t, y_oh))
-
         diffs = [(outputs[i] - outputs[j]).pow(2).mean().item()
                  for i in range(K) for j in range(i + 1, K)]
         avg_diff = np.mean(diffs)
@@ -356,7 +358,7 @@ def kmeans_init(loader, cfg):
 
 
 def pretrain_with_kmeans(model, unlabeled_loader, val_loader, cfg,
-                         centroids, pretrain_epochs=20, logger=None):
+                         centroids, pretrain_epochs=20):
     print(f"\n🏋️ Pretrain: {pretrain_epochs} epochs with KMeans pseudo-labels")
     pretrain_lr = getattr(cfg, 'pretrain_lr', 2e-4)
     print(f"   Pretrain LR: {pretrain_lr}")
@@ -380,9 +382,6 @@ def pretrain_with_kmeans(model, unlabeled_loader, val_loader, cfg,
 
         avg_loss = ep_loss / max(n_batches, 1)
         val_acc, _, val_nmi = evaluate_model(model, val_loader, cfg)
-        if logger:
-            logger.log(epoch=epoch, loss=avg_loss, acc=val_acc, nmi=val_nmi,
-                       pass_rate=100.0, scale=0.0, threshold=0.0)
         print(f"  [Pretrain] Ep {epoch}/{pretrain_epochs} "
               f"| Loss: {avg_loss:.4f} | Acc: {val_acc:.4f} NMI: {val_nmi:.4f}")
 
@@ -394,7 +393,7 @@ def pretrain_with_kmeans(model, unlabeled_loader, val_loader, cfg,
 # ============================================================
 def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
                          val_loader, cfg, is_final_training=False,
-                         trial=None, hyperparams=None, logger=None):
+                         trial=None, hyperparams=None):
 
     total_epochs = cfg.final_epochs if is_final_training else cfg.optuna_epochs
 
@@ -402,9 +401,9 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
         hyperparams = {'target_scale': 134.0, 'warmup_epochs': 10, 'threshold_final': 0.036}
 
     target_scale = hyperparams.get('target_scale', 134.0)
-    start_scale = hyperparams.get('start_scale', 5.0)  # 有 pretrain 时应设高 (如 50)
     warmup_epochs = hyperparams.get('warmup_epochs', 10)
     threshold_final = hyperparams.get('threshold_final', 0.036)
+    lambda_pi = hyperparams.get('lambda_pi', 0.0)  # 默认 0 = 不更新 π
 
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
@@ -414,29 +413,34 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
     has_labeled = labeled_loader is not None
 
     history = {"loss": [], "acc": [], "nmi": [],
-               "pass_rate": [], "scale": [], "threshold": []}
+               "pass_rate": [], "scale": [], "threshold": [],
+               "pi_entropy": [], "pi_values": []}
 
     for epoch in range(1, total_epochs + 1):
 
-        # ── Scale 调度: start_scale → mid → target_scale ──
-        mid_scale = max(start_scale, 20.0)  # warmup 结束时的 scale
+        # ── Scale 调度: 5 → 20 → target_scale ──
         if epoch <= warmup_epochs:
             use_hard = False
             p1 = epoch / warmup_epochs
-            dynamic_scale = start_scale + (mid_scale - start_scale) * p1
+            dynamic_scale = 5.0 + (20.0 - 5.0) * p1
             dynamic_threshold = 0.0
             status = "EXPLORE"
         else:
             use_hard = True
             p2 = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
-            dynamic_scale = mid_scale + (target_scale - mid_scale) * p2
+            dynamic_scale = 20.0 + (target_scale - 20.0) * p2
             dynamic_threshold = threshold_final * p2
             status = "REFINE"
 
+        # π 信息
+        pi_np = model.pi.detach().cpu().numpy()
+        pi_entropy = -np.sum(pi_np * np.log(pi_np + 1e-9))
+
         if is_final_training:
-            pi_str = ", ".join([f"{p:.3f}" for p in model.pi.detach().cpu().numpy()])
+            pi_str = ", ".join([f"{p:.3f}" for p in pi_np])
             print(f"🔥 [Ep {epoch}/{total_epochs}] [{status}] "
-                  f"Scale={dynamic_scale:.1f} Thres={dynamic_threshold:.3f} π=[{pi_str}]")
+                  f"Scale={dynamic_scale:.1f} Thres={dynamic_threshold:.3f} "
+                  f"π=[{pi_str}] H(π)={pi_entropy:.3f}")
 
         model.train()
         ep_loss, ep_dpm, ep_label, ep_mask = 0.0, 0.0, 0.0, 0.0
@@ -461,7 +465,8 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
                 loss, info = model(x_un, cfg, y=None,
                                    scale_factor=dynamic_scale,
                                    threshold=dynamic_threshold,
-                                   use_hard_label=use_hard)
+                                   use_hard_label=use_hard,
+                                   lambda_pi=lambda_pi)
 
                 total_loss = cfg.alpha_unlabeled * loss
                 total_loss.backward()
@@ -500,13 +505,12 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
         history["pass_rate"].append(pass_pct)
         history["scale"].append(dynamic_scale)
         history["threshold"].append(dynamic_threshold)
-
-        if logger:
-            logger.log(epoch=epoch, loss=avg_loss, acc=val_acc, nmi=val_nmi,
-                       pass_rate=pass_pct, scale=dynamic_scale, threshold=dynamic_threshold)
+        history["pi_entropy"].append(pi_entropy)
+        history["pi_values"].append(", ".join([f"{p:.3f}" for p in pi_np]))
 
         if is_final_training:
-            print(f"  → Loss={avg_loss:.4f} (dpm={avg_dpm:.4f} π={avg_label:.4f}×{getattr(cfg, 'lambda_pi', 0.01)}) "
+            label_str = f" π_loss={avg_label:.4f}×{lambda_pi}" if lambda_pi > 0 else ""
+            print(f"  → Loss={avg_loss:.4f} (dpm={avg_dpm:.4f}{label_str}) "
                   f"| Acc={val_acc:.4f} NMI={val_nmi:.4f} | Pass={pass_pct:.1f}%")
             plot_dashboard(history, os.path.join(cfg.output_dir, "dashboard.png"))
             if epoch % 5 == 0:
@@ -530,7 +534,6 @@ def objective(trial):
     cfg.alpha_unlabeled = 1.0
     cfg.labeled_per_class = 0
     cfg.posterior_sample_steps = 5
-    cfg.lambda_pi = 0.01
     cfg.optuna_epochs = 35
 
     lr = trial.suggest_float("lr", 4e-5, 2e-4, log=True)
@@ -540,7 +543,8 @@ def objective(trial):
 
     hyperparams = {'target_scale': target_scale,
                    'warmup_epochs': warmup_epochs,
-                   'threshold_final': threshold_final}
+                   'threshold_final': threshold_final,
+                   'lambda_pi': 0.0}
 
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -559,16 +563,19 @@ def main():
     # ╔══════════════════════════════════════════════════════════╗
     # ║  配置区                                                  ║
     # ╚══════════════════════════════════════════════════════════╝
-    TRAINING_MODE = "unsupervised"    # "unsupervised" 或 "semi_supervised"
+    TRAINING_MODE = "unsupervised"    # "unsupervised" | "semi_supervised"
     LABELED_PER_CLASS = 100           # 半监督: 每类标注数量
-    ENABLE_PRETRAIN = True            # True = KMeans pretrain, False = 直接 EM
-    SKIP_PRETRAIN = True             # True = 从 checkpoint 恢复
+    ENABLE_PRETRAIN = False           # True = KMeans pretrain, False = 直接 EM
+    SKIP_PRETRAIN = False             # True = 从 checkpoint 恢复
     ENABLE_AUTO_SEARCH = False
+
+    # π 更新配置 (论文 M-step)
+    ENABLE_PI_UPDATE = True           # True = 开启 π 更新 (论文要求)
+    LAMBDA_PI = 0.01                  # label_loss 系数 (平衡 dpm_loss≈0.02 和 label_loss≈2.3)
 
     cfg = Config()
     cfg.alpha_unlabeled = 1.0
     cfg.posterior_sample_steps = 5
-    cfg.lambda_pi = 0.01              # label_loss 系数 (防止 π 被过度拉扯)
     cfg.pretrain_epochs = 20
     cfg.pretrain_lr = 2e-4
 
@@ -589,24 +596,27 @@ def main():
         best_params = {
             'target_scale': study.best_params['target_scale'],
             'warmup_epochs': study.best_params['warmup_epochs'],
-            'threshold_final': study.best_params['threshold_final']
+            'threshold_final': study.best_params['threshold_final'],
         }
         best_lr = study.best_params['lr']
     else:
-        best_params = {'target_scale': 134.37, 'start_scale': 50.0,
-                       'warmup_epochs': 10, 'threshold_final': 0.036}
+        best_params = {'target_scale': 134.37, 'warmup_epochs': 10, 'threshold_final': 0.036}
         best_lr = 4.01e-05
 
-    print(f"\n🚀 Training: LR={best_lr:.2e}, λ_π={cfg.lambda_pi}, Params={best_params}")
+    # 添加 π 更新参数
+    best_params['lambda_pi'] = LAMBDA_PI if ENABLE_PI_UPDATE else 0.0
+
+    pi_info = f"λ_π={LAMBDA_PI}" if ENABLE_PI_UPDATE else "π=fixed"
+    print(f"\n🚀 Training: LR={best_lr:.2e}, {pi_info}, Params={best_params}")
 
     cfg.final_epochs = 60
+    cfg.output_dir = "./mDPM_results"
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
     labeled_loader, unlabeled_loader, val_loader = get_semi_loaders(cfg)
 
-    logger = TrainingLogger()
     pretrain_ckpt = os.path.join(cfg.output_dir, "pretrain_checkpoint.pt")
 
     # ── Phase 0: Pretrain (可选) ──
@@ -615,18 +625,16 @@ def main():
             print(f"\n⏩ Loading checkpoint: {pretrain_ckpt}")
             ckpt = torch.load(pretrain_ckpt, map_location=cfg.device, weights_only=False)
             model.load_state_dict(ckpt['model_state_dict'])
-            if 'logger_records' in ckpt:
-                logger.records = ckpt['logger_records']
             print(f"   Acc={ckpt.get('acc', '?')}")
-            diagnose_conditioning(model, val_loader, cfg)
         else:
             if TRAINING_MODE == "unsupervised":
                 centroids, cluster_props = kmeans_init(unlabeled_loader, cfg)
+                # 初始化 π 从 KMeans 比例
                 with torch.no_grad():
-                    model.log_pi.copy_(torch.log(torch.tensor(cluster_props).clamp(min=1e-6)))
+                    model.default_pi.copy_(torch.tensor(cluster_props, dtype=torch.float32))
                 print(f"   π from KMeans: {model.pi.detach().cpu().numpy().round(3).tolist()}")
                 pretrain_with_kmeans(model, unlabeled_loader, val_loader, cfg,
-                                     centroids, pretrain_epochs=cfg.pretrain_epochs, logger=logger)
+                                     centroids, pretrain_epochs=cfg.pretrain_epochs)
 
             elif TRAINING_MODE == "semi_supervised" and labeled_loader is not None:
                 print(f"\n🏋️ Pretrain with REAL labels ({cfg.pretrain_epochs} ep)")
@@ -641,26 +649,29 @@ def main():
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         pt_opt.step(); ep_loss += loss.item(); n += 1
                     acc, _, nmi = evaluate_model(model, val_loader, cfg)
-                    if logger:
-                        logger.log(epoch=ep, loss=ep_loss/max(n,1), acc=acc, nmi=nmi,
-                                   pass_rate=100, scale=0, threshold=0)
                     print(f"  [Pretrain] Ep {ep}/{cfg.pretrain_epochs} "
                           f"| Loss: {ep_loss/max(n,1):.4f} | Acc: {acc:.4f} NMI: {nmi:.4f}")
                 print("  ✅ Pretrain complete\n")
 
-            diagnose_conditioning(model, val_loader, cfg)
+            # Save checkpoint
             acc_now, _, nmi_now = evaluate_model(model, val_loader, cfg)
             torch.save({
                 'model_state_dict': model.state_dict(),
-                'logger_records': logger.records,
                 'acc': acc_now, 'nmi': nmi_now,
             }, pretrain_ckpt)
             print(f"💾 Checkpoint saved → {pretrain_ckpt} (Acc={acc_now:.4f})")
             print(f"   下次设 SKIP_PRETRAIN=True 即可跳过\n")
     else:
         print("\n⏩ No pretrain, starting EM directly")
-        best_params['start_scale'] = 5.0  # 无 pretrain → 从低 scale 开始
-        diagnose_conditioning(model, val_loader, cfg)
+
+    # 开启 π 更新
+    if ENABLE_PI_UPDATE:
+        model.enable_pi_update(True)
+        print(f"📊 π update ENABLED (λ_π={LAMBDA_PI})")
+    else:
+        print(f"📊 π update DISABLED (fixed uniform)")
+
+    diagnose_conditioning(model, val_loader, cfg)
 
     # ── Phase 1: EM Training ──
     print("=" * 50)
@@ -673,19 +684,19 @@ def main():
         unlabeled_loader, val_loader, cfg,
         is_final_training=True,
         hyperparams=best_params,
-        logger=logger,
     )
 
     print(f"\n✅ Done. Best Acc: {best_acc:.4f}")
     sample_and_save(model, cfg, os.path.join(cfg.output_dir, "final_samples.png"),
                     cluster_mapping=best_mapping)
 
+    # Save config
     cfg_dict = {k: v for k, v in vars(cfg).items()
                 if not k.startswith('_') and isinstance(v, (int, float, str, bool))}
     cfg_dict['training_mode'] = TRAINING_MODE
+    cfg_dict['enable_pi_update'] = ENABLE_PI_UPDATE
+    cfg_dict['lambda_pi'] = LAMBDA_PI
     json.dump(cfg_dict, open(os.path.join(cfg.output_dir, "config.json"), "w"), indent=2)
-    if logger:
-        logger.save(os.path.join(cfg.output_dir, "training_log.json"))
 
 
 if __name__ == "__main__":
