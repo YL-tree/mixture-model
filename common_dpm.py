@@ -140,64 +140,66 @@ class SinusoidalPositionalEmbedding(nn.Module):
 
 class ResidualBlock(nn.Module):
     """
-    改进版 ResidualBlock：使用 AdaGN (Adaptive Group Norm) 替代简单的加法。
-    增强了条件 y 对生成过程的控制力，大幅提升分类时的判别度。
+    Dual-FiLM ResidualBlock:
+    - time_mlp → scale/shift (控制去噪强度)
+    - class_mlp → 独立的 scale/shift (控制类别特征)
+    两路 FiLM 依次作用, class 无法被忽略
     """
-    def __init__(self, in_channels, out_channels, time_embed_dim, kernel_size=3):
+    def __init__(self, in_channels, out_channels, time_embed_dim, class_embed_dim=None, kernel_size=3):
         super().__init__()
-        
+        if class_embed_dim is None:
+            class_embed_dim = time_embed_dim
+
         padding = kernel_size // 2
-        
-        # 1. 正常的卷积层
+
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
         self.norm1 = nn.GroupNorm(8, out_channels)
         self.act1 = nn.SiLU()
-        
+
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act2 = nn.SiLU()
-        
-        # [核心修改 1] 输出维度翻倍 (out_channels * 2)
-        # 因为我们要同时预测 Scale (乘法系数) 和 Shift (加法偏置)
+
+        # Time FiLM: scale + shift (作用在 norm1 之后)
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_embed_dim, out_channels * 2)
         )
-        
+
+        # Class FiLM: 独立的 scale + shift (作用在 norm2 之后)
+        self.class_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(class_embed_dim, out_channels * 2)
+        )
+
         self.residual_conv = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
-    def forward(self, x, t_emb):
+    def forward(self, x, t_emb, c_emb=None):
         """
         x: (B, C, H, W)
-        t_emb: (B, time_embed_dim) -> 包含了 time + label 的信息
+        t_emb: (B, time_embed_dim) - 纯时间信息
+        c_emb: (B, class_embed_dim) - 纯类别信息 (可选)
         """
-        # --- 主干路径 ---
-        
-        # 1. 第一层卷积
         h = self.conv1(x)
-        
-        # 2. [核心修改 2] AdaGN 注入机制
-        # 先归一化
         h = self.norm1(h)
-        
-        # 计算 Scale 和 Shift
-        # style shape: (B, 2*C) -> (B, 2*C, 1, 1)
-        style = self.time_mlp(t_emb)[:, :, None, None]
-        scale, shift = style.chunk(2, dim=1) # 分割成两半
-        
-        # 执行仿射变换: h = h * (1 + scale) + shift
-        # 这种乘法交互让条件 y 能强力控制特征图
-        h = h * (1 + scale) + shift
-        
-        # 激活函数
+
+        # Time FiLM
+        t_style = self.time_mlp(t_emb)[:, :, None, None]
+        t_scale, t_shift = t_style.chunk(2, dim=1)
+        h = h * (1 + t_scale) + t_shift
         h = self.act1(h)
-        
-        # 3. 第二层卷积
+
+        # 第二层卷积
         h = self.conv2(h)
         h = self.norm2(h)
+
+        # Class FiLM (独立通路, 不经过 time)
+        if c_emb is not None:
+            c_style = self.class_mlp(c_emb)[:, :, None, None]
+            c_scale, c_shift = c_style.chunk(2, dim=1)
+            h = h * (1 + c_scale) + c_shift
+
         h = self.act2(h)
-        
-        # --- 残差连接 ---
         return h + self.residual_conv(x)
 
 class AttentionBlock(nn.Module):
@@ -225,23 +227,17 @@ class ConditionalUnet(nn.Module):
         self.time_emb_dim = time_emb_dim
         self.num_classes = num_classes
 
+        # Time 通路
         self.time_mlp = nn.Sequential(
             SinusoidalPositionalEmbedding(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
-        # ---- 修复: label 独立 MLP 通路 + concat 融合 ----
-        # 给 label 和 time 同等地位的表示能力
+        # Class 通路 (独立, 不与 time 合并)
         self.label_emb = nn.Embedding(num_classes, time_emb_dim)
         self.label_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
-        )
-        # concat 后投影回 time_emb_dim，迫使网络学习联合表示
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(time_emb_dim * 2, time_emb_dim),
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
@@ -251,30 +247,30 @@ class ConditionalUnet(nn.Module):
 
         self.downs = nn.ModuleList([
             nn.ModuleList([
-                ResidualBlock(ch[0], ch[0], time_emb_dim),
-                ResidualBlock(ch[0], ch[1], time_emb_dim), 
+                ResidualBlock(ch[0], ch[0], time_emb_dim, time_emb_dim),
+                ResidualBlock(ch[0], ch[1], time_emb_dim, time_emb_dim),
                 nn.MaxPool2d(2)
             ]),
             nn.ModuleList([
-                ResidualBlock(ch[1], ch[2], time_emb_dim), 
+                ResidualBlock(ch[1], ch[2], time_emb_dim, time_emb_dim),
                 AttentionBlock(ch[2]),
                 nn.MaxPool2d(2)
             ]),
         ])
 
         self.bottleneck = nn.ModuleList([
-            ResidualBlock(ch[2], ch[2], time_emb_dim),
+            ResidualBlock(ch[2], ch[2], time_emb_dim, time_emb_dim),
             AttentionBlock(ch[2]),
-            ResidualBlock(ch[2], ch[2], time_emb_dim),
+            ResidualBlock(ch[2], ch[2], time_emb_dim, time_emb_dim),
         ])
 
         self.ups = nn.ModuleList([
             nn.ModuleList([
-                ResidualBlock(ch[2] + ch[1], ch[1], time_emb_dim),
+                ResidualBlock(ch[2] + ch[1], ch[1], time_emb_dim, time_emb_dim),
                 AttentionBlock(ch[1])
             ]),
             nn.ModuleList([
-                ResidualBlock(ch[1] + ch[0], ch[0], time_emb_dim),
+                ResidualBlock(ch[1] + ch[0], ch[0], time_emb_dim, time_emb_dim),
             ]),
         ])
         self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
@@ -285,47 +281,52 @@ class ConditionalUnet(nn.Module):
         )
 
     def forward(self, x, t, y_cond):
-        # 1. 时间嵌入
+        # 1. Time embedding
         t_emb = self.time_mlp(t)
-        
-        # 2. 标签嵌入 (独立 MLP 通路)
+
+        # 2. Class embedding (独立通路)
         if y_cond.dim() == 2 and y_cond.size(1) == self.num_classes:
-            y_emb = y_cond @ self.label_emb.weight   # [B, dim]
+            y_emb = y_cond @ self.label_emb.weight
         elif y_cond.dim() == 1:
             y_emb = self.label_emb(y_cond)
         else:
             raise ValueError("y_cond format error")
-        y_emb = self.label_mlp(y_emb)  # 独立深度处理
-        
-        # 3. Concat 融合 (不再是简单加法，label 无法被忽略)
-        cond_emb = self.fusion_mlp(torch.cat([t_emb, y_emb], dim=1))
+        c_emb = self.label_mlp(y_emb)
 
+        # 3. UNet with separate time/class conditioning
         x = self.init_conv(x)
         skips = [x]
-        
+
         for down_block_set in self.downs:
             for module in down_block_set:
-                if isinstance(module, (ResidualBlock, AttentionBlock)):
-                    x = module(x, cond_emb)
+                if isinstance(module, ResidualBlock):
+                    x = module(x, t_emb, c_emb)
+                elif isinstance(module, AttentionBlock):
+                    x = module(x)
                 else:
                     x = module(x)
             skips.append(x)
-            
+
         skips.pop()
-        
+
         for block in self.bottleneck:
-            x = block(x, cond_emb)
+            if isinstance(block, ResidualBlock):
+                x = block(x, t_emb, c_emb)
+            else:
+                x = block(x)
 
         for up_block_set, skip in zip(self.ups, reversed(skips)):
             x = self.upsample(x)
             if x.shape[2] != skip.shape[2]:
-                 skip = skip[:, :, :x.shape[2], :x.shape[3]] 
-            x = torch.cat([x, skip], dim=1) 
+                skip = skip[:, :, :x.shape[2], :x.shape[3]]
+            x = torch.cat([x, skip], dim=1)
             for module in up_block_set:
-                if isinstance(module, (ResidualBlock, AttentionBlock)):
-                    x = module(x, cond_emb)
+                if isinstance(module, ResidualBlock):
+                    x = module(x, t_emb, c_emb)
+                elif isinstance(module, AttentionBlock):
+                    x = module(x)
                 else:
-                    x = module(x) 
+                    x = module(x)
 
         return self.final_conv(x)
 # -----------------------------------------------------
