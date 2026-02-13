@@ -107,8 +107,7 @@ class mDPM_SemiSup(nn.Module):
 
         return logits
 
-    def forward(self, x_0, cfg, y=None, scale_factor=1.0,
-                threshold=0.0, use_hard_label=False, lambda_pi=0.0):
+    def forward(self, x_0, cfg, y=None, scale_factor=1.0, lambda_pi=0.0):
         B = x_0.size(0)
 
         # Path A: 监督
@@ -122,29 +121,22 @@ class mDPM_SemiSup(nn.Module):
             return dpm_loss, {'dpm_loss': dpm_loss.item(), 'label_loss': 0.0,
                               'mask_rate': 1.0}
 
-        # Path B: 无监督 EM
+        # Path B: 无监督 EM (论文: 始终 soft sampling)
         logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
         resp = F.softmax(logits, dim=1)
 
-        if use_hard_label:
-            max_probs, pseudo_labels = resp.max(dim=1)
-            mask = (max_probs >= threshold).float()
-            y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
-        else:
-            pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
-            y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
-            mask = torch.ones(B, device=x_0.device)
+        # Soft sampling: scale 增大时自动趋近 hard
+        pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
+        y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
 
         # M-step: denoiser loss
         t_train = torch.randint(0, cfg.timesteps, (B,), device=x_0.device).long()
         noise = torch.randn_like(x_0)
         x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
         pred_noise = self.cond_denoiser(x_t_train, t_train, y_target)
-        loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
-        dpm_loss = (loss_per * mask).sum() / (mask.sum() + 1e-8)
+        dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean')
 
-        # M-step: π 更新 (论文公式)
-        # label_loss ≈ 2.3, dpm_loss ≈ 0.02 → 需要 lambda_pi 平衡
+        # M-step: π 更新 (论文公式, 延迟开启)
         label_loss_val = 0.0
         total_loss = dpm_loss
         if lambda_pi > 0 and self.log_pi.requires_grad:
@@ -156,7 +148,7 @@ class mDPM_SemiSup(nn.Module):
         return total_loss, {
             'dpm_loss': dpm_loss.item(),
             'label_loss': label_loss_val,
-            'mask_rate': mask.mean().item(),
+            'mask_rate': 1.0,
         }
 
 
@@ -242,8 +234,7 @@ def plot_dashboard(history, outpath):
         ax.axhline(y=np.log(10), color='gray', linestyle='--', alpha=0.5, label='uniform')
         ax.set_title('π Entropy'); ax.grid(True, alpha=0.3); ax.legend()
     else:
-        ax.plot(epochs, history["threshold"], 'orange')
-        ax.set_title('Threshold'); ax.grid(True, alpha=0.3)
+        ax.set_title('π Entropy (N/A)'); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 2]; ax.axis('off')
     pi_str = ""
@@ -414,23 +405,20 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
     has_labeled = labeled_loader is not None
 
     history = {"loss": [], "acc": [], "nmi": [],
-               "pass_rate": [], "scale": [], "threshold": [],
+               "pass_rate": [], "scale": [],
                "pi_entropy": [], "pi_values": []}
 
     for epoch in range(1, total_epochs + 1):
 
         # ── Scale 调度: 5 → 20 → target_scale ──
+        # 始终用 soft sampling (论文 M-step), scale 退火自动实现 soft→近似hard 的平滑过渡
         if epoch <= warmup_epochs:
-            use_hard = False
             p1 = epoch / warmup_epochs
             dynamic_scale = 5.0 + (20.0 - 5.0) * p1
-            dynamic_threshold = 0.0
             status = "EXPLORE"
         else:
-            use_hard = True
             p2 = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
             dynamic_scale = 20.0 + (target_scale - 20.0) * p2
-            dynamic_threshold = threshold_final * p2
             status = "REFINE"
 
         # π 信息
@@ -441,8 +429,8 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
             pi_str = ", ".join([f"{p:.3f}" for p in pi_np])
             pi_status = f"λ_π={lambda_pi}" if epoch >= pi_start_epoch else "π=frozen"
             print(f"🔥 [Ep {epoch}/{total_epochs}] [{status}] "
-                  f"Scale={dynamic_scale:.1f} Thres={dynamic_threshold:.3f} "
-                  f"[{pi_status}] π=[{pi_str}] H(π)={pi_entropy:.3f}")
+                  f"Scale={dynamic_scale:.1f} [{pi_status}] "
+                  f"π=[{pi_str}] H(π)={pi_entropy:.3f}")
 
         model.train()
         ep_loss, ep_dpm, ep_label, ep_mask = 0.0, 0.0, 0.0, 0.0
@@ -466,8 +454,6 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
 
                 loss, info = model(x_un, cfg, y=None,
                                    scale_factor=dynamic_scale,
-                                   threshold=dynamic_threshold,
-                                   use_hard_label=use_hard,
                                    lambda_pi=lambda_pi if epoch >= pi_start_epoch else 0.0)
 
                 total_loss = cfg.alpha_unlabeled * loss
@@ -506,7 +492,6 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
         history["nmi"].append(val_nmi)
         history["pass_rate"].append(pass_pct)
         history["scale"].append(dynamic_scale)
-        history["threshold"].append(dynamic_threshold)
         history["pi_entropy"].append(pi_entropy)
         history["pi_values"].append(", ".join([f"{p:.3f}" for p in pi_np]))
 
