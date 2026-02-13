@@ -437,7 +437,7 @@ def objective(trial):
 
 def main():
     # [设置] 随机种子 (例如 42)
-    set_seed(42)
+    set_seed(2026)
     
     # 自动搜索开关
     ENABLE_AUTO_SEARCH = False 
