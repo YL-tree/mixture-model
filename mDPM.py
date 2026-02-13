@@ -403,7 +403,8 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
     target_scale = hyperparams.get('target_scale', 134.0)
     warmup_epochs = hyperparams.get('warmup_epochs', 10)
     threshold_final = hyperparams.get('threshold_final', 0.036)
-    lambda_pi = hyperparams.get('lambda_pi', 0.0)  # 默认 0 = 不更新 π
+    lambda_pi = hyperparams.get('lambda_pi', 0.0)
+    pi_start_epoch = hyperparams.get('pi_start_epoch', 30)  # π 更新延迟到 Ep30+
 
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
@@ -438,9 +439,10 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
 
         if is_final_training:
             pi_str = ", ".join([f"{p:.3f}" for p in pi_np])
+            pi_status = f"λ_π={lambda_pi}" if epoch >= pi_start_epoch else "π=frozen"
             print(f"🔥 [Ep {epoch}/{total_epochs}] [{status}] "
                   f"Scale={dynamic_scale:.1f} Thres={dynamic_threshold:.3f} "
-                  f"π=[{pi_str}] H(π)={pi_entropy:.3f}")
+                  f"[{pi_status}] π=[{pi_str}] H(π)={pi_entropy:.3f}")
 
         model.train()
         ep_loss, ep_dpm, ep_label, ep_mask = 0.0, 0.0, 0.0, 0.0
@@ -466,7 +468,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
                                    scale_factor=dynamic_scale,
                                    threshold=dynamic_threshold,
                                    use_hard_label=use_hard,
-                                   lambda_pi=lambda_pi)
+                                   lambda_pi=lambda_pi if epoch >= pi_start_epoch else 0.0)
 
                 total_loss = cfg.alpha_unlabeled * loss
                 total_loss.backward()
@@ -605,8 +607,9 @@ def main():
 
     # 添加 π 更新参数
     best_params['lambda_pi'] = LAMBDA_PI if ENABLE_PI_UPDATE else 0.0
+    best_params['pi_start_epoch'] = 30  # 延迟到 Ep30: Scale≈60, Acc 应已稳定
 
-    pi_info = f"λ_π={LAMBDA_PI}" if ENABLE_PI_UPDATE else "π=fixed"
+    pi_info = f"λ_π={LAMBDA_PI} (starts Ep30)" if ENABLE_PI_UPDATE else "π=fixed"
     print(f"\n🚀 Training: LR={best_lr:.2e}, {pi_info}, Params={best_params}")
 
     cfg.final_epochs = 60
