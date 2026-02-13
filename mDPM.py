@@ -95,40 +95,45 @@ class mDPM_SemiSup(nn.Module):
 
     def estimate_posterior_logits(self, x_0, cfg):
         """
-        简化版 posterior estimation:
-        - 不用 SNR 权重 (会放大噪声)
-        - 只用低 t (class 信号更强)
-        - 更多采样减少方差
-        
-        evaluate_model_simple 用同样方法能到 40%, 这里对齐它。
+        后验估计: 用 clamped SNR 权重 + 完整 t 范围。
+        关键修复: 把 SNR 上限从 20 降到 5, 避免极端权重放大噪声。
         """
         batch_size = x_0.size(0)
         K = cfg.num_classes
-        M = getattr(cfg, 'posterior_sample_steps', 5)
+        M = getattr(cfg, 'posterior_sample_steps', 10)
+        T = cfg.timesteps
         device = x_0.device
-        
-        # 低 t 范围: 在 t<200 时图像结构保留较好, class 条件差异最明显
-        t_max = min(200, cfg.timesteps)
-        
+
+        betas = self.dpm_process.betas
+        alphas = self.dpm_process.alphas
+        alphas_cumprod = self.dpm_process.alphas_cumprod
+        posterior_var = self.dpm_process.posterior_variance
+
+        # SNR 权重, 但 clamp 更严格 (上限 5 而非 20)
+        snr_weights = (betas ** 2) / (
+            2.0 * posterior_var.clamp(min=1e-8) * alphas * (1 - alphas_cumprod).clamp(min=1e-8)
+        )
+        snr_weights = snr_weights.clamp(min=0.1, max=5.0)  # 严格 clamp
+
         logits = torch.zeros(batch_size, K, device=device)
-        
+
         with torch.no_grad():
             for _ in range(M):
-                t = torch.randint(1, t_max, (batch_size,), device=device).long()
+                t = torch.randint(1, T, (batch_size,), device=device).long()
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
-                
+                w_t = snr_weights[t]  # [B]
+
                 for k in range(K):
                     y_oh = F.one_hot(torch.full((batch_size,), k, device=device,
                                                  dtype=torch.long), K).float()
                     pred = self.cond_denoiser(x_t, t, y_oh)
                     mse = F.mse_loss(pred, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                    logits[:, k] += -mse   # 简单累加, 不加权
-            
-            # 加上 prior
+                    logits[:, k] += -w_t * mse
+
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
             logits = logits + log_pi
-        
+
         return logits
 
     def forward(self, x_0, cfg, y=None, threshold=0.0, use_hard_label=False):
@@ -222,13 +227,13 @@ def evaluate_model(model, loader, cfg):
 @torch.no_grad()
 def evaluate_model_simple(model, loader, cfg):
     """
-    简化版评估: 直接用 conditional MSE, 低 t 范围。
+    简化版评估: 直接 conditional MSE, 完整 t 范围。
+    这个方法 pretrain 阶段能到 40%。
     """
     model.eval()
     preds, ys_true = [], []
     K = cfg.num_classes
     M = 5
-    t_max = min(200, cfg.timesteps)
 
     for x_0, y_true in loader:
         x_0 = x_0.to(cfg.device)
@@ -236,7 +241,7 @@ def evaluate_model_simple(model, loader, cfg):
         logits = torch.zeros(B, K, device=x_0.device)
 
         for _ in range(M):
-            t = torch.randint(1, t_max, (B,), device=x_0.device).long()
+            t = torch.randint(1, cfg.timesteps, (B,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t = model.dpm_process.q_sample(x_0, t, noise)
 
