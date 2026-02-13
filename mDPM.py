@@ -94,13 +94,12 @@ class mDPM_SemiSup(nn.Module):
         # Clamp: 下限 0.01 保留信号, 上限 5.0 避免 t≈1 爆炸
         return w.clamp(min=0.01, max=5.0)
 
-    def estimate_posterior_logits(self, x_0, cfg):
+    def estimate_posterior_logits(self, x_0, cfg, scale_factor=1.0):
         """
-        论文 Section 2.2.3:
-        log s̃_k = log π_k + w_1·(-MSE at t=1) + (T-1)/M · Σ_m w_tm·(-MSE at t_m)
-        
-        (T-1)/M ≈ 200 是论文自带的"放大因子", 不需要手动 scale_factor。
-        t ∈ [1, T) 完整范围, 不截断。
+        论文结构 + 实用调整:
+        - SNR 权重 (论文公式, clamp 防爆炸)
+        - 重构项 t=1 + 扩散项 t∈[2,T) (论文结构)
+        - scale_factor 替代 (T-1)/M (论文的 (T-1)/M 在 M<100 时方差太大)
         """
         B = x_0.size(0)
         K = cfg.num_classes
@@ -113,7 +112,7 @@ class mDPM_SemiSup(nn.Module):
         diff_logprob = torch.zeros(B, K, device=device)
 
         with torch.no_grad():
-            # (a) 重构项: t=1 (论文单独处理)
+            # (a) 重构项: t=1
             t1 = torch.ones(B, device=device, dtype=torch.long)
             noise1 = torch.randn_like(x_0)
             z_1 = self.dpm_process.q_sample(x_0, t1, noise1)
@@ -125,12 +124,12 @@ class mDPM_SemiSup(nn.Module):
                 mse = F.mse_loss(pred, noise1, reduction='none').view(B, -1).mean(dim=1)
                 recon_logprob[:, k] = -w1 * mse
 
-            # (b) 扩散项: t ∈ [2, T), Monte Carlo M 次, 乘 (T-1)/M
+            # (b) 扩散项: t∈[2, T), M 次采样, 取平均 (不乘 (T-1)/M)
             for _ in range(M):
                 t = torch.randint(2, T, (B,), device=device).long()
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
-                wt = snr_w[t]  # [B]
+                wt = snr_w[t]
 
                 for k in range(K):
                     y_oh = F.one_hot(torch.full((B,), k, device=device, dtype=torch.long), K).float()
@@ -138,15 +137,14 @@ class mDPM_SemiSup(nn.Module):
                     mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
                     diff_logprob[:, k] += -wt * mse
 
-            # (T-1)/M 缩放 (论文公式, ≈200 when M=5, T=1000)
-            diff_logprob = diff_logprob * (T - 1) / M
+            diff_logprob = diff_logprob / M  # 取平均, 不乘 (T-1)/M
 
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
-            logits = log_pi + recon_logprob + diff_logprob
+            logits = log_pi + (recon_logprob + diff_logprob) * scale_factor
 
         return logits
 
-    def forward(self, x_0, cfg, y=None, threshold=0.0, use_hard_label=False):
+    def forward(self, x_0, cfg, y=None, threshold=0.0, use_hard_label=False, scale_factor=1.0):
         B = x_0.size(0)
 
         # Path A: 监督
@@ -162,7 +160,7 @@ class mDPM_SemiSup(nn.Module):
 
         # Path B: 无监督 (论文 EM)
         else:
-            logits = self.estimate_posterior_logits(x_0, cfg)
+            logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
             resp = F.softmax(logits, dim=1)
 
             if use_hard_label:
@@ -199,15 +197,15 @@ class mDPM_SemiSup(nn.Module):
 # ============================================================
 # 2. Evaluation (用论文的 posterior 估计)
 # ============================================================
-def evaluate_model(model, loader, cfg):
-    """与训练一致: 用 estimate_posterior_logits + 匈牙利匹配"""
+def evaluate_model(model, loader, cfg, eval_scale=100.0):
+    """用 posterior 估计 + 匈牙利匹配。eval_scale 用较高值确保可区分。"""
     model.eval()
     preds, ys_true = [], []
 
     with torch.no_grad():
         for x_0, y_true in loader:
             x_0 = x_0.to(cfg.device)
-            logits = model.estimate_posterior_logits(x_0, cfg)
+            logits = model.estimate_posterior_logits(x_0, cfg, scale_factor=eval_scale)
             pred_cluster = torch.argmax(logits, dim=1).cpu().numpy()
             preds.append(pred_cluster)
             ys_true.append(y_true.numpy())
@@ -343,7 +341,7 @@ def diagnose_conditioning(model, loader, cfg):
     snr_w = model._compute_snr_weights()
     print(f"\n   SNR weights: t=1→{snr_w[1]:.3f}, t=50→{snr_w[50]:.3f}, "
           f"t=200→{snr_w[200]:.3f}, t=500→{snr_w[500]:.3f}")
-    print(f"   (T-1)/M scaling: {(cfg.timesteps - 1) / getattr(cfg, 'posterior_sample_steps', 5):.0f}x")
+    print(f"   M={getattr(cfg, 'posterior_sample_steps', 5)}, SNR加权 + scale_factor")
     print()
 
 
@@ -423,8 +421,9 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
     total_epochs = cfg.final_epochs if is_final_training else cfg.optuna_epochs
 
     if hyperparams is None:
-        hyperparams = {'warmup_epochs': 10, 'threshold_final': 0.036}
+        hyperparams = {'target_scale': 134.0, 'warmup_epochs': 10, 'threshold_final': 0.036}
 
+    target_scale = hyperparams.get('target_scale', 134.0)
     warmup_epochs = hyperparams.get('warmup_epochs', 10)
     threshold_final = hyperparams.get('threshold_final', 0.036)
 
@@ -443,18 +442,21 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
         # ── 调度器 ──
         if epoch <= warmup_epochs:
             use_hard = False
+            p1 = epoch / warmup_epochs
+            dynamic_scale = 5.0 + (20.0 - 5.0) * p1
             dynamic_threshold = 0.0
             status = "EXPLORE"
         else:
             use_hard = True
             p2 = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
+            dynamic_scale = 20.0 + (target_scale - 20.0) * p2
             dynamic_threshold = threshold_final * p2
             status = "REFINE"
 
         if is_final_training:
             pi_str = ", ".join([f"{p:.3f}" for p in model.pi.detach().cpu().numpy()])
             print(f"🔥 [Ep {epoch}/{total_epochs}] [{status}] "
-                  f"Thres={dynamic_threshold:.3f} π=[{pi_str}]")
+                  f"Scale={dynamic_scale:.1f} Thres={dynamic_threshold:.3f} π=[{pi_str}]")
 
         model.train()
         ep_loss, ep_dpm, ep_label, ep_mask = 0.0, 0.0, 0.0, 0.0
@@ -478,7 +480,8 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
 
                 loss, info = model(x_un, cfg, y=None,
                                    threshold=dynamic_threshold,
-                                   use_hard_label=use_hard)
+                                   use_hard_label=use_hard,
+                                   scale_factor=dynamic_scale)
 
                 total_loss = cfg.alpha_unlabeled * loss
                 total_loss.backward()
@@ -550,10 +553,11 @@ def objective(trial):
     cfg.optuna_epochs = 35
 
     lr = trial.suggest_float("lr", 4e-5, 2e-4, log=True)
+    target_scale = trial.suggest_float("target_scale", 120.0, 180.0)
     warmup_epochs = trial.suggest_int("warmup_epochs", 10, 20)
     threshold_final = trial.suggest_float("threshold_final", 0.0, 0.1)
 
-    hyperparams = {'warmup_epochs': warmup_epochs, 'threshold_final': threshold_final}
+    hyperparams = {'target_scale': target_scale, 'warmup_epochs': warmup_epochs, 'threshold_final': threshold_final}
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     _, unlabeled_loader, val_loader = get_semi_loaders(cfg)
@@ -602,7 +606,7 @@ def main():
         }
         best_lr = study.best_params['lr']
     else:
-        best_params = {'warmup_epochs': 10, 'threshold_final': 0.036}
+        best_params = {'target_scale': 134.37, 'warmup_epochs': 10, 'threshold_final': 0.036}
         best_lr = 4.01e-05
 
     print(f"\n🚀 Training: LR={best_lr:.2e}, Params={best_params}")
