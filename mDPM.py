@@ -95,25 +95,16 @@ class mDPM_SemiSup(nn.Module):
 
     def estimate_posterior_logits(self, x_0, cfg):
         """
-        后验估计: 用 clamped SNR 权重 + 完整 t 范围。
-        关键修复: 把 SNR 上限从 20 降到 5, 避免极端权重放大噪声。
+        与 evaluate_model_simple 完全相同的方法:
+        - 无 SNR 权重 (SNR 权重会产生极端值, 导致 posterior 坍缩)
+        - t ∈ [1, T) 完整范围
+        - 简单累加 -mse
         """
         batch_size = x_0.size(0)
         K = cfg.num_classes
         M = getattr(cfg, 'posterior_sample_steps', 10)
         T = cfg.timesteps
         device = x_0.device
-
-        betas = self.dpm_process.betas
-        alphas = self.dpm_process.alphas
-        alphas_cumprod = self.dpm_process.alphas_cumprod
-        posterior_var = self.dpm_process.posterior_variance
-
-        # SNR 权重, 但 clamp 更严格 (上限 5 而非 20)
-        snr_weights = (betas ** 2) / (
-            2.0 * posterior_var.clamp(min=1e-8) * alphas * (1 - alphas_cumprod).clamp(min=1e-8)
-        )
-        snr_weights = snr_weights.clamp(min=0.1, max=5.0)  # 严格 clamp
 
         logits = torch.zeros(batch_size, K, device=device)
 
@@ -122,14 +113,13 @@ class mDPM_SemiSup(nn.Module):
                 t = torch.randint(1, T, (batch_size,), device=device).long()
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
-                w_t = snr_weights[t]  # [B]
 
                 for k in range(K):
                     y_oh = F.one_hot(torch.full((batch_size,), k, device=device,
                                                  dtype=torch.long), K).float()
                     pred = self.cond_denoiser(x_t, t, y_oh)
                     mse = F.mse_loss(pred, noise, reduction='none').view(batch_size, -1).mean(dim=1)
-                    logits[:, k] += -w_t * mse
+                    logits[:, k] += -mse
 
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
             logits = logits + log_pi
