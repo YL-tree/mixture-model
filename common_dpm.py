@@ -231,8 +231,20 @@ class ConditionalUnet(nn.Module):
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
+        # ---- 修复: label 独立 MLP 通路 + concat 融合 ----
+        # 给 label 和 time 同等地位的表示能力
         self.label_emb = nn.Embedding(num_classes, time_emb_dim)
-        nn.init.normal_(self.label_emb.weight, mean=0.0, std=1.0)
+        self.label_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim),
+        )
+        # concat 后投影回 time_emb_dim，迫使网络学习联合表示
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim * 2, time_emb_dim),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, time_emb_dim),
+        )
 
         ch = [base_channels, base_channels * 2, base_channels * 4]
         self.init_conv = nn.Conv2d(in_channels, ch[0], 3, padding=1)
@@ -273,30 +285,20 @@ class ConditionalUnet(nn.Module):
         )
 
     def forward(self, x, t, y_cond):
-        # 1. 计算时间嵌入
+        # 1. 时间嵌入
         t_emb = self.time_mlp(t)
         
-        # 2. 计算标签嵌入
+        # 2. 标签嵌入 (独立 MLP 通路)
         if y_cond.dim() == 2 and y_cond.size(1) == self.num_classes:
-            y_emb = y_cond @ self.label_emb.weight
+            y_emb = y_cond @ self.label_emb.weight   # [B, dim]
         elif y_cond.dim() == 1:
             y_emb = self.label_emb(y_cond)
         else:
             raise ValueError("y_cond format error")
-            
-        # ==========================================
-        # [关键修改] 动态调整注入强度
-        # ==========================================
-        # 获取当前 batch 每个样本的时间权重
-        w_t = get_time_weight(t, self.time_mlp[0].dim * 2).to(t.device) # 这里的 dim * 2 只是为了获取 max_steps 对应的参数，或者直接传 1000
-        # 修正：直接用 cfg.timesteps 或者硬编码 1000
-        w_t = get_time_weight(t, max_steps=1000).to(t.device)
+        y_emb = self.label_mlp(y_emb)  # 独立深度处理
         
-        # 增强/抑制条件信号
-        y_emb = y_emb * w_t
-        
-        # 3. 融合 (条件 = 时间 + 加权后的标签)
-        cond_emb = t_emb + y_emb
+        # 3. Concat 融合 (不再是简单加法，label 无法被忽略)
+        cond_emb = self.fusion_mlp(torch.cat([t_emb, y_emb], dim=1))
 
         x = self.init_conv(x)
         skips = [x]
