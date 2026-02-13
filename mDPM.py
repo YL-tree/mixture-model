@@ -256,6 +256,54 @@ def evaluate_model(model, loader, cfg):
     return acc, cluster2label, nmi_score
 
 
+@torch.no_grad()
+def evaluate_model_simple(model, loader, cfg):
+    """
+    简化版评估: 直接用 conditional MSE (不用 CFG)。
+    用于 pretrain 阶段，因为此时 unconditional 路径还没训好。
+    """
+    model.eval()
+    preds, ys_true = [], []
+    K = cfg.num_classes
+    M = 3  # 少量采样即可
+
+    for x_0, y_true in loader:
+        x_0 = x_0.to(cfg.device)
+        B = x_0.size(0)
+        logits = torch.zeros(B, K, device=x_0.device)
+
+        for _ in range(M):
+            t = torch.randint(1, cfg.timesteps, (B,), device=x_0.device).long()
+            noise = torch.randn_like(x_0)
+            x_t = model.dpm_process.q_sample(x_0, t, noise)
+
+            for k in range(K):
+                y_oh = F.one_hot(torch.full((B,), k, device=x_0.device,
+                                             dtype=torch.long), K).float()
+                pred = model.cond_denoiser(x_t, t, y_oh)
+                mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
+                logits[:, k] += -mse
+
+        pred_cluster = logits.argmax(dim=1).cpu().numpy()
+        preds.append(pred_cluster)
+        ys_true.append(y_true.numpy())
+
+    preds = np.concatenate(preds)
+    ys_true = np.concatenate(ys_true)
+
+    cost_matrix = np.zeros((K, K))
+    for i in range(K):
+        for j in range(K):
+            cost_matrix[i, j] = -np.sum((ys_true == i) & (preds == j))
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    c2l = {int(c): int(l) for c, l in zip(col_ind, row_ind)}
+    aligned = np.array([c2l.get(p, 0) for p in preds])
+    acc = np.mean(aligned == ys_true)
+    nmi_score = NMI(ys_true, preds)
+
+    return acc, c2l, nmi_score
+
+
 # ============================================================
 # 4. Diagnostic Figures (仿照 mVAE_aligned.py)
 # ============================================================
@@ -775,7 +823,8 @@ def pretrain_with_kmeans(model, optimizer, loader, val_loader, cfg,
             n_batches += 1
 
         avg_loss = ep_loss / max(n_batches, 1)
-        val_acc, _, val_nmi = evaluate_model(model, val_loader, cfg)
+        # Pretrain 用简单 conditional MSE 评估（不用 CFG，因为 unconditional 路径还没训好）
+        val_acc, _, val_nmi = evaluate_model_simple(model, val_loader, cfg)
 
         if logger:
             pi_np = model.pi.detach().cpu().numpy()
@@ -792,6 +841,60 @@ def pretrain_with_kmeans(model, optimizer, loader, val_loader, cfg,
               f"| Loss: {avg_loss:.4f} | Acc: {val_acc:.4f} NMI: {val_nmi:.4f}")
 
     print("  ✅ Pretrain complete\n")
+
+    # ---- 诊断: UNet 是否真的在用 class 条件? ----
+    _diagnose_conditioning(model, loader, cfg)
+
+
+@torch.no_grad()
+def _diagnose_conditioning(model, loader, cfg):
+    """
+    直接测量: 同一个 (x_t, t)，不同 class k 的 UNet 输出是否不同。
+    如果 avg_diff ≈ 0，说明 class 条件被忽略（架构问题）。
+    """
+    model.eval()
+    device = cfg.device
+    K = cfg.num_classes
+
+    x_0, _ = next(iter(loader))
+    x_0 = x_0[:16].to(device)
+    t = torch.full((16,), 200, device=device, dtype=torch.long)
+    noise = torch.randn_like(x_0)
+    x_t = model.dpm_process.q_sample(x_0, t, noise)
+
+    # 收集每个 class 的 UNet 输出
+    outputs = []
+    for k in range(K):
+        y_oh = F.one_hot(torch.full((16,), k, device=device, dtype=torch.long), K).float()
+        eps_k = model.cond_denoiser(x_t, t, y_oh)
+        outputs.append(eps_k)
+
+    # 计算所有 class 对之间的 L2 差异
+    diffs = []
+    for i in range(K):
+        for j in range(i + 1, K):
+            d = (outputs[i] - outputs[j]).pow(2).mean().item()
+            diffs.append(d)
+
+    avg_diff = np.mean(diffs)
+    max_diff = np.max(diffs)
+
+    # 与自身预测的 scale 比较
+    avg_norm = np.mean([o.pow(2).mean().item() for o in outputs])
+
+    print(f"\n🔬 Conditioning Diagnostic:")
+    print(f"   Avg pairwise diff between classes: {avg_diff:.6f}")
+    print(f"   Max pairwise diff between classes: {max_diff:.6f}")
+    print(f"   Avg output norm:                   {avg_norm:.6f}")
+    print(f"   Ratio (diff/norm):                 {avg_diff / (avg_norm + 1e-9):.6f}")
+
+    if avg_diff / (avg_norm + 1e-9) < 0.001:
+        print("   ⚠️  CLASS CONDITIONING IS BEING IGNORED!")
+        print("   → UNet 输出对不同 class 几乎完全一样")
+        print("   → 需要更强的架构级修复")
+    else:
+        print("   ✅ Class conditioning IS working")
+        print("   → 如果 Acc 仍低，可能是 posterior estimation 的问题")
 def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
                          val_loader, cfg, is_final_training=False, trial=None,
                          hyperparams=None, logger=None, epoch_offset=0):
