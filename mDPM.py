@@ -1074,7 +1074,7 @@ def main():
         ckpt = torch.load(pretrain_ckpt_path, map_location=cfg.device)
         model.load_state_dict(ckpt['model_state_dict'])
         if 'logger_data' in ckpt:
-            logger.data = ckpt['logger_data']
+            logger.records = ckpt['logger_data']
         epoch_offset = ckpt.get('epoch_offset', cfg.pretrain_epochs)
         print(f"   Restored: Acc={ckpt.get('pretrain_acc', '?'):.4f}, "
               f"epoch_offset={epoch_offset}")
@@ -1135,7 +1135,7 @@ def main():
         pretrain_acc, _, pretrain_nmi = evaluate_model_simple(model, val_loader, cfg)
         torch.save({
             'model_state_dict': model.state_dict(),
-            'logger_data': logger.data,
+            'logger_data': logger.records,
             'epoch_offset': epoch_offset,
             'pretrain_acc': pretrain_acc,
             'pretrain_nmi': pretrain_nmi,
