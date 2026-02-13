@@ -740,10 +740,15 @@ def pretrain_with_kmeans(model, optimizer, loader, val_loader, cfg,
                          centroids, pretrain_epochs=10, logger=None):
     """
     Phase 0: 用 KMeans 伪标签做 supervised DDPM 训练。
-    每个 batch 在线通过 centroid 最近邻分配伪标签。
+    使用独立的高学习率，结束后恢复原 optimizer 状态。
     """
     print(f"\n🏋️ Pretrain: {pretrain_epochs} epochs with KMeans pseudo-labels")
     centroids_dev = centroids.to(cfg.device)
+
+    # Pretrain 用独立的高学习率 optimizer
+    pretrain_lr = getattr(cfg, 'pretrain_lr', 2e-4)
+    pretrain_opt = torch.optim.Adam(model.parameters(), lr=pretrain_lr)
+    print(f"   Pretrain LR: {pretrain_lr}")
 
     for epoch in range(1, pretrain_epochs + 1):
         model.train()
@@ -754,19 +759,17 @@ def pretrain_with_kmeans(model, optimizer, loader, val_loader, cfg,
             x_0 = x_0.to(cfg.device)
             B = x_0.size(0)
 
-            # 在线分配: 到各 centroid 的欧氏距离
             with torch.no_grad():
                 flat = x_0.view(B, -1)
-                dists = torch.cdist(flat, centroids_dev)  # [B, K]
-                pseudo_y = dists.argmin(dim=1)             # [B]
+                dists = torch.cdist(flat, centroids_dev)
+                pseudo_y = dists.argmin(dim=1)
 
-            # 标准 supervised DDPM loss
             loss, info = model(x_0, cfg, y=pseudo_y)
 
-            optimizer.zero_grad()
+            pretrain_opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            pretrain_opt.step()
 
             ep_loss += loss.item()
             n_batches += 1
@@ -954,7 +957,8 @@ def main():
     cfg.alpha_unlabeled = 1.0
     cfg.labeled_per_class = 0
     cfg.posterior_sample_steps = 5
-    cfg.pretrain_epochs = 10  # KMeans 预训练轮数
+    cfg.pretrain_epochs = 20   # KMeans 预训练轮数 (需要足够多)
+    cfg.pretrain_lr = 2e-4     # Pretrain 独立学习率 (比 EM 高 5x)
     cfg.cond_drop_prob = 0.15  # CFG: 训练时 15% 概率 drop class 条件
     cfg.guidance_weight = 3.0   # CFG: 推断时 guidance scale
 
