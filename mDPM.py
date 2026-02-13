@@ -402,6 +402,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
         hyperparams = {'target_scale': 134.0, 'warmup_epochs': 10, 'threshold_final': 0.036}
 
     target_scale = hyperparams.get('target_scale', 134.0)
+    start_scale = hyperparams.get('start_scale', 5.0)  # 有 pretrain 时应设高 (如 50)
     warmup_epochs = hyperparams.get('warmup_epochs', 10)
     threshold_final = hyperparams.get('threshold_final', 0.036)
 
@@ -417,17 +418,18 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
 
     for epoch in range(1, total_epochs + 1):
 
-        # ── Scale 调度: 5 → 20 → target_scale ──
+        # ── Scale 调度: start_scale → mid → target_scale ──
+        mid_scale = max(start_scale, 20.0)  # warmup 结束时的 scale
         if epoch <= warmup_epochs:
             use_hard = False
             p1 = epoch / warmup_epochs
-            dynamic_scale = 5.0 + (20.0 - 5.0) * p1
+            dynamic_scale = start_scale + (mid_scale - start_scale) * p1
             dynamic_threshold = 0.0
             status = "EXPLORE"
         else:
             use_hard = True
             p2 = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
-            dynamic_scale = 20.0 + (target_scale - 20.0) * p2
+            dynamic_scale = mid_scale + (target_scale - mid_scale) * p2
             dynamic_threshold = threshold_final * p2
             status = "REFINE"
 
@@ -560,7 +562,7 @@ def main():
     TRAINING_MODE = "unsupervised"    # "unsupervised" 或 "semi_supervised"
     LABELED_PER_CLASS = 100           # 半监督: 每类标注数量
     ENABLE_PRETRAIN = True            # True = KMeans pretrain, False = 直接 EM
-    SKIP_PRETRAIN = False             # True = 从 checkpoint 恢复
+    SKIP_PRETRAIN = True             # True = 从 checkpoint 恢复
     ENABLE_AUTO_SEARCH = False
 
     cfg = Config()
@@ -591,7 +593,8 @@ def main():
         }
         best_lr = study.best_params['lr']
     else:
-        best_params = {'target_scale': 134.37, 'warmup_epochs': 10, 'threshold_final': 0.036}
+        best_params = {'target_scale': 134.37, 'start_scale': 50.0,
+                       'warmup_epochs': 10, 'threshold_final': 0.036}
         best_lr = 4.01e-05
 
     print(f"\n🚀 Training: LR={best_lr:.2e}, λ_π={cfg.lambda_pi}, Params={best_params}")
@@ -656,6 +659,7 @@ def main():
             print(f"   下次设 SKIP_PRETRAIN=True 即可跳过\n")
     else:
         print("\n⏩ No pretrain, starting EM directly")
+        best_params['start_scale'] = 5.0  # 无 pretrain → 从低 scale 开始
         diagnose_conditioning(model, val_loader, cfg)
 
     # ── Phase 1: EM Training ──
