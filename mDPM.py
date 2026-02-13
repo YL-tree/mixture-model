@@ -1010,11 +1010,12 @@ def main():
     # ╚══════════════════════════════════════════════════════╝
     TRAINING_MODE = "unsupervised"   # "unsupervised" 或 "semi_supervised"
     LABELED_PER_CLASS = 100          # 半监督模式下每类的标注数量
+    SKIP_PRETRAIN = False            # True = 从 checkpoint 加载, 跳过 pretrain
     ENABLE_AUTO_SEARCH = False
 
     cfg = Config()
     cfg.alpha_unlabeled = 1.0
-    cfg.posterior_sample_steps = 10  # 增加采样减少方差
+    cfg.posterior_sample_steps = 10
     cfg.pretrain_epochs = 20
     cfg.pretrain_lr = 2e-4
 
@@ -1064,58 +1065,87 @@ def main():
     logger = TrainingLogger()
     epoch_offset = 0
 
-    # ---- Phase 0: 初始化 ----
-    if TRAINING_MODE == "unsupervised":
-        # 无监督: KMeans pretrain
-        data_loader = unlabeled_loader
-        centroids, cluster_props = kmeans_init(data_loader, cfg)
+    pretrain_ckpt_path = os.path.join(cfg.output_dir, "pretrain_checkpoint.pt")
 
-        with torch.no_grad():
-            init_log_pi = torch.log(torch.tensor(cluster_props, dtype=torch.float32).clamp(min=1e-6))
-            model.log_pi.copy_(init_log_pi)
-        print(f"   π initialized from KMeans: {model.pi.detach().cpu().numpy().round(3).tolist()}")
+    # ── Phase 0: Pretrain 或 加载 Checkpoint ──
+    if SKIP_PRETRAIN and os.path.exists(pretrain_ckpt_path):
+        # ---- 从 checkpoint 恢复 ----
+        print(f"\n⏩ Loading pretrain checkpoint: {pretrain_ckpt_path}")
+        ckpt = torch.load(pretrain_ckpt_path, map_location=cfg.device)
+        model.load_state_dict(ckpt['model_state_dict'])
+        if 'logger_data' in ckpt:
+            logger.data = ckpt['logger_data']
+        epoch_offset = ckpt.get('epoch_offset', cfg.pretrain_epochs)
+        print(f"   Restored: Acc={ckpt.get('pretrain_acc', '?'):.4f}, "
+              f"epoch_offset={epoch_offset}")
+        print(f"   π = {model.pi.detach().cpu().numpy().round(3).tolist()}")
+        _diagnose_conditioning(model, val_loader, cfg)
 
-        pretrain_with_kmeans(model, optimizer, data_loader, val_loader, cfg,
-                             centroids, pretrain_epochs=cfg.pretrain_epochs, logger=logger)
-        epoch_offset = cfg.pretrain_epochs
+    else:
+        # ---- 正常 pretrain ----
+        if TRAINING_MODE == "unsupervised":
+            data_loader = unlabeled_loader
+            centroids, cluster_props = kmeans_init(data_loader, cfg)
 
-    elif TRAINING_MODE == "semi_supervised":
-        # 半监督: 用真实标签做 pretrain (比 KMeans 更好)
-        if labeled_loader is not None:
-            print(f"\n🏋️ Pretrain: {cfg.pretrain_epochs} epochs with REAL labels")
-            pretrain_opt = torch.optim.Adam(model.parameters(), lr=cfg.pretrain_lr)
+            with torch.no_grad():
+                init_log_pi = torch.log(torch.tensor(cluster_props, dtype=torch.float32).clamp(min=1e-6))
+                model.log_pi.copy_(init_log_pi)
+            print(f"   π initialized from KMeans: {model.pi.detach().cpu().numpy().round(3).tolist()}")
 
-            for epoch in range(1, cfg.pretrain_epochs + 1):
-                model.train()
-                ep_loss, n = 0.0, 0
-                for x_lab, y_lab in labeled_loader:
-                    x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device)
-                    loss, _ = model(x_lab, cfg, y=y_lab)
-                    pretrain_opt.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    pretrain_opt.step()
-                    ep_loss += loss.item(); n += 1
-
-                avg_loss = ep_loss / max(n, 1)
-                val_acc, _, val_nmi = evaluate_model_simple(model, val_loader, cfg)
-
-                if logger:
-                    pi_np = model.pi.detach().cpu().numpy()
-                    logger.log(epoch=epoch, loss=avg_loss, dpm_loss=avg_loss, label_loss=0.0,
-                               acc=val_acc, nmi=val_nmi, mask_rate=1.0,
-                               resp_entropy=0.0, max_conf=1.0, pi_values=pi_np,
-                               pi_entropy=float(-(pi_np * np.log(pi_np + 1e-9)).sum()),
-                               threshold=0.0)
-
-                print(f"  [Pretrain] Ep {epoch}/{cfg.pretrain_epochs} "
-                      f"| Loss: {avg_loss:.4f} | Acc: {val_acc:.4f} NMI: {val_nmi:.4f}")
-
-            print("  ✅ Pretrain complete\n")
-            _diagnose_conditioning(model, val_loader, cfg)
+            pretrain_with_kmeans(model, optimizer, data_loader, val_loader, cfg,
+                                 centroids, pretrain_epochs=cfg.pretrain_epochs, logger=logger)
             epoch_offset = cfg.pretrain_epochs
 
-    # ---- Phase 1: EM Training ----
+        elif TRAINING_MODE == "semi_supervised":
+            if labeled_loader is not None:
+                print(f"\n🏋️ Pretrain: {cfg.pretrain_epochs} epochs with REAL labels")
+                pretrain_opt = torch.optim.Adam(model.parameters(), lr=cfg.pretrain_lr)
+
+                for epoch in range(1, cfg.pretrain_epochs + 1):
+                    model.train()
+                    ep_loss, n = 0.0, 0
+                    for x_lab, y_lab in labeled_loader:
+                        x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device)
+                        loss, _ = model(x_lab, cfg, y=y_lab)
+                        pretrain_opt.zero_grad()
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        pretrain_opt.step()
+                        ep_loss += loss.item(); n += 1
+
+                    avg_loss = ep_loss / max(n, 1)
+                    val_acc, _, val_nmi = evaluate_model_simple(model, val_loader, cfg)
+
+                    if logger:
+                        pi_np = model.pi.detach().cpu().numpy()
+                        logger.log(epoch=epoch, loss=avg_loss, dpm_loss=avg_loss, label_loss=0.0,
+                                   acc=val_acc, nmi=val_nmi, mask_rate=1.0,
+                                   resp_entropy=0.0, max_conf=1.0, pi_values=pi_np,
+                                   pi_entropy=float(-(pi_np * np.log(pi_np + 1e-9)).sum()),
+                                   threshold=0.0)
+
+                    print(f"  [Pretrain] Ep {epoch}/{cfg.pretrain_epochs} "
+                          f"| Loss: {avg_loss:.4f} | Acc: {val_acc:.4f} NMI: {val_nmi:.4f}")
+
+                print("  ✅ Pretrain complete\n")
+                _diagnose_conditioning(model, val_loader, cfg)
+                epoch_offset = cfg.pretrain_epochs
+
+        # ---- 保存 pretrain checkpoint ----
+        pretrain_acc, _, pretrain_nmi = evaluate_model_simple(model, val_loader, cfg)
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'logger_data': logger.data,
+            'epoch_offset': epoch_offset,
+            'pretrain_acc': pretrain_acc,
+            'pretrain_nmi': pretrain_nmi,
+            'training_mode': TRAINING_MODE,
+        }, pretrain_ckpt_path)
+        print(f"💾 Pretrain checkpoint saved → {pretrain_ckpt_path}")
+        print(f"   (Acc={pretrain_acc:.4f}, NMI={pretrain_nmi:.4f})")
+        print(f"   下次设 SKIP_PRETRAIN=True 即可跳过 pretrain\n")
+
+    # ── Phase 1: EM Training ──
     print("=" * 50)
     print("🔄 Switching to EM training...")
     print("=" * 50)
