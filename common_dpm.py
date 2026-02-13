@@ -304,9 +304,12 @@ class ConditionalUnet(nn.Module):
         c_emb = self.label_mlp(y_emb)
 
         # 4. ★ Input-level conditioning: 拼到图像通道上
-        # y_onehot: [B, K] → [B, K, H, W]
+        # x_t 在 t=200 时幅度约 ±2~3, class 通道需要同等量级才不会被淹没
+        # 用双极编码: 选中的 class = +1, 未选中 = -1, 再乘 scale
         B, _, H, W = x.shape
-        c_spatial = y_onehot[:, :, None, None].expand(B, self.num_classes, H, W)
+        c_bipolar = 2.0 * y_onehot - 1.0   # [B, K]: 选中 → +1, 未选中 → -1
+        cond_scale = 3.0  # 让 class 通道幅度 ≈ x_t 幅度
+        c_spatial = (c_bipolar * cond_scale)[:, :, None, None].expand(B, self.num_classes, H, W)
         x_in = torch.cat([x, c_spatial], dim=1)  # [B, C+K, H, W]
 
         # 5. UNet
