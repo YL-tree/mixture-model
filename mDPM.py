@@ -88,36 +88,13 @@ class mDPM_SemiSup(nn.Module):
             image_channels=cfg.image_channels
         )
         self.log_pi = nn.Parameter(torch.zeros(cfg.num_classes))
-        # ---- Classifier-Free Guidance (CFG) ----
-        self.cond_drop_prob = getattr(cfg, 'cond_drop_prob', 0.15)
-        self.guidance_weight = getattr(cfg, 'guidance_weight', 3.0)
 
     @property
     def pi(self):
         return F.softmax(self.log_pi, dim=0)
 
-    def _predict_noise_cfg(self, x_t, t, y_onehot):
-        """训练时: 随机将部分样本的 class 条件置零, 迫使模型同时学会 conditional 和 unconditional"""
-        if self.training and self.cond_drop_prob > 0:
-            drop_mask = (torch.rand(x_t.size(0), device=x_t.device) < self.cond_drop_prob)
-            y_onehot = y_onehot.clone()
-            y_onehot[drop_mask] = 0.0
-        return self.cond_denoiser(x_t, t, y_onehot)
-
-    def _guided_mse(self, x_t, t, noise, y_onehot):
-        """
-        推断时: Classifier-Free Guidance
-        ε_guided = ε_uncond + w * (ε_cond - ε_uncond)
-        """
-        y_null = torch.zeros_like(y_onehot)
-        eps_uncond = self.cond_denoiser(x_t, t, y_null)
-        eps_cond = self.cond_denoiser(x_t, t, y_onehot)
-        eps_guided = eps_uncond + self.guidance_weight * (eps_cond - eps_uncond)
-        mse = F.mse_loss(eps_guided, noise, reduction='none').view(x_t.size(0), -1).mean(dim=1)
-        return mse
-
     def estimate_posterior_logits(self, x_0, cfg):
-        """论文公式 + CFG guidance 计算各类别 log-score"""
+        """论文公式: 直接 conditional MSE (input-level conditioning 保证信号够强)"""
         batch_size = x_0.size(0)
         num_classes = cfg.num_classes
         M = cfg.posterior_sample_steps
@@ -146,7 +123,8 @@ class mDPM_SemiSup(nn.Module):
             for k in range(num_classes):
                 y_oh = F.one_hot(torch.full((batch_size,), k, device=x_0.device,
                                              dtype=torch.long), num_classes).float()
-                mse = self._guided_mse(z_1, t_recon, noise_recon, y_oh)
+                pred = self.cond_denoiser(z_1, t_recon, y_oh)
+                mse = F.mse_loss(pred, noise_recon, reduction='none').view(batch_size, -1).mean(dim=1)
                 recon_logprob[:, k] = -w_recon * mse
 
             # (b) 扩散转移项
@@ -159,7 +137,8 @@ class mDPM_SemiSup(nn.Module):
                 for k in range(num_classes):
                     y_oh = F.one_hot(torch.full((batch_size,), k, device=x_0.device,
                                                  dtype=torch.long), num_classes).float()
-                    mse = self._guided_mse(x_t, t, noise, y_oh)
+                    pred = self.cond_denoiser(x_t, t, y_oh)
+                    mse = F.mse_loss(pred, noise, reduction='none').view(batch_size, -1).mean(dim=1)
                     diffusion_logprob[:, k] += -w_t * mse
 
             diffusion_logprob = diffusion_logprob * (T - 1) / M
@@ -171,19 +150,19 @@ class mDPM_SemiSup(nn.Module):
     def forward(self, x_0, cfg, y=None, threshold=0.0, use_hard_label=False):
         batch_size = x_0.size(0)
 
-        # Path A: 监督 (带 CFG dropout)
+        # Path A: 监督
         if y is not None:
             t = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t = self.dpm_process.q_sample(x_0, t, noise)
             y_onehot = F.one_hot(y, num_classes=cfg.num_classes).float()
-            pred_noise = self._predict_noise_cfg(x_t, t, y_onehot)
+            pred_noise = self.cond_denoiser(x_t, t, y_onehot)
             dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean')
             return dpm_loss, {'dpm_loss': dpm_loss.item(), 'label_loss': 0.0,
                               'mask_rate': 1.0, 'resp': None,
                               'resp_entropy': 0.0, 'max_conf': 1.0}
 
-        # Path B: 无监督 (带 CFG dropout)
+        # Path B: 无监督
         else:
             logits = self.estimate_posterior_logits(x_0, cfg)
             resp = F.softmax(logits, dim=1)
@@ -200,7 +179,7 @@ class mDPM_SemiSup(nn.Module):
             t_train = torch.randint(0, cfg.timesteps, (batch_size,), device=x_0.device).long()
             noise = torch.randn_like(x_0)
             x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
-            pred_noise = self._predict_noise_cfg(x_t_train, t_train, y_target)
+            pred_noise = self.cond_denoiser(x_t_train, t_train, y_target)
 
             loss_per_sample = F.mse_loss(pred_noise, noise, reduction='none').view(batch_size, -1).mean(dim=1)
             dpm_loss = (loss_per_sample * mask).sum() / (mask.sum() + 1e-8)
@@ -454,13 +433,12 @@ def fig02_posterior_histogram(model, loader, cfg, save_path):
 # --- fig03: Generated Samples (enhanced) ---
 @torch.no_grad()
 def fig03_generated_samples(model, cfg, save_path, n_per_class=10, cluster_mapping=None):
-    """按映射后的真实数字顺序，用 CFG 采样生成图像网格"""
+    """按映射后的真实数字顺序生成图像网格"""
     T = model.dpm_process.timesteps
     model.cond_denoiser.eval()
     image_c = model.dpm_process.image_channels
     K = cfg.num_classes
     device = cfg.device
-    w = model.guidance_weight  # CFG guidance scale
 
     shape = (n_per_class * K, image_c, 28, 28)
     x_t = torch.randn(shape, device=device)
@@ -473,7 +451,6 @@ def fig03_generated_samples(model, cfg, save_path, n_per_class=10, cluster_mappi
         y_cond = torch.arange(K).to(device).repeat_interleave(n_per_class).long()
 
     y_cond_vec = F.one_hot(y_cond, K).float()
-    y_null = torch.zeros_like(y_cond_vec)
 
     for i in reversed(range(0, T)):
         t = torch.full((shape[0],), i, device=device, dtype=torch.long)
@@ -481,10 +458,7 @@ def fig03_generated_samples(model, cfg, save_path, n_per_class=10, cluster_mappi
         one_minus_alpha_t_bar = model.dpm_process._extract_t(
             model.dpm_process.sqrt_one_minus_alphas_cumprod, t, shape)
 
-        # CFG: ε_guided = ε_uncond + w * (ε_cond - ε_uncond)
-        eps_uncond = model.cond_denoiser(x_t, t, y_null)
-        eps_cond = model.cond_denoiser(x_t, t, y_cond_vec)
-        pred_noise = eps_uncond + w * (eps_cond - eps_uncond)
+        pred_noise = model.cond_denoiser(x_t, t, y_cond_vec)
 
         mu_t_1 = (x_t - (1 - alpha_t) / one_minus_alpha_t_bar * pred_noise) / alpha_t.sqrt()
         sigma_t_1 = model.dpm_process._extract_t(
@@ -535,21 +509,15 @@ def fig04_x_conditionality(model, loader, cfg, save_path, n_samples=6):
         ax.imshow(x_t[j, 0].cpu().clamp(-1, 1) * 0.5 + 0.5, cmap='gray'); ax.axis('off')
     axes[1, 0].set_ylabel(f"Noisy\nt={t_vis}", fontsize=9, rotation=0, labelpad=50)
 
-    # Row 2..K+1: 不同 class 条件一步 CFG 去噪
+    # Row 2..K+1: 不同 class 条件一步去噪
     alpha_t_val = model.dpm_process.alphas[t_vis]
     sqrt_oma = model.dpm_process.sqrt_one_minus_alphas_cumprod[t_vis]
-    w = model.guidance_weight
-
-    # unconditional prediction (shared)
-    y_null = torch.zeros(n_samples, K, device=device)
-    eps_uncond = model.cond_denoiser(x_t, t, y_null)
 
     for k in range(K):
         y_oh = F.one_hot(torch.full((n_samples,), k, device=device,
                                      dtype=torch.long), K).float()
-        eps_cond = model.cond_denoiser(x_t, t, y_oh)
-        eps_guided = eps_uncond + w * (eps_cond - eps_uncond)
-        x_denoised = (x_t - (1 - alpha_t_val) / sqrt_oma * eps_guided) / alpha_t_val.sqrt()
+        eps_pred = model.cond_denoiser(x_t, t, y_oh)
+        x_denoised = (x_t - (1 - alpha_t_val) / sqrt_oma * eps_pred) / alpha_t_val.sqrt()
 
         for j in range(n_samples):
             ax = axes[k + 2, j]
@@ -588,19 +556,13 @@ def measure_x_conditionality(model, loader, cfg, n_samples=100):
 
     alpha_t = model.dpm_process.alphas[t_val]
     sqrt_oma = model.dpm_process.sqrt_one_minus_alphas_cumprod[t_val]
-    w = model.guidance_weight
-
-    # unconditional prediction (shared)
-    y_null = torch.zeros(n_samples, K, device=device)
-    eps_uncond = model.cond_denoiser(x_t, t, y_null)
 
     outputs = []
     for k in range(K):
         y_oh = F.one_hot(torch.full((n_samples,), k, device=device,
                                      dtype=torch.long), K).float()
-        eps_cond = model.cond_denoiser(x_t, t, y_oh)
-        eps_guided = eps_uncond + w * (eps_cond - eps_uncond)
-        denoised = (x_t - (1 - alpha_t) / sqrt_oma * eps_guided) / alpha_t.sqrt()
+        eps_pred = model.cond_denoiser(x_t, t, y_oh)
+        denoised = (x_t - (1 - alpha_t) / sqrt_oma * eps_pred) / alpha_t.sqrt()
         outputs.append(denoised)
 
     outputs = torch.stack(outputs, dim=0)  # [K, N, C, H, W]
@@ -646,10 +608,7 @@ def fig05_per_class_denoising(model, loader, cfg, save_path,
 
         ck = label2cluster.get(k, k) if label2cluster else k
         y_oh = F.one_hot(torch.full((B,), ck, device=device, dtype=torch.long), K).float()
-        y_null = torch.zeros_like(y_oh)
-        eps_uncond = model.cond_denoiser(x_t, t, y_null)
-        eps_cond = model.cond_denoiser(x_t, t, y_oh)
-        pred_noise = eps_uncond + model.guidance_weight * (eps_cond - eps_uncond)
+        pred_noise = model.cond_denoiser(x_t, t, y_oh)
         alpha_t_val = model.dpm_process.alphas[t_vis]
         sqrt_oma = model.dpm_process.sqrt_one_minus_alphas_cumprod[t_vis]
         x_denoised = (x_t - (1 - alpha_t_val) / sqrt_oma * pred_noise) / alpha_t_val.sqrt()
@@ -913,6 +872,10 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
     best_val_acc = 0.0
     best_cluster_mapping = None
 
+    has_labeled = labeled_loader is not None
+    if has_labeled and is_final_training:
+        print(f"   📋 Semi-supervised mode: labeled + unlabeled data")
+
     for epoch in range(1, total_epochs + 1):
 
         # 调度器
@@ -933,32 +896,48 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
 
         model.train()
         ep_loss, ep_dpm, ep_label = 0.0, 0.0, 0.0
+        ep_sup_loss = 0.0
         ep_mask, ep_ent, ep_conf = 0.0, 0.0, 0.0
         n_batches = 0
 
-        for batch_un in unlabeled_loader:
-            optimizer.zero_grad()
+        # ---- 有标签数据: supervised DDPM loss ----
+        if has_labeled:
+            for x_lab, y_lab in labeled_loader:
+                x_lab = x_lab.to(cfg.device)
+                y_lab = y_lab.to(cfg.device)
 
-            x_un, _ = batch_un
-            x_un = x_un.to(cfg.device)
+                optimizer.zero_grad()
+                sup_loss, _ = model(x_lab, cfg, y=y_lab)
+                sup_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                ep_sup_loss += sup_loss.item()
 
-            l_unsup, info = model(x_un, cfg, y=None,
-                                  threshold=dynamic_threshold,
-                                  use_hard_label=use_hard)
+        # ---- 无标签数据: EM loss ----
+        if unlabeled_loader is not None:
+            for batch_un in unlabeled_loader:
+                optimizer.zero_grad()
 
-            total_loss = cfg.alpha_unlabeled * l_unsup
+                x_un, _ = batch_un
+                x_un = x_un.to(cfg.device)
 
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+                l_unsup, info = model(x_un, cfg, y=None,
+                                      threshold=dynamic_threshold,
+                                      use_hard_label=use_hard)
 
-            ep_loss += total_loss.item()
-            ep_dpm += info['dpm_loss']
-            ep_label += info.get('label_loss', 0.0)
-            ep_mask += info['mask_rate']
-            ep_ent += info.get('resp_entropy', 0.0)
-            ep_conf += info.get('max_conf', 0.0)
-            n_batches += 1
+                total_loss = cfg.alpha_unlabeled * l_unsup
+
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                ep_loss += total_loss.item()
+                ep_dpm += info['dpm_loss']
+                ep_label += info.get('label_loss', 0.0)
+                ep_mask += info['mask_rate']
+                ep_ent += info.get('resp_entropy', 0.0)
+                ep_conf += info.get('max_conf', 0.0)
+                n_batches += 1
 
         # Validation
         val_acc, cluster_mapping, val_nmi = evaluate_model(model, val_loader, cfg)
@@ -1007,7 +986,8 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
             )
 
         if is_final_training:
-            print(f"  → Loss={avg_loss:.4f} (dpm={avg_dpm:.4f} label={avg_label:.4f}) "
+            sup_str = f" sup={ep_sup_loss:.4f}" if has_labeled else ""
+            print(f"  → Loss={avg_loss:.4f} (dpm={avg_dpm:.4f} label={avg_label:.4f}{sup_str}) "
                   f"| Acc={val_acc:.4f} NMI={val_nmi:.4f} "
                   f"| Conf={avg_conf:.3f} Pass={avg_mask*100:.1f}%")
 
@@ -1054,29 +1034,44 @@ def objective(trial):
 def main():
     set_seed(42)
 
+    # ╔══════════════════════════════════════════════════════╗
+    # ║  在这里选择训练模式                                    ║
+    # ╚══════════════════════════════════════════════════════╝
+    TRAINING_MODE = "unsupervised"   # "unsupervised" 或 "semi_supervised"
+    LABELED_PER_CLASS = 100          # 半监督模式下每类的标注数量
     ENABLE_AUTO_SEARCH = False
 
     cfg = Config()
     cfg.alpha_unlabeled = 1.0
-    cfg.labeled_per_class = 0
     cfg.posterior_sample_steps = 5
-    cfg.pretrain_epochs = 20   # KMeans 预训练轮数 (需要足够多)
-    cfg.pretrain_lr = 2e-4     # Pretrain 独立学习率 (比 EM 高 5x)
-    cfg.cond_drop_prob = 0.15  # CFG: 训练时 15% 概率 drop class 条件
-    cfg.guidance_weight = 3.0   # CFG: 推断时 guidance scale
+    cfg.pretrain_epochs = 20
+    cfg.pretrain_lr = 2e-4
+
+    # ---- 根据模式配置 ----
+    if TRAINING_MODE == "unsupervised":
+        cfg.labeled_per_class = 0
+        print("=" * 50)
+        print("🔓 Mode: UNSUPERVISED (全部数据无标签)")
+        print("   → KMeans pretrain + EM")
+        print("=" * 50)
+    elif TRAINING_MODE == "semi_supervised":
+        cfg.labeled_per_class = LABELED_PER_CLASS
+        print("=" * 50)
+        print(f"🏷️  Mode: SEMI-SUPERVISED ({LABELED_PER_CLASS} labels/class)")
+        print(f"   → Labeled supervised + Unlabeled EM")
+        print("=" * 50)
+    else:
+        raise ValueError(f"Unknown mode: {TRAINING_MODE}")
 
     if ENABLE_AUTO_SEARCH:
         print("🔍 [Step 1] Starting Optuna Search...")
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=20)
-
-        print("\n" + "=" * 40 + "\n🎉 Search Finished!\n" + "=" * 40)
         best_params = {
             'warmup_epochs': study.best_params['warmup_epochs'],
             'threshold_final': study.best_params['threshold_final']
         }
         best_lr = study.best_params['lr']
-
     else:
         print("⏩ [Step 1] Skipping Search, using default params")
         best_params = {
@@ -1085,7 +1080,7 @@ def main():
         }
         best_lr = 4.01e-05
 
-    print("\n🚀 [Step 2] Starting Training...")
+    print(f"\n🚀 [Step 2] Starting Training...")
     print(f"   Configs: LR={best_lr:.2e}, Params={best_params}")
 
     cfg.final_epochs = 60
@@ -1093,21 +1088,61 @@ def main():
 
     model = mDPM_SemiSup(cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=best_lr)
-    _, unlabeled_loader, val_loader = get_semi_loaders(cfg)
+    labeled_loader, unlabeled_loader, val_loader = get_semi_loaders(cfg)
 
     logger = TrainingLogger()
+    epoch_offset = 0
 
-    # ---- Phase 0: KMeans Pretrain ----
-    centroids, cluster_props = kmeans_init(unlabeled_loader, cfg)
+    # ---- Phase 0: 初始化 ----
+    if TRAINING_MODE == "unsupervised":
+        # 无监督: KMeans pretrain
+        data_loader = unlabeled_loader
+        centroids, cluster_props = kmeans_init(data_loader, cfg)
 
-    # 用 KMeans 比例初始化 π
-    with torch.no_grad():
-        init_log_pi = torch.log(torch.tensor(cluster_props, dtype=torch.float32).clamp(min=1e-6))
-        model.log_pi.copy_(init_log_pi)
-    print(f"   π initialized from KMeans: {model.pi.detach().cpu().numpy().round(3).tolist()}")
+        with torch.no_grad():
+            init_log_pi = torch.log(torch.tensor(cluster_props, dtype=torch.float32).clamp(min=1e-6))
+            model.log_pi.copy_(init_log_pi)
+        print(f"   π initialized from KMeans: {model.pi.detach().cpu().numpy().round(3).tolist()}")
 
-    pretrain_with_kmeans(model, optimizer, unlabeled_loader, val_loader, cfg,
-                         centroids, pretrain_epochs=cfg.pretrain_epochs, logger=logger)
+        pretrain_with_kmeans(model, optimizer, data_loader, val_loader, cfg,
+                             centroids, pretrain_epochs=cfg.pretrain_epochs, logger=logger)
+        epoch_offset = cfg.pretrain_epochs
+
+    elif TRAINING_MODE == "semi_supervised":
+        # 半监督: 用真实标签做 pretrain (比 KMeans 更好)
+        if labeled_loader is not None:
+            print(f"\n🏋️ Pretrain: {cfg.pretrain_epochs} epochs with REAL labels")
+            pretrain_opt = torch.optim.Adam(model.parameters(), lr=cfg.pretrain_lr)
+
+            for epoch in range(1, cfg.pretrain_epochs + 1):
+                model.train()
+                ep_loss, n = 0.0, 0
+                for x_lab, y_lab in labeled_loader:
+                    x_lab, y_lab = x_lab.to(cfg.device), y_lab.to(cfg.device)
+                    loss, _ = model(x_lab, cfg, y=y_lab)
+                    pretrain_opt.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    pretrain_opt.step()
+                    ep_loss += loss.item(); n += 1
+
+                avg_loss = ep_loss / max(n, 1)
+                val_acc, _, val_nmi = evaluate_model_simple(model, val_loader, cfg)
+
+                if logger:
+                    pi_np = model.pi.detach().cpu().numpy()
+                    logger.log(epoch=epoch, loss=avg_loss, dpm_loss=avg_loss, label_loss=0.0,
+                               acc=val_acc, nmi=val_nmi, mask_rate=1.0,
+                               resp_entropy=0.0, max_conf=1.0, pi_values=pi_np,
+                               pi_entropy=float(-(pi_np * np.log(pi_np + 1e-9)).sum()),
+                               threshold=0.0)
+
+                print(f"  [Pretrain] Ep {epoch}/{cfg.pretrain_epochs} "
+                      f"| Loss: {avg_loss:.4f} | Acc: {val_acc:.4f} NMI: {val_nmi:.4f}")
+
+            print("  ✅ Pretrain complete\n")
+            _diagnose_conditioning(model, val_loader, cfg)
+            epoch_offset = cfg.pretrain_epochs
 
     # ---- Phase 1: EM Training ----
     print("=" * 50)
@@ -1115,21 +1150,23 @@ def main():
     print("=" * 50)
 
     best_acc, best_mapping = run_training_session(
-        model, optimizer, None, unlabeled_loader, val_loader, cfg,
+        model, optimizer,
+        labeled_loader if TRAINING_MODE == "semi_supervised" else None,
+        unlabeled_loader, val_loader, cfg,
         is_final_training=True,
         hyperparams=best_params,
         logger=logger,
-        epoch_offset=cfg.pretrain_epochs,
+        epoch_offset=epoch_offset,
     )
 
     print(f"\n✅ Done. Best Acc: {best_acc:.4f}")
 
-    # 生成全套诊断图
     generate_all_figures(model, logger, val_loader, cfg, cluster_mapping=best_mapping)
 
-    # 保存配置
     cfg_dict = {k: v for k, v in vars(cfg).items()
                 if not k.startswith('_') and isinstance(v, (int, float, str, bool))}
+    cfg_dict['training_mode'] = TRAINING_MODE
+    cfg_dict['labeled_per_class'] = cfg.labeled_per_class
     json.dump(cfg_dict, open(os.path.join(cfg.output_dir, "config.json"), "w"), indent=2)
 
 

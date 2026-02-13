@@ -222,10 +222,16 @@ class AttentionBlock(nn.Module):
         return x + self.proj_out(out)
 
 class ConditionalUnet(nn.Module):
+    """
+    Input-level + Dual-FiLM Conditional UNet.
+    Class one-hot 直接拼到图像通道上 (不可能被忽略),
+    同时保留 FiLM 调制用于细粒度控制.
+    """
     def __init__(self, in_channels=1, base_channels=64, num_classes=10, time_emb_dim=256):
         super().__init__()
         self.time_emb_dim = time_emb_dim
         self.num_classes = num_classes
+        self.in_channels = in_channels
 
         # Time 通路
         self.time_mlp = nn.Sequential(
@@ -234,7 +240,7 @@ class ConditionalUnet(nn.Module):
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
-        # Class 通路 (独立, 不与 time 合并)
+        # Class 通路 (用于 FiLM)
         self.label_emb = nn.Embedding(num_classes, time_emb_dim)
         self.label_mlp = nn.Sequential(
             nn.Linear(time_emb_dim, time_emb_dim),
@@ -243,7 +249,8 @@ class ConditionalUnet(nn.Module):
         )
 
         ch = [base_channels, base_channels * 2, base_channels * 4]
-        self.init_conv = nn.Conv2d(in_channels, ch[0], 3, padding=1)
+        # ★ 输入通道 = 图像通道 + K 个 class 通道
+        self.init_conv = nn.Conv2d(in_channels + num_classes, ch[0], 3, padding=1)
 
         self.downs = nn.ModuleList([
             nn.ModuleList([
@@ -284,17 +291,26 @@ class ConditionalUnet(nn.Module):
         # 1. Time embedding
         t_emb = self.time_mlp(t)
 
-        # 2. Class embedding (独立通路)
-        if y_cond.dim() == 2 and y_cond.size(1) == self.num_classes:
-            y_emb = y_cond @ self.label_emb.weight
-        elif y_cond.dim() == 1:
-            y_emb = self.label_emb(y_cond)
+        # 2. Class → one-hot (处理多种输入格式)
+        if y_cond.dim() == 1:
+            y_onehot = F.one_hot(y_cond, self.num_classes).float()
+        elif y_cond.dim() == 2 and y_cond.size(1) == self.num_classes:
+            y_onehot = y_cond
         else:
             raise ValueError("y_cond format error")
+
+        # 3. Class embedding for FiLM
+        y_emb = y_onehot @ self.label_emb.weight
         c_emb = self.label_mlp(y_emb)
 
-        # 3. UNet with separate time/class conditioning
-        x = self.init_conv(x)
+        # 4. ★ Input-level conditioning: 拼到图像通道上
+        # y_onehot: [B, K] → [B, K, H, W]
+        B, _, H, W = x.shape
+        c_spatial = y_onehot[:, :, None, None].expand(B, self.num_classes, H, W)
+        x_in = torch.cat([x, c_spatial], dim=1)  # [B, C+K, H, W]
+
+        # 5. UNet
+        x = self.init_conv(x_in)
         skips = [x]
 
         for down_block_set in self.downs:
