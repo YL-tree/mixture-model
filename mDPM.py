@@ -107,7 +107,8 @@ class mDPM_SemiSup(nn.Module):
 
         return logits
 
-    def forward(self, x_0, cfg, y=None, scale_factor=1.0, lambda_pi=0.0):
+    def forward(self, x_0, cfg, y=None, scale_factor=1.0,
+                use_hard_label=False, threshold=0.0, lambda_pi=0.0):
         B = x_0.size(0)
 
         # Path A: 监督
@@ -121,20 +122,28 @@ class mDPM_SemiSup(nn.Module):
             return dpm_loss, {'dpm_loss': dpm_loss.item(), 'label_loss': 0.0,
                               'mask_rate': 1.0}
 
-        # Path B: 无监督 EM (论文: 始终 soft sampling)
+        # Path B: 无监督 EM
         logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
         resp = F.softmax(logits, dim=1)
 
-        # Soft sampling: scale 增大时自动趋近 hard
-        pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
-        y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
+        if use_hard_label:
+            # REFINE: hard argmax + threshold (验证过能到 0.8)
+            max_probs, pseudo_labels = resp.max(dim=1)
+            mask = (max_probs >= threshold).float()
+            y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
+        else:
+            # EXPLORE: soft sampling
+            pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
+            y_target = F.one_hot(pseudo_labels, num_classes=cfg.num_classes).float()
+            mask = torch.ones(B, device=x_0.device)
 
         # M-step: denoiser loss
         t_train = torch.randint(0, cfg.timesteps, (B,), device=x_0.device).long()
         noise = torch.randn_like(x_0)
         x_t_train = self.dpm_process.q_sample(x_0, t_train, noise)
         pred_noise = self.cond_denoiser(x_t_train, t_train, y_target)
-        dpm_loss = F.mse_loss(pred_noise, noise, reduction='mean')
+        loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
+        dpm_loss = (loss_per * mask).sum() / (mask.sum() + 1e-8)
 
         # M-step: π 更新 (论文公式, 延迟开启)
         label_loss_val = 0.0
@@ -148,7 +157,7 @@ class mDPM_SemiSup(nn.Module):
         return total_loss, {
             'dpm_loss': dpm_loss.item(),
             'label_loss': label_loss_val,
-            'mask_rate': 1.0,
+            'mask_rate': mask.mean().item(),
         }
 
 
@@ -411,14 +420,17 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
     for epoch in range(1, total_epochs + 1):
 
         # ── Scale 调度: 5 → 20 → target_scale ──
-        # 始终用 soft sampling (论文 M-step), scale 退火自动实现 soft→近似hard 的平滑过渡
         if epoch <= warmup_epochs:
+            use_hard = False
             p1 = epoch / warmup_epochs
             dynamic_scale = 5.0 + (20.0 - 5.0) * p1
+            dynamic_threshold = 0.0
             status = "EXPLORE"
         else:
+            use_hard = True
             p2 = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
             dynamic_scale = 20.0 + (target_scale - 20.0) * p2
+            dynamic_threshold = threshold_final * p2
             status = "REFINE"
 
         # π 信息
@@ -429,7 +441,7 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
             pi_str = ", ".join([f"{p:.3f}" for p in pi_np])
             pi_status = f"λ_π={lambda_pi}" if epoch >= pi_start_epoch else "π=frozen"
             print(f"🔥 [Ep {epoch}/{total_epochs}] [{status}] "
-                  f"Scale={dynamic_scale:.1f} [{pi_status}] "
+                  f"Scale={dynamic_scale:.1f} Thres={dynamic_threshold:.3f} [{pi_status}] "
                   f"π=[{pi_str}] H(π)={pi_entropy:.3f}")
 
         model.train()
@@ -454,6 +466,8 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
 
                 loss, info = model(x_un, cfg, y=None,
                                    scale_factor=dynamic_scale,
+                                   use_hard_label=use_hard,
+                                   threshold=dynamic_threshold,
                                    lambda_pi=lambda_pi if epoch >= pi_start_epoch else 0.0)
 
                 total_loss = cfg.alpha_unlabeled * loss
