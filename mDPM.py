@@ -63,7 +63,11 @@ class mDPM_SemiSup(nn.Module):
     @property
     def pi(self):
         if self.log_pi.requires_grad:
-            return F.softmax(self.log_pi, dim=0)
+            raw_pi = F.softmax(self.log_pi, dim=0)
+            # Clamp: 允许 π 偏离均匀, 但不能极端坍缩
+            # MNIST 真实分布: 每类 9%-11%, 所以 [0.05, 0.20] 足够
+            clamped = raw_pi.clamp(min=0.05, max=0.20)
+            return clamped / clamped.sum()  # 重新归一化
         else:
             return self.default_pi
 
@@ -572,7 +576,7 @@ def main():
 
     # π 更新配置 (论文 M-step)
     ENABLE_PI_UPDATE = True           # True = 开启 π 更新 (论文要求)
-    LAMBDA_PI = 0.01                  # label_loss 系数 (平衡 dpm_loss≈0.02 和 label_loss≈2.3)
+    LAMBDA_PI = 0.001                 # 降低: 0.01 仍导致 π 坍缩
 
     cfg = Config()
     cfg.alpha_unlabeled = 1.0
@@ -689,6 +693,15 @@ def main():
     )
 
     print(f"\n✅ Done. Best Acc: {best_acc:.4f}")
+
+    # 加载最佳模型生成 samples (而不是最后一个 epoch)
+    best_ckpt = os.path.join(cfg.output_dir, "best_model.pt")
+    if os.path.exists(best_ckpt):
+        ckpt = torch.load(best_ckpt, map_location=cfg.device, weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        best_mapping = ckpt.get('cluster_mapping', best_mapping)
+        print(f"   Loaded best model (Acc={ckpt.get('acc', '?'):.4f}) for sampling")
+
     sample_and_save(model, cfg, os.path.join(cfg.output_dir, "final_samples.png"),
                     cluster_mapping=best_mapping)
 
