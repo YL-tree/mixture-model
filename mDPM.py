@@ -574,9 +574,9 @@ def main():
     SKIP_PRETRAIN = False             # True = 从 checkpoint 恢复
     ENABLE_AUTO_SEARCH = False
 
-    # π 更新配置 (论文 M-step)
-    ENABLE_PI_UPDATE = True           # True = 开启 π 更新 (论文要求)
-    LAMBDA_PI = 0.001                 # 降低: 0.01 仍导致 π 坍缩
+    # π 更新配置
+    ENABLE_PI_UPDATE = True
+    LAMBDA_PI = 0.001
 
     cfg = Config()
     cfg.alpha_unlabeled = 1.0
@@ -605,7 +605,7 @@ def main():
         }
         best_lr = study.best_params['lr']
     else:
-        best_params = {'target_scale': 134.37, 'warmup_epochs': 10, 'threshold_final': 0.036}
+        best_params = {'target_scale': 60.0, 'warmup_epochs': 10, 'threshold_final': 0.036}
         best_lr = 4.01e-05
 
     # 添加 π 更新参数
