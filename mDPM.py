@@ -79,17 +79,15 @@ class mDPM_StrictEM(nn.Module):
     def compute_log_likelihood(self, x_0, cfg, scale_factor=5.0, n_mc=5):
         """
         E-step: 计算 log p(x | k) ∝ -MSE_k
-        ★ 方案B: 只用高噪声段 t ∈ [600, 1000)
-        诊断: t=500 ratio≈0.28 (有信号), t=50 ratio≈0.006 (无信号)
-        低t无区分度, 会淹没高t的真实信号, scale放大后导致坍缩
+        只用高噪声段 t ∈ [T*0.6, T) = [60, 100) for T=100
         """
         B = x_0.size(0)
         K = self.K
         device = x_0.device
         T = self.dpm_process.timesteps
 
-        t_lo = T * 3 // 5   # 600
-        t_hi = T             # 1000
+        t_lo = T * 3 // 5   # T=100 → 60
+        t_hi = T             # T=100 → 100
 
         total_neg_mse = torch.zeros(B, K, device=device)
 
@@ -249,7 +247,7 @@ def conditioning_diagnostic(model, data_x, cfg, n_samples=200):
     B = x.size(0)
 
     results = {}
-    for t_val in [50, 200, 500, 700, 900]:
+    for t_val in [10, 30, 60, 80]:
         t = torch.full((B,), t_val, device=device, dtype=torch.long)
         noise = torch.randn_like(x)
         x_t = model.dpm_process.q_sample(x, t, noise)
@@ -691,13 +689,14 @@ def main():
     total_epochs = (hyperparams['m_epochs_first'] +
                     hyperparams['m_epochs_rest'] * (hyperparams['n_em_rounds'] - 1))
 
-    print(f"\n🚀 Strict EM Training [实验B: E-step只用高t ∈ [600,1000)]")
+    print(f"\n🚀 Strict EM Training [T=100, E-step高t, 匹配HMM-DPM]")
+    print(f"   Timesteps:    {cfg.timesteps} (从1000改为100)")
     print(f"   EM rounds:    {hyperparams['n_em_rounds']}")
     print(f"   M-step epochs: {hyperparams['m_epochs_first']} (first) / "
           f"{hyperparams['m_epochs_rest']} (rest)")
     print(f"   Scale:         {hyperparams['scale_start']} → "
           f"{hyperparams['scale_end']} (annealing)")
-    print(f"   E-step t:      [600, 1000) ★ 只用高噪声段")
+    print(f"   E-step t:      [60, 100) 高噪声段")
     print(f"   KMeans init:   {USE_KMEANS_INIT}")
     print(f"   Total epochs:  ~{total_epochs}")
 
