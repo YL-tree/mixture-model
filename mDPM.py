@@ -421,9 +421,16 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
                "pass_rate": [], "scale": [],
                "pi_entropy": [], "pi_values": []}
 
+    # Adaptive scale 状态 (基于 dpm_loss, 纯无监督)
+    scale_frozen = False
+    frozen_scale = None
+    scale_patience = hyperparams.get('scale_patience', 5)
+    loss_increase_count = 0
+    recent_best_loss = float('inf')
+
     for epoch in range(1, total_epochs + 1):
 
-        # ── Scale 调度: 5 → 20 → target_scale ──
+        # ── Scale 调度: 5 → 20 → target_scale (自动冻结) ──
         if epoch <= warmup_epochs:
             use_hard = False
             p1 = epoch / warmup_epochs
@@ -433,9 +440,15 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
         else:
             use_hard = True
             p2 = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
-            dynamic_scale = 20.0 + (target_scale - 20.0) * p2
+            scheduled_scale = 20.0 + (target_scale - 20.0) * p2
             dynamic_threshold = threshold_final * p2
-            status = "REFINE"
+
+            if scale_frozen:
+                dynamic_scale = frozen_scale
+                status = f"FROZEN@{frozen_scale:.0f}"
+            else:
+                dynamic_scale = scheduled_scale
+                status = "REFINE"
 
         # π 信息
         pi_np = model.pi.detach().cpu().numpy()
@@ -498,6 +511,23 @@ def run_training_session(model, optimizer, labeled_loader, unlabeled_loader,
             }, os.path.join(cfg.output_dir, "best_model.pt"))
             if is_final_training:
                 print(f"   ★ New Best! Acc={best_val_acc:.4f}")
+
+        # ── Adaptive Scale: dpm_loss 连续上升就冻结 (纯无监督) ──
+        if epoch > warmup_epochs and not scale_frozen:
+            avg_dpm = ep_dpm / max(n_batches, 1)
+            if avg_dpm < recent_best_loss:
+                recent_best_loss = avg_dpm
+                loss_increase_count = 0
+            else:
+                loss_increase_count += 1
+
+            if loss_increase_count >= scale_patience:
+                scale_frozen = True
+                frozen_scale = dynamic_scale
+                if is_final_training:
+                    print(f"   ❄️ Scale FROZEN at {frozen_scale:.1f} "
+                          f"(dpm_loss increased {scale_patience} epochs, "
+                          f"best_loss={recent_best_loss:.4f})")
 
         N = max(n_batches, 1)
         avg_loss = ep_loss / N
@@ -605,12 +635,13 @@ def main():
         }
         best_lr = study.best_params['lr']
     else:
-        best_params = {'target_scale': 60.0, 'warmup_epochs': 10, 'threshold_final': 0.036}
+        best_params = {'target_scale': 134.37, 'warmup_epochs': 10, 'threshold_final': 0.036}
         best_lr = 4.01e-05
 
     # 添加 π 更新参数
     best_params['lambda_pi'] = LAMBDA_PI if ENABLE_PI_UPDATE else 0.0
-    best_params['pi_start_epoch'] = 30  # 延迟到 Ep30: Scale≈60, Acc 应已稳定
+    best_params['pi_start_epoch'] = 30
+    best_params['scale_patience'] = 5  # Acc 连续下降 5 轮就冻结 scale
 
     pi_info = f"λ_π={LAMBDA_PI} (starts Ep30)" if ENABLE_PI_UPDATE else "π=fixed"
     print(f"\n🚀 Training: LR={best_lr:.2e}, {pi_info}, Params={best_params}")
