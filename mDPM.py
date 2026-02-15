@@ -76,10 +76,13 @@ class mDPM_StrictEM(nn.Module):
         return torch.cat([x, cond_map], dim=1)  # [B, 1+K, H, W]
 
     @torch.no_grad()
-    def compute_log_likelihood(self, x_0, cfg, scale_factor=5.0, n_mc=5):
+    def compute_log_likelihood(self, x_0, cfg, scale_factor=0.002, n_mc=16):
         """
         E-step: 计算 log p(x | k) ∝ -MSE_k
-        只用高噪声段 t ∈ [T*0.6, T) = [60, 100) for T=100
+        完全匹配 HMM-DPM 的 compute_log_bk:
+          - scale_factor=0.002 (除法, 有效放大 500 倍)
+          - n_mc=16 (16次MC采样累积)
+          - t ∈ [T*0.6, T) 高噪声段
         """
         B = x_0.size(0)
         K = self.K
@@ -89,7 +92,7 @@ class mDPM_StrictEM(nn.Module):
         t_lo = T * 3 // 5   # T=100 → 60
         t_hi = T             # T=100 → 100
 
-        total_neg_mse = torch.zeros(B, K, device=device)
+        total_mse = torch.zeros(K, B, device=device)  # [K, B] 匹配 HMM-DPM
 
         for _ in range(n_mc):
             t = torch.randint(t_lo, t_hi, (B,), device=device).long()
@@ -100,12 +103,16 @@ class mDPM_StrictEM(nn.Module):
                 y_oh = F.one_hot(torch.full((B,), k, device=device,
                                              dtype=torch.long), K).float()
                 pred = self.cond_denoiser(x_t, t, y_oh)
-                mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
-                total_neg_mse[:, k] += -mse
+                mse = (pred - noise).pow(2).view(B, -1).mean(1)  # [B]
+                total_mse[k] += mse
 
-        avg_neg_mse = total_neg_mse / n_mc
+        avg_mse = total_mse / n_mc           # [K, B]
+        log_bk = -avg_mse / scale_factor     # 除法! 0.002 → 放大500倍
+        logits = log_bk.t()                  # [B, K]
+
+        # 加上 log π 先验
         log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
-        logits = log_pi + avg_neg_mse * scale_factor
+        logits = logits + log_pi
         return logits
 
     def compute_diffusion_loss(self, x_0, y_onehot):
@@ -170,7 +177,7 @@ class mDPM_StrictEM(nn.Module):
 # 2. Evaluation (固定 t=500, argmin MSE)
 # ============================================================
 @torch.no_grad()
-def evaluate_model(model, val_loader, cfg, n_repeats=3, scale_for_eval=50.0):
+def evaluate_model(model, val_loader, cfg, n_repeats=16, scale_for_eval=0.002):
     model.eval()
     all_preds, all_labels = [], []
     for x, y in val_loader:
@@ -203,7 +210,7 @@ def evaluate_model(model, val_loader, cfg, n_repeats=3, scale_for_eval=50.0):
 # 3. Global E-step (借鉴 HMM-DPM)
 # ============================================================
 @torch.no_grad()
-def global_estep(model, all_x, cfg, scale_factor=5.0, n_mc=5, batch_size=256):
+def global_estep(model, all_x, cfg, scale_factor=0.002, n_mc=16, batch_size=256):
     """
     全局 E-step: 对所有样本计算 pseudo-label, 缓存结果
     这是 HMM-DPM 成功的关键 — 标签在整个 M-step 期间固定
@@ -305,7 +312,7 @@ def plot_dashboard(history, outpath):
     # ── Row 2: EM internals ──
     ax = axes[1, 0]
     ax.plot(rounds, history["scale"], 'c-', marker='o', linewidth=2)
-    ax.set_title('Scale Factor (annealing)', fontweight='bold')
+    ax.set_title('Scale Factor (÷, 越小放大越多)', fontweight='bold')
     ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
@@ -356,7 +363,7 @@ def plot_dashboard(history, outpath):
                 f"Best Acc:      {max(history['acc']):.4f}\n"
                 f"Current NMI:   {history['nmi'][-1]:.4f}\n"
                 f"Active Classes: {history['n_active'][-1]}\n"
-                f"Scale:         {history['scale'][-1]:.1f}\n"
+                f"Scale:         {history['scale'][-1]} (×{1/history['scale'][-1]:.0f})\n"
                 f"H(π):          {history['pi_entropy'][-1]:.3f}\n"
                 f"Gap:           {history['gap'][-1]:.4f}"
                 f"{pi_str}")
@@ -418,9 +425,8 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
     n_em_rounds = hyperparams.get('n_em_rounds', 8)
     m_epochs_first = hyperparams.get('m_epochs_first', 15)
     m_epochs_rest = hyperparams.get('m_epochs_rest', 8)
-    scale_start = hyperparams.get('scale_start', 5.0)     # E-step 起始 scale
-    scale_end = hyperparams.get('scale_end', 50.0)         # E-step 最终 scale
-    n_mc = hyperparams.get('n_mc', 5)
+    scale_factor = hyperparams.get('scale_factor', 0.002)  # 匹配 HMM-DPM
+    n_mc = hyperparams.get('n_mc', 16)                     # 匹配 HMM-DPM
     use_contrastive = hyperparams.get('use_contrastive', False)
     contrastive_weight = hyperparams.get('contrastive_weight', 0.1)
     use_kmeans_init = hyperparams.get('use_kmeans_init', True)
@@ -461,12 +467,8 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
     for em_round in range(n_em_rounds):
         m_epochs = m_epochs_first if em_round == 0 else m_epochs_rest
 
-        # Scale 退火: 从 scale_start 到 scale_end
-        progress = em_round / max(n_em_rounds - 1, 1)
-        current_scale = scale_start + (scale_end - scale_start) * progress
-
         print(f"\n{'='*60}")
-        print(f"EM Round {em_round+1}/{n_em_rounds} | Scale={current_scale:.1f}")
+        print(f"EM Round {em_round+1}/{n_em_rounds} | SF={scale_factor} (×{1/scale_factor:.0f})")
         print(f"{'='*60}")
 
         # ── Conditioning 诊断 ──
@@ -482,23 +484,21 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
 
         # ── E-step: 全局重算分配 ──
         if em_round > 0:
-            print(f"  [E-step] scale={current_scale:.1f}, n_mc={n_mc}")
+            print(f"  [E-step] SF={scale_factor}, n_mc={n_mc}")
             cached_labels, freq_np, n_active, gap = global_estep(
                 model, all_x, cfg,
-                scale_factor=current_scale, n_mc=n_mc)
+                scale_factor=scale_factor, n_mc=n_mc)
 
             # ── 坍缩检测与恢复 ──
-            if n_active < cfg.num_classes * 0.5:  # 活跃类 < 50%
+            if n_active < cfg.num_classes * 0.5:
                 print(f"  ⚠️ COLLAPSE DETECTED: #active={n_active}/{cfg.num_classes}")
-                print(f"  ⚠️ Reverting to previous labels + reducing scale")
-                # 恢复上一轮标签
+                print(f"  ⚠️ Reverting to previous labels")
                 cached_labels = prev_cached_labels.clone()
-                current_scale = max(current_scale * 0.5, scale_start)
                 freq = torch.bincount(cached_labels, minlength=cfg.num_classes).float()
                 freq_np = (freq / freq.sum()).numpy()
                 n_active = len(cached_labels.unique())
                 gap = 0.0
-                print(f"  ⚠️ Restored: #active={n_active}, scale→{current_scale:.1f}")
+                print(f"  ⚠️ Restored: #active={n_active}")
 
             # 闭式解更新 π
             pi_np = model.update_pi_closed_form(cached_labels)
@@ -529,7 +529,7 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
             history["pi_entropy"].append(pi_entropy)
             history["n_active"].append(n_active)
             history["gap"].append(gap)
-            history["scale"].append(current_scale)
+            history["scale"].append(scale_factor)
             history["freq_history"].append(freq_np.tolist())
             history["pi_values"].append(", ".join([f"{p:.3f}" for p in pi_np]))
 
@@ -611,7 +611,7 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
             history["pi_entropy"].append(pi_entropy)
             history["n_active"].append(len(cached_labels.unique()))
             history["gap"].append(0.0)
-            history["scale"].append(current_scale)
+            history["scale"].append(scale_factor)
             freq_r0 = torch.bincount(cached_labels, minlength=cfg.num_classes).float()
             freq_r0 = (freq_r0 / freq_r0.sum()).numpy()
             history["freq_history"].append(freq_r0.tolist())
@@ -676,11 +676,10 @@ def main():
 
     hyperparams = {
         'n_em_rounds': 8,
-        'm_epochs_first': 15,         # 恢复原值
+        'm_epochs_first': 15,
         'm_epochs_rest': 8,
-        'scale_start': 5.0,
-        'scale_end': 50.0,
-        'n_mc': 5,
+        'scale_factor': 0.002,        # 匹配 HMM-DPM: 除法, 有效放大 500 倍
+        'n_mc': 16,                    # 匹配 HMM-DPM: 16次MC采样
         'use_kmeans_init': USE_KMEANS_INIT,
         'use_contrastive': False,
         'contrastive_weight': 0.1,
@@ -689,13 +688,14 @@ def main():
     total_epochs = (hyperparams['m_epochs_first'] +
                     hyperparams['m_epochs_rest'] * (hyperparams['n_em_rounds'] - 1))
 
-    print(f"\n🚀 Strict EM Training [T=100, E-step高t, 匹配HMM-DPM]")
-    print(f"   Timesteps:    {cfg.timesteps} (从1000改为100)")
+    print(f"\n🚀 Strict EM Training [匹配 HMM-DPM 参数]")
+    print(f"   Timesteps:    {cfg.timesteps}")
     print(f"   EM rounds:    {hyperparams['n_em_rounds']}")
     print(f"   M-step epochs: {hyperparams['m_epochs_first']} (first) / "
           f"{hyperparams['m_epochs_rest']} (rest)")
-    print(f"   Scale:         {hyperparams['scale_start']} → "
-          f"{hyperparams['scale_end']} (annealing)")
+    print(f"   Scale factor:  {hyperparams['scale_factor']} (÷, 有效放大 "
+          f"{1/hyperparams['scale_factor']:.0f}x)")
+    print(f"   n_mc:          {hyperparams['n_mc']}")
     print(f"   E-step t:      [60, 100) 高噪声段")
     print(f"   KMeans init:   {USE_KMEANS_INIT}")
     print(f"   Total epochs:  ~{total_epochs}")
