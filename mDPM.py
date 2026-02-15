@@ -99,7 +99,7 @@ class mDPM_StrictEM(nn.Module):
             for k in range(K):
                 y_oh = F.one_hot(torch.full((B,), k, device=device,
                                              dtype=torch.long), K).float()
-                pred = self.cond_denoiser(self._concat_cond(x_t, y_oh), t, y_oh)
+                pred = self.cond_denoiser(x_t, t, y_oh)
                 mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
                 total_neg_mse[:, k] += -mse
 
@@ -121,7 +121,7 @@ class mDPM_StrictEM(nn.Module):
             0, self.dpm_process.timesteps - 1)
         noise = torch.randn_like(x_0)
         x_t = self.dpm_process.q_sample(x_0, t, noise)
-        pred_noise = self.cond_denoiser(self._concat_cond(x_t, y_onehot), t, y_onehot)
+        pred_noise = self.cond_denoiser(x_t, t, y_onehot)
         return F.mse_loss(pred_noise, noise)
 
     def compute_contrastive_loss(self, x_0, y_onehot, margin=0.01):
@@ -136,7 +136,7 @@ class mDPM_StrictEM(nn.Module):
         x_t = self.dpm_process.q_sample(x_0, t, noise)
 
         # 正确条件
-        pred_pos = self.cond_denoiser(self._concat_cond(x_t, y_onehot), t, y_onehot)
+        pred_pos = self.cond_denoiser(x_t, t, y_onehot)
         mse_pos = (pred_pos - noise).pow(2).view(B, -1).mean(1)
 
         # 错误条件: shuffle
@@ -146,7 +146,7 @@ class mDPM_StrictEM(nn.Module):
         if same.any():
             y_neg[same] = torch.roll(y_onehot[same], 1, dims=0)
 
-        pred_neg = self.cond_denoiser(self._concat_cond(x_t, y_neg), t, y_neg)
+        pred_neg = self.cond_denoiser(x_t, t, y_neg)
         mse_neg = (pred_neg - noise).pow(2).view(B, -1).mean(1)
 
         contrastive = F.relu(mse_pos - mse_neg + margin).mean()
@@ -256,7 +256,7 @@ def conditioning_diagnostic(model, data_x, cfg, n_samples=200):
         for k in range(K):
             y_oh = F.one_hot(torch.full((B,), k, device=device,
                                          dtype=torch.long), K).float()
-            pred = model.cond_denoiser(model._concat_cond(x_t, y_oh), t, y_oh)
+            pred = model.cond_denoiser(x_t, t, y_oh)
             mse = (pred - noise).pow(2).view(B, -1).mean(1)  # [B]
             mse_per_k.append(mse.mean().item())
 
@@ -387,7 +387,7 @@ def sample_and_save(model, cfg, out_path, n_per_class=10, cluster_mapping=None):
         for t_idx in reversed(range(T)):
             t_ = torch.full((n_per_class,), t_idx, device=cfg.device,
                              dtype=torch.long)
-            pred = model.cond_denoiser(model._concat_cond(x, y_oh), t_, y_oh)
+            pred = model.cond_denoiser(x, t_, y_oh)
             beta = model.dpm_process.betas[t_idx]
             alpha = model.dpm_process.alphas[t_idx]
             alpha_bar = model.dpm_process.alphas_cumprod[t_idx]
