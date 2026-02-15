@@ -217,6 +217,38 @@ def global_estep(model, all_x, cfg, scale_factor=5.0, n_mc=5, batch_size=256):
     return cached_labels, freq.numpy(), n_active, gap
 
 
+@torch.no_grad()
+def conditioning_diagnostic(model, data_x, cfg, n_samples=200):
+    """诊断 denoiser 对不同 class 的区分能力"""
+    model.eval()
+    device = cfg.device
+    K = cfg.num_classes
+    x = data_x[:n_samples].to(device)
+    B = x.size(0)
+
+    results = {}
+    for t_val in [50, 200, 500]:
+        t = torch.full((B,), t_val, device=device, dtype=torch.long)
+        noise = torch.randn_like(x)
+        x_t = model.dpm_process.q_sample(x, t, noise)
+
+        mse_per_k = []
+        for k in range(K):
+            y_oh = F.one_hot(torch.full((B,), k, device=device,
+                                         dtype=torch.long), K).float()
+            pred = model.cond_denoiser(x_t, t, y_oh)
+            mse = (pred - noise).pow(2).view(B, -1).mean(1)  # [B]
+            mse_per_k.append(mse.mean().item())
+
+        mse_arr = np.array(mse_per_k)
+        diff = mse_arr.max() - mse_arr.min()
+        avg = mse_arr.mean()
+        ratio = diff / (avg + 1e-8)
+        results[t_val] = {'diff': diff, 'avg': avg, 'ratio': ratio}
+
+    return results
+
+
 # ============================================================
 # 4. Dashboard & Sampling
 # ============================================================
@@ -224,43 +256,95 @@ def plot_dashboard(history, outpath):
     n = len(history["acc"])
     if n == 0:
         return
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle(f"Strict EM Dashboard (Round {n})", fontsize=14)
+    fig, axes = plt.subplots(3, 3, figsize=(20, 15))
+    fig.suptitle(f"Strict EM Dashboard (Round {n})", fontsize=16, fontweight='bold')
     rounds = list(range(1, n + 1))
 
+    # ── Row 1: Core metrics ──
     ax = axes[0, 0]
     if len(history["loss"]) >= n:
-        ax.plot(rounds, history["loss"][:n], 'b-', marker='o')
-    ax.set_title('Diffusion Loss'); ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
+        ax.plot(rounds, history["loss"][:n], 'b-', marker='o', linewidth=2)
+    ax.set_title('Diffusion Loss', fontweight='bold')
+    ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
 
     ax = axes[0, 1]
-    ax.plot(rounds, history["acc"], 'r-', marker='o', label='Acc')
-    ax.plot(rounds, history["nmi"], 'g--', marker='s', label='NMI')
-    ax.set_title('Clustering Performance'); ax.legend(); ax.grid(True, alpha=0.3)
+    ax.plot(rounds, history["acc"], 'r-', marker='o', linewidth=2, label='Acc')
+    ax.plot(rounds, history["nmi"], 'g--', marker='s', linewidth=2, label='NMI')
+    ax.set_title('Clustering Performance', fontweight='bold')
+    ax.set_ylim(0, 1); ax.legend(fontsize=10); ax.grid(True, alpha=0.3)
     ax.set_xlabel('EM Round')
 
     ax = axes[0, 2]
-    ax.plot(rounds, history["n_active"], 'purple', marker='o')
-    ax.axhline(y=10, color='gray', linestyle='--', alpha=0.5)
-    ax.set_title('Active Classes'); ax.set_ylim(0, 12)
+    ax.plot(rounds, history["n_active"], 'purple', marker='o', linewidth=2)
+    ax.axhline(y=10, color='gray', linestyle='--', alpha=0.5, label='K=10')
+    ax.axhline(y=5, color='red', linestyle='--', alpha=0.5, label='collapse threshold')
+    ax.set_title('Active Classes', fontweight='bold')
+    ax.set_ylim(0, 12); ax.legend(fontsize=9)
     ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
 
+    # ── Row 2: EM internals ──
     ax = axes[1, 0]
-    ax.plot(rounds, history["scale"], 'c-', marker='o')
-    ax.set_title('Scale Factor'); ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
+    ax.plot(rounds, history["scale"], 'c-', marker='o', linewidth=2)
+    ax.set_title('Scale Factor (annealing)', fontweight='bold')
+    ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 1]
-    ax.plot(rounds, history["pi_entropy"], 'orange', marker='o', label='π entropy')
-    ax.axhline(y=np.log(10), color='gray', linestyle='--', alpha=0.5, label='uniform')
-    ax.set_title('π Entropy'); ax.legend()
-    ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
+    ax.plot(rounds, history["pi_entropy"], 'orange', marker='o', linewidth=2, label='H(π)')
+    ax.axhline(y=np.log(10), color='gray', linestyle='--', alpha=0.5, label='uniform=2.303')
+    ax.set_title('π Entropy', fontweight='bold')
+    ax.legend(fontsize=10); ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 2]
-    ax.plot(rounds, history["gap"], 'm-', marker='o')
-    ax.set_title('Emission Gap (confidence)')
+    ax.plot(rounds, history["gap"], 'm-', marker='o', linewidth=2)
+    ax.set_title('Emission Gap (top1-top2)', fontweight='bold')
     ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
 
-    plt.tight_layout(); plt.savefig(outpath); plt.close()
+    # ── Row 3: Conditioning & Freq ──
+    ax = axes[2, 0]
+    if "cond_ratio" in history and len(history["cond_ratio"]) > 0:
+        cr = history["cond_ratio"]
+        cr_rounds = list(range(1, len(cr) + 1))
+        for t_key in ['t50', 't200', 't500']:
+            vals = [c.get(t_key, 0) for c in cr]
+            ax.plot(cr_rounds, vals, marker='o', linewidth=2, label=t_key)
+        ax.set_title('Conditioning Ratio', fontweight='bold')
+        ax.legend(fontsize=9); ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
+    else:
+        ax.set_title('Conditioning Ratio (N/A)'); ax.grid(True, alpha=0.3)
+
+    ax = axes[2, 1]
+    if "freq_history" in history and len(history["freq_history"]) > 0:
+        freq_arr = np.array(history["freq_history"])  # [n_rounds, K]
+        for k in range(freq_arr.shape[1]):
+            ax.plot(list(range(1, freq_arr.shape[0]+1)), freq_arr[:, k],
+                    alpha=0.7, linewidth=1.5, label=f'k={k}')
+        ax.axhline(y=0.1, color='gray', linestyle='--', alpha=0.5)
+        ax.set_title('Class Frequency Distribution', fontweight='bold')
+        ax.set_xlabel('EM Round'); ax.grid(True, alpha=0.3)
+        if freq_arr.shape[1] <= 10:
+            ax.legend(fontsize=7, ncol=2)
+    else:
+        ax.set_title('Class Frequency (N/A)'); ax.grid(True, alpha=0.3)
+
+    # Info panel
+    ax = axes[2, 2]; ax.axis('off')
+    if n > 0:
+        pi_str = ""
+        if "pi_values" in history and len(history["pi_values"]) > 0:
+            pi_str = f"\nπ: [{history['pi_values'][-1]}]"
+        info = (f"Current Acc:   {history['acc'][-1]:.4f}\n"
+                f"Best Acc:      {max(history['acc']):.4f}\n"
+                f"Current NMI:   {history['nmi'][-1]:.4f}\n"
+                f"Active Classes: {history['n_active'][-1]}\n"
+                f"Scale:         {history['scale'][-1]:.1f}\n"
+                f"H(π):          {history['pi_entropy'][-1]:.3f}\n"
+                f"Gap:           {history['gap'][-1]:.4f}"
+                f"{pi_str}")
+        ax.text(0.05, 0.95, info, fontsize=12, family='monospace',
+                verticalalignment='top', transform=ax.transAxes,
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout(); plt.savefig(outpath, dpi=120); plt.close()
 
 
 @torch.no_grad()
@@ -314,9 +398,10 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
     n_em_rounds = hyperparams.get('n_em_rounds', 8)
     m_epochs_first = hyperparams.get('m_epochs_first', 15)
     m_epochs_rest = hyperparams.get('m_epochs_rest', 8)
-    scale_factor = hyperparams.get('scale_factor', 30.0)
+    scale_start = hyperparams.get('scale_start', 5.0)     # E-step 起始 scale
+    scale_end = hyperparams.get('scale_end', 50.0)         # E-step 最终 scale
     n_mc = hyperparams.get('n_mc', 5)
-    use_contrastive = hyperparams.get('use_contrastive', True)
+    use_contrastive = hyperparams.get('use_contrastive', False)
     contrastive_weight = hyperparams.get('contrastive_weight', 0.1)
     use_kmeans_init = hyperparams.get('use_kmeans_init', True)
 
@@ -327,7 +412,8 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
     best_cluster_mapping = None
 
     history = {"loss": [], "acc": [], "nmi": [], "scale": [],
-               "pi_entropy": [], "n_active": [], "gap": []}
+               "pi_entropy": [], "n_active": [], "gap": [],
+               "cond_ratio": [], "freq_history": [], "pi_values": []}
 
     # ── KMeans 初始化 (借鉴 HMM-DPM) ──
     if use_kmeans_init:
@@ -355,24 +441,53 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
     for em_round in range(n_em_rounds):
         m_epochs = m_epochs_first if em_round == 0 else m_epochs_rest
 
+        # Scale 退火: 从 scale_start 到 scale_end
+        progress = em_round / max(n_em_rounds - 1, 1)
+        current_scale = scale_start + (scale_end - scale_start) * progress
+
         print(f"\n{'='*60}")
-        print(f"EM Round {em_round+1}/{n_em_rounds}")
+        print(f"EM Round {em_round+1}/{n_em_rounds} | Scale={current_scale:.1f}")
         print(f"{'='*60}")
+
+        # ── Conditioning 诊断 ──
+        diag = conditioning_diagnostic(model, all_x, cfg)
+        cond_ratio_entry = {f't{t_val}': d['ratio'] for t_val, d in diag.items()}
+        history["cond_ratio"].append(cond_ratio_entry)
+
+        if is_final_training:
+            print(f"  [Conditioning Diagnostic]")
+            for t_val, d in diag.items():
+                print(f"    t={t_val:3d}: diff={d['diff']:.6f} "
+                      f"avg={d['avg']:.4f} ratio={d['ratio']:.4f}")
 
         # ── E-step: 全局重算分配 ──
         if em_round > 0:
-            print(f"  [E-step] scale={scale_factor}, n_mc={n_mc}")
+            print(f"  [E-step] scale={current_scale:.1f}, n_mc={n_mc}")
             cached_labels, freq_np, n_active, gap = global_estep(
                 model, all_x, cfg,
-                scale_factor=scale_factor, n_mc=n_mc)
+                scale_factor=current_scale, n_mc=n_mc)
+
+            # ── 坍缩检测与恢复 ──
+            if n_active < cfg.num_classes * 0.5:  # 活跃类 < 50%
+                print(f"  ⚠️ COLLAPSE DETECTED: #active={n_active}/{cfg.num_classes}")
+                print(f"  ⚠️ Reverting to previous labels + reducing scale")
+                # 恢复上一轮标签
+                cached_labels = prev_cached_labels.clone()
+                current_scale = max(current_scale * 0.5, scale_start)
+                freq = torch.bincount(cached_labels, minlength=cfg.num_classes).float()
+                freq_np = (freq / freq.sum()).numpy()
+                n_active = len(cached_labels.unique())
+                gap = 0.0
+                print(f"  ⚠️ Restored: #active={n_active}, scale→{current_scale:.1f}")
 
             # 闭式解更新 π
             pi_np = model.update_pi_closed_form(cached_labels)
             pi_entropy = -np.sum(pi_np * np.log(pi_np + 1e-9))
 
-            print(f"  → #active={n_active} | gap={gap:.4f} | "
-                  f"freq=[{freq_np.min():.3f}-{freq_np.max():.3f}] | "
-                  f"H(π)={pi_entropy:.3f}")
+            # 详细频率打印
+            freq_str = ", ".join([f"{f:.3f}" for f in freq_np])
+            print(f"  → #active={n_active} | gap={gap:.4f} | H(π)={pi_entropy:.3f}")
+            print(f"  → freq=[{freq_str}]")
 
             # Evaluate
             val_acc, mapping, val_nmi = evaluate_model(model, val_loader, cfg)
@@ -394,7 +509,12 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
             history["pi_entropy"].append(pi_entropy)
             history["n_active"].append(n_active)
             history["gap"].append(gap)
-            history["scale"].append(scale_factor)
+            history["scale"].append(current_scale)
+            history["freq_history"].append(freq_np.tolist())
+            history["pi_values"].append(", ".join([f"{p:.3f}" for p in pi_np]))
+
+        # 保存当前标签 (用于坍缩恢复)
+        prev_cached_labels = cached_labels.clone()
 
         # ── M-step: 用固定标签训练 denoiser ──
         print(f"  [M-step] training denoiser for {m_epochs} epochs "
@@ -471,7 +591,11 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
             history["pi_entropy"].append(pi_entropy)
             history["n_active"].append(len(cached_labels.unique()))
             history["gap"].append(0.0)
-            history["scale"].append(scale_factor)
+            history["scale"].append(current_scale)
+            freq_r0 = torch.bincount(cached_labels, minlength=cfg.num_classes).float()
+            freq_r0 = (freq_r0 / freq_r0.sum()).numpy()
+            history["freq_history"].append(freq_r0.tolist())
+            history["pi_values"].append(", ".join([f"{p:.3f}" for p in pi_np]))
 
         # Dashboard & samples
         if is_final_training and len(history["acc"]) > 0:
@@ -534,7 +658,8 @@ def main():
         'n_em_rounds': 8,             # EM 轮次
         'm_epochs_first': 15,         # 第一轮多训 (KMeans 标签质量一般)
         'm_epochs_rest': 8,           # 后续轮次 (标签更准)
-        'scale_factor': 30.0,         # E-step scale (固定! 不退火)
+        'scale_start': 5.0,           # E-step 起始 scale (低, 安全)
+        'scale_end': 50.0,            # E-step 最终 scale (高, 准确)
         'n_mc': 5,                    # Monte Carlo 采样次数
         'use_kmeans_init': USE_KMEANS_INIT,
         'use_contrastive': USE_CONTRASTIVE,
@@ -548,10 +673,8 @@ def main():
     print(f"   EM rounds:    {hyperparams['n_em_rounds']}")
     print(f"   M-step epochs: {hyperparams['m_epochs_first']} (first) / "
           f"{hyperparams['m_epochs_rest']} (rest)")
-    print(f"   Scale:         {hyperparams['scale_factor']} (fixed)")
+    print(f"   Scale:         {hyperparams['scale_start']} → {hyperparams['scale_end']} (annealing)")
     print(f"   KMeans init:   {USE_KMEANS_INIT}")
-    print(f"   Contrastive:   {USE_CONTRASTIVE} "
-          f"(weight={hyperparams['contrastive_weight']})")
     print(f"   Total epochs:  ~{total_epochs}")
 
     best_acc, best_mapping = run_strict_em(
