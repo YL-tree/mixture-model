@@ -43,43 +43,65 @@ def set_seed(seed=2026):
 class mDPM_StrictEM(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        K = cfg.num_classes
+        # 构建标准 UNet (in_channels=1, 输出也是1)
         self.cond_denoiser = ConditionalUnet(
-            in_channels=cfg.image_channels,
+            in_channels=cfg.image_channels,      # 输出仍为 1 通道
             base_channels=cfg.unet_base_channels,
             num_classes=cfg.num_classes,
             time_emb_dim=cfg.unet_time_emb_dim
+        )
+        # [关键] 替换 init_conv: 接受 1+K 通道输入 (image + cond broadcast)
+        # 借鉴 HMM-DPM: 条件占输入的 K/(1+K) → 结构上不可忽略
+        # 输出层不变 (final_conv 仍输出 1 通道)
+        self.cond_denoiser.init_conv = nn.Conv2d(
+            cfg.image_channels + K,
+            cfg.unet_base_channels,
+            3, padding=1
         )
         self.dpm_process = DPMForwardProcess(
             timesteps=cfg.timesteps,
             schedule='linear',
             image_channels=cfg.image_channels
         )
-        self.K = cfg.num_classes
-        # π: 闭式解更新, 不需要梯度
-        self.register_buffer('pi', torch.ones(cfg.num_classes) / cfg.num_classes)
+        self.K = K
+        self.register_buffer('pi', torch.ones(K) / K)
+
+    def _concat_cond(self, x, y_onehot):
+        """将条件 broadcast 到空间维度并拼接到输入
+        HMM-DPM 的关键设计: 条件占输入的 K/(1+K) → 结构上不可忽略
+        """
+        B, C, H, W = x.shape
+        cond_map = y_onehot[:, :, None, None].expand(-1, -1, H, W)  # [B, K, H, W]
+        return torch.cat([x, cond_map], dim=1)  # [B, 1+K, H, W]
 
     @torch.no_grad()
     def compute_log_likelihood(self, x_0, cfg, scale_factor=5.0, n_mc=5):
         """
         E-step: 计算 log p(x | k) ∝ -MSE_k
-        借鉴 HMM-DPM: 全部 no_grad, 多次 MC 采样取平均
-        t 范围 [100, 900]: 过滤极端 t
+        ★ 方案B: 只用高噪声段 t ∈ [600, 1000)
+        诊断: t=500 ratio≈0.28 (有信号), t=50 ratio≈0.006 (无信号)
+        低t无区分度, 会淹没高t的真实信号, scale放大后导致坍缩
         """
         B = x_0.size(0)
         K = self.K
         device = x_0.device
+        T = self.dpm_process.timesteps
+
+        t_lo = T * 3 // 5   # 600
+        t_hi = T             # 1000
 
         total_neg_mse = torch.zeros(B, K, device=device)
 
         for _ in range(n_mc):
-            t = torch.randint(100, 900, (B,), device=device).long()
+            t = torch.randint(t_lo, t_hi, (B,), device=device).long()
             noise = torch.randn_like(x_0)
             x_t = self.dpm_process.q_sample(x_0, t, noise)
 
             for k in range(K):
                 y_oh = F.one_hot(torch.full((B,), k, device=device,
                                              dtype=torch.long), K).float()
-                pred = self.cond_denoiser(x_t, t, y_oh)
+                pred = self.cond_denoiser(self._concat_cond(x_t, y_oh), t, y_oh)
                 mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
                 total_neg_mse[:, k] += -mse
 
@@ -101,7 +123,7 @@ class mDPM_StrictEM(nn.Module):
             0, self.dpm_process.timesteps - 1)
         noise = torch.randn_like(x_0)
         x_t = self.dpm_process.q_sample(x_0, t, noise)
-        pred_noise = self.cond_denoiser(x_t, t, y_onehot)
+        pred_noise = self.cond_denoiser(self._concat_cond(x_t, y_onehot), t, y_onehot)
         return F.mse_loss(pred_noise, noise)
 
     def compute_contrastive_loss(self, x_0, y_onehot, margin=0.01):
@@ -116,7 +138,7 @@ class mDPM_StrictEM(nn.Module):
         x_t = self.dpm_process.q_sample(x_0, t, noise)
 
         # 正确条件
-        pred_pos = self.cond_denoiser(x_t, t, y_onehot)
+        pred_pos = self.cond_denoiser(self._concat_cond(x_t, y_onehot), t, y_onehot)
         mse_pos = (pred_pos - noise).pow(2).view(B, -1).mean(1)
 
         # 错误条件: shuffle
@@ -126,7 +148,7 @@ class mDPM_StrictEM(nn.Module):
         if same.any():
             y_neg[same] = torch.roll(y_onehot[same], 1, dims=0)
 
-        pred_neg = self.cond_denoiser(x_t, t, y_neg)
+        pred_neg = self.cond_denoiser(self._concat_cond(x_t, y_neg), t, y_neg)
         mse_neg = (pred_neg - noise).pow(2).view(B, -1).mean(1)
 
         contrastive = F.relu(mse_pos - mse_neg + margin).mean()
@@ -227,7 +249,7 @@ def conditioning_diagnostic(model, data_x, cfg, n_samples=200):
     B = x.size(0)
 
     results = {}
-    for t_val in [50, 200, 500]:
+    for t_val in [50, 200, 500, 700, 900]:
         t = torch.full((B,), t_val, device=device, dtype=torch.long)
         noise = torch.randn_like(x)
         x_t = model.dpm_process.q_sample(x, t, noise)
@@ -236,7 +258,7 @@ def conditioning_diagnostic(model, data_x, cfg, n_samples=200):
         for k in range(K):
             y_oh = F.one_hot(torch.full((B,), k, device=device,
                                          dtype=torch.long), K).float()
-            pred = model.cond_denoiser(x_t, t, y_oh)
+            pred = model.cond_denoiser(model._concat_cond(x_t, y_oh), t, y_oh)
             mse = (pred - noise).pow(2).view(B, -1).mean(1)  # [B]
             mse_per_k.append(mse.mean().item())
 
@@ -367,7 +389,7 @@ def sample_and_save(model, cfg, out_path, n_per_class=10, cluster_mapping=None):
         for t_idx in reversed(range(T)):
             t_ = torch.full((n_per_class,), t_idx, device=cfg.device,
                              dtype=torch.long)
-            pred = model.cond_denoiser(x, t_, y_oh)
+            pred = model.cond_denoiser(model._concat_cond(x, y_oh), t_, y_oh)
             beta = model.dpm_process.betas[t_idx]
             alpha = model.dpm_process.alphas[t_idx]
             alpha_bar = model.dpm_process.alphas_cumprod[t_idx]
@@ -655,25 +677,27 @@ def main():
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     hyperparams = {
-        'n_em_rounds': 8,             # EM 轮次
-        'm_epochs_first': 15,         # 第一轮多训 (KMeans 标签质量一般)
-        'm_epochs_rest': 8,           # 后续轮次 (标签更准)
-        'scale_start': 5.0,           # E-step 起始 scale (低, 安全)
-        'scale_end': 50.0,            # E-step 最终 scale (高, 准确)
-        'n_mc': 5,                    # Monte Carlo 采样次数
+        'n_em_rounds': 8,
+        'm_epochs_first': 15,         # 恢复原值
+        'm_epochs_rest': 8,
+        'scale_start': 5.0,
+        'scale_end': 50.0,
+        'n_mc': 5,
         'use_kmeans_init': USE_KMEANS_INIT,
-        'use_contrastive': USE_CONTRASTIVE,
+        'use_contrastive': False,
         'contrastive_weight': 0.1,
     }
 
     total_epochs = (hyperparams['m_epochs_first'] +
                     hyperparams['m_epochs_rest'] * (hyperparams['n_em_rounds'] - 1))
 
-    print(f"\n🚀 Strict EM Training")
+    print(f"\n🚀 Strict EM Training [实验B: E-step只用高t ∈ [600,1000)]")
     print(f"   EM rounds:    {hyperparams['n_em_rounds']}")
     print(f"   M-step epochs: {hyperparams['m_epochs_first']} (first) / "
           f"{hyperparams['m_epochs_rest']} (rest)")
-    print(f"   Scale:         {hyperparams['scale_start']} → {hyperparams['scale_end']} (annealing)")
+    print(f"   Scale:         {hyperparams['scale_start']} → "
+          f"{hyperparams['scale_end']} (annealing)")
+    print(f"   E-step t:      [600, 1000) ★ 只用高噪声段")
     print(f"   KMeans init:   {USE_KMEANS_INIT}")
     print(f"   Total epochs:  ~{total_epochs}")
 
