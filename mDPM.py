@@ -1,14 +1,14 @@
-# mDPM.py — 在线 EM + 闭式解 π 更新版
+# mDPM.py — 在线 EM + 论文式 soft π 更新 (T=1000)
 # ═══════════════════════════════════════════════════════════════
-# 回到验证过的在线 EM 框架 (Acc=0.5-0.6):
-#   每个 batch 内: E-step(算posterior) + M-step(训denoiser)
-#   标签每 batch 刷新 → conditioning 不会死
+# 在线 EM 框架 (验证过 Acc=0.5-0.6):
+#   每个 batch: E-step(算posterior) + M-step(训denoiser)
 #
-# π 更新: 闭式解 + clamp 防坍缩
-#   原版 π 通过 label_loss 梯度更新 → rich-get-richer 坍缩
-#   现版: π_k = count(label==k)/N, clamp(min=0.05) → 反映数据分布但不饿死
+# π 更新方式: 论文原文 soft resp 均值 + clamp
+#   论文: π_k = (1/N) Σ r_{nk}   (soft responsibilities)
+#   之前试的 hard count: π_k = count(argmax==k)/N → 极端偏移 → 坍缩
+#   soft resp 天然平滑: 即使 argmax 都是 class 9, resp 对其他 class ≠ 0
 #
-# 同时加入 conditioning diagnostic 监控 denoiser 健康度
+# T=1000 (原始验证值)
 # ═══════════════════════════════════════════════════════════════
 
 import torch
@@ -58,24 +58,21 @@ class mDPM(nn.Module):
             image_channels=cfg.image_channels
         )
         self.K = cfg.num_classes
-        # π: 闭式解更新 (不用梯度), clamp 防饿死
+        # π: 闭式解更新 (不用梯度) + clamp 防饿死
         self.register_buffer('pi', torch.ones(cfg.num_classes) / cfg.num_classes)
 
-    def update_pi_closed_form(self, all_pseudo_labels, min_ratio=0.5):
+    def update_pi_soft(self, all_resp, min_ratio=0.5):
         """
-        闭式解更新 π (借鉴 HMM-DPM):
-          π_k = count(label==k) / N
-          clamp: π_k >= 1/(2K) 防止任何 class 被饿死
+        论文公式更新 π:
+          π_k = (1/N) Σ r_{nk}    (soft responsibilities 的均值)
+          clamp: π_k >= 1/(2K) = 0.05, 防止饿死
         
-        Args:
-            all_pseudo_labels: 一个 epoch 所有 batch 的 pseudo_label 拼起来 [N]
-            min_ratio: clamp 下限 = 1/(K * 1/min_ratio), 0.5 → min=1/(2K)=0.05
+        soft resp 天然比 hard count 平滑, 不容易极端偏移
         """
-        counts = torch.bincount(all_pseudo_labels, minlength=self.K).float()
-        freq = counts / counts.sum()
-        # clamp: 不低于 uniform * min_ratio = 0.1 * 0.5 = 0.05
+        # all_resp: [N, K], 每行是一个样本的 soft posterior
+        avg_resp = all_resp.mean(dim=0)  # [K]
         min_val = (1.0 / self.K) * min_ratio
-        clamped = freq.clamp(min=min_val)
+        clamped = avg_resp.clamp(min=min_val)
         new_pi = clamped / clamped.sum()
         self.pi.copy_(new_pi.to(self.pi.device))
         return new_pi.cpu().numpy()
@@ -150,6 +147,7 @@ class mDPM(nn.Module):
             'dpm_loss': dpm_loss.item(),
             'mask_rate': mask_rate,
             'pseudo_labels': pseudo_labels.detach(),
+            'resp': resp.detach(),  # soft posterior, 用于论文式 π 更新
         }
 
 
@@ -364,8 +362,7 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
     """
     在线 EM 训练:
       每个 batch: E-step(算posterior) + M-step(训denoiser)
-      标签每 batch 都不同 → conditioning 不死
-      π 闭式解 + clamp → 不坍缩
+      每个 epoch 结束: 闭式解更新 π + clamp(min=0.05)
     """
     if hyperparams is None:
         hyperparams = {}
@@ -374,7 +371,6 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
     target_scale = hyperparams.get('target_scale', 134.0)
     warmup_epochs = hyperparams.get('warmup_epochs', 10)
     threshold_final = hyperparams.get('threshold_final', 0.036)
-    diag_every = hyperparams.get('diag_every', 5)
 
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
@@ -388,7 +384,7 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
 
     for epoch in range(1, total_epochs + 1):
 
-        # ── Scale 调度 (验证过的: 5→20→134) ──
+        # ── Scale 调度 (原始验证过的: 5→20→134) ──
         if epoch <= warmup_epochs:
             use_hard = False
             p1 = epoch / warmup_epochs
@@ -412,6 +408,7 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
         ep_mask = 0.0
         n_batches = 0
         epoch_labels = []
+        epoch_resps = []
 
         for x_batch, _ in unlabeled_loader:
             x_batch = x_batch.to(cfg.device)
@@ -429,19 +426,21 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
             ep_loss += loss.item()
             ep_mask += info['mask_rate']
             epoch_labels.append(info['pseudo_labels'].cpu())
+            epoch_resps.append(info['resp'].cpu())
             n_batches += 1
 
         # ── Epoch 统计 ──
         avg_loss = ep_loss / max(n_batches, 1)
         pass_pct = (ep_mask / max(n_batches, 1)) * 100
 
-        # 统计本 epoch 的 label 分布
+        # 统计本 epoch 的 label 分布 (hard, 仅监控)
         all_labels = torch.cat(epoch_labels)
         label_freq = np.bincount(all_labels.numpy(), minlength=cfg.num_classes).astype(float)
         label_freq = label_freq / label_freq.sum()
 
-        # ── 闭式解更新 π (每 epoch 结束后) ──
-        pi_np = model.update_pi_closed_form(all_labels)
+        # ── 论文式 π 更新: soft resp 均值 + clamp ──
+        all_resp = torch.cat(epoch_resps)  # [N, K]
+        pi_np = model.update_pi_soft(all_resp)
         pi_entropy = -np.sum(pi_np * np.log(pi_np + 1e-9))
         if is_final:
             pi_str = ", ".join([f"{p:.3f}" for p in pi_np])
@@ -462,8 +461,8 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
             if is_final:
                 print(f"   ★ New Best! Acc={best_val_acc:.4f}")
 
-        # ── Conditioning Diagnostic ──
-        if epoch % diag_every == 0 or epoch == 1:
+        # ── Conditioning Diagnostic (每 5 epoch) ──
+        if epoch % 5 == 0 or epoch == 1:
             cond_ratios = conditioning_diagnostic(model, val_loader, cfg)
             avg_ratio = np.mean(list(cond_ratios.values()))
             history["cond_ratio"].append(avg_ratio)
@@ -513,7 +512,7 @@ def main():
     cfg.final_epochs = 60
 
     print("=" * 60)
-    print("🔓 Online EM + Closed-form π (clamp防坍缩)")
+    print("🔓 Online EM + Closed-form π (T=1000)")
     print(f"   T={cfg.timesteps}, M={cfg.posterior_sample_steps}")
     print("=" * 60)
 
@@ -531,12 +530,11 @@ def main():
         'target_scale': 134.37,
         'warmup_epochs': 10,
         'threshold_final': 0.036,
-        'diag_every': 5,
     }
 
     print(f"\n🚀 Training:")
     print(f"   LR=4.01e-05")
-    print(f"   Scale: 5→20 (warmup {hyperparams['warmup_epochs']}ep) → 134 (refine)")
+    print(f"   Scale: 5→20 (warmup 10ep, soft) → 20→134 (refine, hard)")
     print(f"   π = closed-form + clamp(min=0.05)")
     print(f"   Epochs: {hyperparams['total_epochs']}")
 
