@@ -241,7 +241,70 @@ def global_estep(model, all_x, cfg, scale_factor=0.002, n_mc=16, batch_size=256)
     vals, _ = torch.topk(all_logits_t, 2, dim=1)
     gap = (vals[:, 0] - vals[:, 1]).mean().item()
 
-    return cached_labels, freq.numpy(), n_active, gap
+    return cached_labels, freq.numpy(), n_active, gap, all_logits_t
+
+
+@torch.no_grad()
+def anti_collapse_rescue(cached_labels, all_logits, K, min_freq_ratio=0.5):
+    """
+    防坍缩救援 (借鉴 HMM-DPM anti_collapse_rescue):
+    对频率低于 uniform × min_freq_ratio 的弱势 class,
+    从过载 class 中抢回 emission 本来就支持该 class 的样本.
+
+    不是强制均匀 — 只防止任何 class 被杀死.
+    基于 emission 得分而非随机分配 — 抢回"本该属于 k"的样本.
+    """
+    N = cached_labels.size(0)
+    uniform = 1.0 / K
+    min_freq = uniform * min_freq_ratio  # e.g. 0.1 × 0.5 = 0.05
+    overload_freq = uniform * 1.5        # 过载阈值
+
+    freq = torch.bincount(cached_labels, minlength=K).float() / N
+    rescued_total = 0
+
+    for k in range(K):
+        if freq[k] >= min_freq:
+            continue
+
+        # 需要救援的样本数
+        target_count = int(min_freq * N)
+        current_count = (cached_labels == k).sum().item()
+        need = target_count - current_count
+        if need <= 0:
+            continue
+
+        # 从过载 class 中找候选
+        overloaded_mask = torch.zeros(N, dtype=torch.bool)
+        for j in range(K):
+            if freq[j] > overload_freq:
+                overloaded_mask |= (cached_labels == j)
+
+        if overloaded_mask.sum() == 0:
+            continue
+
+        # 计算 rescue_score: emission[样本, k] - emission[样本, 当前class]
+        candidate_indices = overloaded_mask.nonzero(as_tuple=True)[0]
+        current_k = cached_labels[candidate_indices]
+        score_k = all_logits[candidate_indices, k]
+        score_current = all_logits[candidate_indices, current_k]
+        rescue_score = score_k - score_current  # 越高 = 越应该属于 k
+
+        # 选 score 最高的 need 个样本
+        n_rescue = min(need, candidate_indices.size(0))
+        _, top_idx = rescue_score.topk(n_rescue)
+        rescue_indices = candidate_indices[top_idx]
+
+        cached_labels[rescue_indices] = k
+        rescued_total += n_rescue
+        print(f"    🛟 Rescued class {k}: {current_count}→{current_count+n_rescue} "
+              f"(+{n_rescue} from overloaded classes)")
+
+    if rescued_total > 0:
+        freq_after = torch.bincount(cached_labels, minlength=K).float() / N
+        print(f"    🛟 Total rescued: {rescued_total} samples")
+        print(f"    🛟 Freq after: [{', '.join([f'{f:.3f}' for f in freq_after])}]")
+
+    return cached_labels, rescued_total
 
 
 @torch.no_grad()
@@ -485,20 +548,19 @@ def run_strict_em(model, optimizer, all_x, val_loader, cfg,
         # ── E-step: 全局重算分配 ──
         if em_round > 0:
             print(f"  [E-step] SF={scale_factor}, n_mc={n_mc}")
-            cached_labels, freq_np, n_active, gap = global_estep(
+            cached_labels, freq_np, n_active, gap, all_logits = global_estep(
                 model, all_x, cfg,
                 scale_factor=scale_factor, n_mc=n_mc)
 
-            # ── 坍缩检测与恢复 ──
-            if n_active < cfg.num_classes * 0.5:
-                print(f"  ⚠️ COLLAPSE DETECTED: #active={n_active}/{cfg.num_classes}")
-                print(f"  ⚠️ Reverting to previous labels")
-                cached_labels = prev_cached_labels.clone()
+            # ── 防坍缩救援 (借鉴 HMM-DPM) ──
+            cached_labels, n_rescued = anti_collapse_rescue(
+                cached_labels, all_logits, cfg.num_classes, min_freq_ratio=0.5)
+
+            # 救援后重算 freq
+            if n_rescued > 0:
                 freq = torch.bincount(cached_labels, minlength=cfg.num_classes).float()
                 freq_np = (freq / freq.sum()).numpy()
                 n_active = len(cached_labels.unique())
-                gap = 0.0
-                print(f"  ⚠️ Restored: #active={n_active}")
 
             # 闭式解更新 π
             pi_np = model.update_pi_closed_form(cached_labels)
