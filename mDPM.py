@@ -675,11 +675,11 @@ def main():
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     hyperparams = {
-        'n_em_rounds': 8,
-        'm_epochs_first': 15,
-        'm_epochs_rest': 8,
-        'scale_factor': 0.002,        # 匹配 HMM-DPM: 除法, 有效放大 500 倍
-        'n_mc': 16,                    # 匹配 HMM-DPM: 16次MC采样
+        'n_em_rounds': 12,            # 更多轮, 每轮更短
+        'm_epochs_first': 3,          # ★ 组合A+C: 只训3ep, conditioning不会死
+        'm_epochs_rest': 5,           # 短M-step + 频繁E-step
+        'scale_factor': 0.002,        # ★ 匹配 HMM-DPM ×500 放大
+        'n_mc': 16,                   # ★ 匹配 HMM-DPM 16次MC
         'use_kmeans_init': USE_KMEANS_INIT,
         'use_contrastive': False,
         'contrastive_weight': 0.1,
@@ -688,15 +688,14 @@ def main():
     total_epochs = (hyperparams['m_epochs_first'] +
                     hyperparams['m_epochs_rest'] * (hyperparams['n_em_rounds'] - 1))
 
-    print(f"\n🚀 Strict EM Training [匹配 HMM-DPM 参数]")
+    print(f"\n🚀 Strict EM [组合 A+C: 短M-step + 强E-step]")
     print(f"   Timesteps:    {cfg.timesteps}")
     print(f"   EM rounds:    {hyperparams['n_em_rounds']}")
     print(f"   M-step epochs: {hyperparams['m_epochs_first']} (first) / "
-          f"{hyperparams['m_epochs_rest']} (rest)")
+          f"{hyperparams['m_epochs_rest']} (rest) ← 短! 保护conditioning")
     print(f"   Scale factor:  {hyperparams['scale_factor']} (÷, 有效放大 "
           f"{1/hyperparams['scale_factor']:.0f}x)")
     print(f"   n_mc:          {hyperparams['n_mc']}")
-    print(f"   E-step t:      [60, 100) 高噪声段")
     print(f"   KMeans init:   {USE_KMEANS_INIT}")
     print(f"   Total epochs:  ~{total_epochs}")
 
