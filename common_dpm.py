@@ -54,7 +54,7 @@ class Config:
         # 模型结构和 DPM 参数
         # ---------------------
         self.num_classes = 10             # MNIST
-        self.timesteps = 100              # 扩散总时间步 T (从1000改为100, 匹配HMM-DPM)
+        self.timesteps = 1000             # 扩散总时间步 T (原始验证过的值)
         self.image_channels = 1           # MNIST
         
         # U-Net 参数
@@ -65,7 +65,7 @@ class Config:
 
 # 增加条件注入时的时间步权重函数，用于控制条件注入的强度
 # 权重函数在中间时间步 (30% - 70%) 增强，两头抑制
-def get_time_weight(t, max_steps=100):
+def get_time_weight(t, max_steps=1000):
     """
     返回一个随时间变化的权重系数，形状为 (Batch_Size, 1)
     """
@@ -87,7 +87,7 @@ def get_time_weight(t, max_steps=100):
 # B. DPM 前向过程
 # -----------------------------------------------------
 class DPMForwardProcess(nn.Module):
-    def __init__(self, timesteps: int = 100, schedule: str = 'linear', image_channels: int = 1):
+    def __init__(self, timesteps: int = 1000, schedule: str = 'linear', image_channels: int = 1):
         super().__init__()
         self.timesteps = timesteps
         self.image_channels = image_channels
