@@ -3,10 +3,10 @@
 # 在线 EM 框架 (验证过 Acc=0.5-0.6):
 #   每个 batch: E-step(算posterior) + M-step(训denoiser)
 #
-# π 更新方式: 论文原文 soft resp 均值 + clamp
-#   论文: π_k = (1/N) Σ r_{nk}   (soft responsibilities)
-#   之前试的 hard count: π_k = count(argmax==k)/N → 极端偏移 → 坍缩
-#   soft resp 天然平滑: 即使 argmax 都是 class 9, resp 对其他 class ≠ 0
+# π 更新方式: 论文 soft resp + EMA + 双向 clamp
+#   论文: π_k = (1/N) Σ r_{nk}
+#   EMA: π = 0.95 * π_old + 0.05 * resp_mean (防突变)
+#   双向 clamp: π_k ∈ [0.05, 0.20] (防饿死 & 防独占)
 #
 # T=1000 (原始验证值)
 # ═══════════════════════════════════════════════════════════════
@@ -61,20 +61,24 @@ class mDPM(nn.Module):
         # π: 闭式解更新 (不用梯度) + clamp 防饿死
         self.register_buffer('pi', torch.ones(cfg.num_classes) / cfg.num_classes)
 
-    def update_pi_soft(self, all_resp, min_ratio=0.5):
+    def update_pi_soft(self, all_resp, ema=0.95, min_ratio=0.5, max_ratio=2.0):
         """
-        论文公式更新 π:
-          π_k = (1/N) Σ r_{nk}    (soft responsibilities 的均值)
-          clamp: π_k >= 1/(2K) = 0.05, 防止饿死
+        论文式 π 更新, 加双重保护:
+          1. soft resp 均值 (论文原文)
+          2. EMA 慢更新: π = ema * π_old + (1-ema) * resp_mean
+          3. 双向 clamp: π_k ∈ [1/(2K), 2/K] = [0.05, 0.20]
         
-        soft resp 天然比 hard count 平滑, 不容易极端偏移
+        防止任何 class 被饿死或独占
         """
-        # all_resp: [N, K], 每行是一个样本的 soft posterior
         avg_resp = all_resp.mean(dim=0)  # [K]
-        min_val = (1.0 / self.K) * min_ratio
-        clamped = avg_resp.clamp(min=min_val)
+        # EMA: 每轮最多偏移 5%
+        smoothed = ema * self.pi + (1 - ema) * avg_resp.to(self.pi.device)
+        # 双向 clamp
+        min_val = (1.0 / self.K) * min_ratio   # 0.05
+        max_val = (1.0 / self.K) * max_ratio   # 0.20
+        clamped = smoothed.clamp(min=min_val, max=max_val)
         new_pi = clamped / clamped.sum()
-        self.pi.copy_(new_pi.to(self.pi.device))
+        self.pi.copy_(new_pi)
         return new_pi.cpu().numpy()
 
     def estimate_posterior_logits(self, x_0, cfg, scale_factor=1.0):
@@ -535,7 +539,7 @@ def main():
     print(f"\n🚀 Training:")
     print(f"   LR=4.01e-05")
     print(f"   Scale: 5→20 (warmup 10ep, soft) → 20→134 (refine, hard)")
-    print(f"   π = closed-form + clamp(min=0.05)")
+    print(f"   π = soft resp + EMA(0.95) + clamp[0.05, 0.20]")
     print(f"   Epochs: {hyperparams['total_epochs']}")
 
     best_acc, best_mapping = run_training(
