@@ -1,14 +1,17 @@
-# mDPM.py — 在线 EM + 论文式 soft π 更新 (T=1000)
+# mDPM.py — 在线 EM + π 固定 (T=1000)
 # ═══════════════════════════════════════════════════════════════
 # 在线 EM 框架 (验证过 Acc=0.5-0.6):
 #   每个 batch: E-step(算posterior) + M-step(训denoiser)
 #
-# π 更新方式: 论文 soft resp + EMA + 双向 clamp
-#   论文: π_k = (1/N) Σ r_{nk}
-#   EMA: π = 0.95 * π_old + 0.05 * resp_mean (防突变)
-#   双向 clamp: π_k ∈ [0.05, 0.20] (防饿死 & 防独占)
-#
-# T=1000 (原始验证值)
+# π 固定为 uniform 1/K:
+#   所有 π 更新方案均导致 component collapse (深度聚类已知问题):
+#   - 梯度更新 (label_loss): rich-get-richer → 坍缩
+#   - 闭式解 hard count + clamp: 坍缩
+#   - 论文式 soft resp 均值 + clamp: 坍缩
+#   - soft resp + EMA + 双向 clamp: 不坍缩但 Acc 仅 0.35
+#   文献支撑: Dilokthanakul 2016 (GMVAE cluster degeneracy),
+#             DPSL (MoE expert collapse), DCE (DPM posterior collapse)
+#   对 MNIST 等类别均匀数据, 固定 π=1/K 等价于强 Dirichlet 先验
 # ═══════════════════════════════════════════════════════════════
 
 import torch
@@ -58,28 +61,10 @@ class mDPM(nn.Module):
             image_channels=cfg.image_channels
         )
         self.K = cfg.num_classes
-        # π: 闭式解更新 (不用梯度) + clamp 防饿死
+        # π 固定为 uniform — 所有 π 更新方案均导致 component collapse
+        # 这是深度聚类的已知问题 (Dilokthanakul 2016, GMVAE cluster degeneracy)
+        # 对于 MNIST 等类别均匀数据, 固定 π = 1/K 等价于强 Dirichlet 先验
         self.register_buffer('pi', torch.ones(cfg.num_classes) / cfg.num_classes)
-
-    def update_pi_soft(self, all_resp, ema=0.95, min_ratio=0.5, max_ratio=2.0):
-        """
-        论文式 π 更新, 加双重保护:
-          1. soft resp 均值 (论文原文)
-          2. EMA 慢更新: π = ema * π_old + (1-ema) * resp_mean
-          3. 双向 clamp: π_k ∈ [1/(2K), 2/K] = [0.05, 0.20]
-        
-        防止任何 class 被饿死或独占
-        """
-        avg_resp = all_resp.mean(dim=0)  # [K]
-        # EMA: 每轮最多偏移 5%
-        smoothed = ema * self.pi + (1 - ema) * avg_resp.to(self.pi.device)
-        # 双向 clamp
-        min_val = (1.0 / self.K) * min_ratio   # 0.05
-        max_val = (1.0 / self.K) * max_ratio   # 0.20
-        clamped = smoothed.clamp(min=min_val, max=max_val)
-        new_pi = clamped / clamped.sum()
-        self.pi.copy_(new_pi)
-        return new_pi.cpu().numpy()
 
     def estimate_posterior_logits(self, x_0, cfg, scale_factor=1.0):
         """
@@ -151,7 +136,6 @@ class mDPM(nn.Module):
             'dpm_loss': dpm_loss.item(),
             'mask_rate': mask_rate,
             'pseudo_labels': pseudo_labels.detach(),
-            'resp': resp.detach(),  # soft posterior, 用于论文式 π 更新
         }
 
 
@@ -275,7 +259,7 @@ def plot_dashboard(history, outpath):
         return
     epochs = range(1, n + 1)
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle(f'Online EM + Closed-form π (Ep {n})', fontsize=18)
+    fig.suptitle(f'Online EM + Fixed π (Ep {n})', fontsize=18)
 
     ax = axes[0, 0]
     ax.plot(epochs, history["loss"], 'b-')
@@ -366,7 +350,7 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
     """
     在线 EM 训练:
       每个 batch: E-step(算posterior) + M-step(训denoiser)
-      每个 epoch 结束: 闭式解更新 π + clamp(min=0.05)
+      π 固定 uniform (不更新)
     """
     if hyperparams is None:
         hyperparams = {}
@@ -412,7 +396,6 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
         ep_mask = 0.0
         n_batches = 0
         epoch_labels = []
-        epoch_resps = []
 
         for x_batch, _ in unlabeled_loader:
             x_batch = x_batch.to(cfg.device)
@@ -430,25 +413,21 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
             ep_loss += loss.item()
             ep_mask += info['mask_rate']
             epoch_labels.append(info['pseudo_labels'].cpu())
-            epoch_resps.append(info['resp'].cpu())
             n_batches += 1
 
         # ── Epoch 统计 ──
         avg_loss = ep_loss / max(n_batches, 1)
         pass_pct = (ep_mask / max(n_batches, 1)) * 100
 
-        # 统计本 epoch 的 label 分布 (hard, 仅监控)
+        # 统计本 epoch 的 label 分布 (仅监控, π 固定不更新)
         all_labels = torch.cat(epoch_labels)
         label_freq = np.bincount(all_labels.numpy(), minlength=cfg.num_classes).astype(float)
         label_freq = label_freq / label_freq.sum()
+        pi_entropy = -np.sum(label_freq * np.log(label_freq + 1e-9))
 
-        # ── 论文式 π 更新: soft resp 均值 + clamp ──
-        all_resp = torch.cat(epoch_resps)  # [N, K]
-        pi_np = model.update_pi_soft(all_resp)
-        pi_entropy = -np.sum(pi_np * np.log(pi_np + 1e-9))
         if is_final:
-            pi_str = ", ".join([f"{p:.3f}" for p in pi_np])
-            print(f"   π=[{pi_str}] H(π)={pi_entropy:.3f}")
+            freq_str = ", ".join([f"{f:.3f}" for f in label_freq])
+            print(f"   freq=[{freq_str}] H={pi_entropy:.3f}")
 
         # ── Validation ──
         val_acc, cluster_mapping, val_nmi, val_freq = evaluate_model(
@@ -516,7 +495,7 @@ def main():
     cfg.final_epochs = 60
 
     print("=" * 60)
-    print("🔓 Online EM + Closed-form π (T=1000)")
+    print("🔓 Online EM + Fixed π (T=1000)")
     print(f"   T={cfg.timesteps}, M={cfg.posterior_sample_steps}")
     print("=" * 60)
 
@@ -539,8 +518,9 @@ def main():
     print(f"\n🚀 Training:")
     print(f"   LR=4.01e-05")
     print(f"   Scale: 5→20 (warmup 10ep, soft) → 20→134 (refine, hard)")
-    print(f"   π = soft resp + EMA(0.95) + clamp[0.05, 0.20]")
+    print(f"   π = uniform 1/K (FIXED)")
     print(f"   Epochs: {hyperparams['total_epochs']}")
+    print(f"   (π 更新实验结论: 所有方案均 collapse, 固定最优)")
 
     best_acc, best_mapping = run_training(
         model, optimizer, unlabeled_loader, val_loader, cfg,
