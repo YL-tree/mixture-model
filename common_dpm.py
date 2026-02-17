@@ -1,4 +1,5 @@
-# common_dpm.py
+# common_dpm.py — Time-weighted AdaGN 架构 (原始 Acc=0.6 版本)
+# 核心: get_time_weight() sin 曲线, 中间时间步放大 class 信号 4x
 import os
 import torch
 import torch.nn as nn
@@ -63,26 +64,6 @@ class Config:
         
         os.makedirs(self.output_dir, exist_ok=True)
 
-# 增加条件注入时的时间步权重函数，用于控制条件注入的强度
-# 权重函数在中间时间步 (30% - 70%) 增强，两头抑制
-def get_time_weight(t, max_steps=1000):
-    """
-    返回一个随时间变化的权重系数，形状为 (Batch_Size, 1)
-    """
-    # 归一化 t 到 [0, 1]
-    t_norm = t.float() / max_steps
-    
-    # 权重基数
-    base = 1.0
-    # 峰值强度 (不要太大，3.0 左右即可)
-    peak = 3.0  
-    
-    # weight = base + peak * sin(t * pi)
-    # 中间时刻增强，两头正常
-    weights = base + peak * torch.sin(t_norm * torch.pi)
-    
-    return weights.view(-1, 1)
-
 # -----------------------------------------------------
 # B. DPM 前向过程
 # -----------------------------------------------------
@@ -136,20 +117,26 @@ class SinusoidalPositionalEmbedding(nn.Module):
         embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
         return embeddings
 
-# common_dpm.py 中的 ResidualBlock 类
+# ── 核心创新: 时间步动态权重 ──
+# sin 曲线: t=500 权重最大(4x), t=0/1000 权重最小(1x)
+# 中间时间步噪声适中, class 信号最有用 → 放大
+# 极端时间步 (太清晰/太噪) → 抑制
+def get_time_weight(t, max_steps=1000):
+    t_norm = t.float() / max_steps
+    base = 1.0
+    peak = 3.0
+    weights = base + peak * torch.sin(t_norm * torch.pi)
+    return weights.view(-1, 1)
+
 
 class ResidualBlock(nn.Module):
     """
-    Dual-FiLM ResidualBlock:
-    - time_mlp → scale/shift (控制去噪强度)
-    - class_mlp → 独立的 scale/shift (控制类别特征)
-    两路 FiLM 依次作用, class 无法被忽略
+    Combined AdaGN ResidualBlock (原始 Acc=0.6 版本):
+    - 接收 combined embedding (t_emb + weighted y_emb)
+    - 单路 FiLM: scale/shift 同时编码时间和类别
     """
     def __init__(self, in_channels, out_channels, time_embed_dim, class_embed_dim=None, kernel_size=3):
         super().__init__()
-        if class_embed_dim is None:
-            class_embed_dim = time_embed_dim
-
         padding = kernel_size // 2
 
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
@@ -160,46 +147,33 @@ class ResidualBlock(nn.Module):
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act2 = nn.SiLU()
 
-        # Time FiLM: scale + shift (作用在 norm1 之后)
+        # Combined FiLM: t+y → scale + shift
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_embed_dim, out_channels * 2)
         )
 
-        # Class FiLM: 独立的 scale + shift (作用在 norm2 之后)
-        self.class_mlp = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(class_embed_dim, out_channels * 2)
-        )
-
         self.residual_conv = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
-    def forward(self, x, t_emb, c_emb=None):
+    def forward(self, x, cond_emb, c_emb=None):
         """
         x: (B, C, H, W)
-        t_emb: (B, time_embed_dim) - 纯时间信息
-        c_emb: (B, class_embed_dim) - 纯类别信息 (可选)
+        cond_emb: (B, time_embed_dim) - combined t+y embedding
+        c_emb: ignored (保持接口兼容)
         """
         h = self.conv1(x)
         h = self.norm1(h)
 
-        # Time FiLM
-        t_style = self.time_mlp(t_emb)[:, :, None, None]
-        t_scale, t_shift = t_style.chunk(2, dim=1)
-        h = h * (1 + t_scale) + t_shift
+        # Combined AdaGN
+        style = self.time_mlp(cond_emb)[:, :, None, None]
+        scale, shift = style.chunk(2, dim=1)
+        h = h * (1 + scale) + shift
         h = self.act1(h)
 
-        # 第二层卷积
         h = self.conv2(h)
         h = self.norm2(h)
-
-        # Class FiLM (独立通路, 不经过 time)
-        if c_emb is not None:
-            c_style = self.class_mlp(c_emb)[:, :, None, None]
-            c_scale, c_shift = c_style.chunk(2, dim=1)
-            h = h * (1 + c_scale) + c_shift
-
         h = self.act2(h)
+
         return h + self.residual_conv(x)
 
 class AttentionBlock(nn.Module):
@@ -223,9 +197,10 @@ class AttentionBlock(nn.Module):
 
 class ConditionalUnet(nn.Module):
     """
-    Input-level + Dual-FiLM Conditional UNet.
-    Class one-hot 直接拼到图像通道上 (不可能被忽略),
-    同时保留 FiLM 调制用于细粒度控制.
+    Time-weighted AdaGN Conditional UNet (原始 Acc=0.6 架构):
+    - get_time_weight: sin 曲线, 中间 t 放大 class 信号 4x
+    - cond_emb = t_emb + y_emb * w_t → 单路 AdaGN
+    - 无 input-level concat (Dual-FiLM 实验证明不如此方案)
     """
     def __init__(self, in_channels=1, base_channels=64, num_classes=10, time_emb_dim=256):
         super().__init__()
@@ -240,17 +215,12 @@ class ConditionalUnet(nn.Module):
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
-        # Class 通路 (用于 FiLM)
+        # Class 通路: Embedding → 256 维
         self.label_emb = nn.Embedding(num_classes, time_emb_dim)
-        self.label_mlp = nn.Sequential(
-            nn.Linear(time_emb_dim, time_emb_dim),
-            nn.SiLU(),
-            nn.Linear(time_emb_dim, time_emb_dim),
-        )
 
         ch = [base_channels, base_channels * 2, base_channels * 4]
-        # ★ 输入通道 = 图像通道 + K 个 class 通道
-        self.init_conv = nn.Conv2d(in_channels + num_classes, ch[0], 3, padding=1)
+        # 输入: 纯图像通道 (无 class concat)
+        self.init_conv = nn.Conv2d(in_channels, ch[0], 3, padding=1)
 
         self.downs = nn.ModuleList([
             nn.ModuleList([
@@ -291,7 +261,7 @@ class ConditionalUnet(nn.Module):
         # 1. Time embedding
         t_emb = self.time_mlp(t)
 
-        # 2. Class → one-hot (处理多种输入格式)
+        # 2. Class → one-hot → embedding
         if y_cond.dim() == 1:
             y_onehot = F.one_hot(y_cond, self.num_classes).float()
         elif y_cond.dim() == 2 and y_cond.size(1) == self.num_classes:
@@ -299,27 +269,24 @@ class ConditionalUnet(nn.Module):
         else:
             raise ValueError("y_cond format error")
 
-        # 3. Class embedding for FiLM
-        y_emb = y_onehot @ self.label_emb.weight
-        c_emb = self.label_mlp(y_emb)
+        y_emb = y_onehot @ self.label_emb.weight  # [B, 256]
 
-        # 4. ★ Input-level conditioning: 拼到图像通道上
-        # x_t 在 t=200 时幅度约 ±2~3, class 通道需要同等量级才不会被淹没
-        # 用双极编码: 选中的 class = +1, 未选中 = -1, 再乘 scale
-        B, _, H, W = x.shape
-        c_bipolar = 2.0 * y_onehot - 1.0   # [B, K]: 选中 → +1, 未选中 → -1
-        cond_scale = 3.0  # 让 class 通道幅度 ≈ x_t 幅度
-        c_spatial = (c_bipolar * cond_scale)[:, :, None, None].expand(B, self.num_classes, H, W)
-        x_in = torch.cat([x, c_spatial], dim=1)  # [B, C+K, H, W]
+        # 3. ★ 核心: 时间步动态权重
+        #    中间 t (≈500) 放大 4x, 极端 t (≈0, ≈1000) 保持 1x
+        w_t = get_time_weight(t, max_steps=1000)  # [B, 1]
+        y_emb = y_emb * w_t
 
-        # 5. UNet
-        x = self.init_conv(x_in)
+        # 4. 融合: combined embedding
+        cond_emb = t_emb + y_emb
+
+        # 5. UNet (纯图像输入, 无 class concat)
+        x = self.init_conv(x)
         skips = [x]
 
         for down_block_set in self.downs:
             for module in down_block_set:
                 if isinstance(module, ResidualBlock):
-                    x = module(x, t_emb, c_emb)
+                    x = module(x, cond_emb)
                 elif isinstance(module, AttentionBlock):
                     x = module(x)
                 else:
@@ -330,7 +297,7 @@ class ConditionalUnet(nn.Module):
 
         for block in self.bottleneck:
             if isinstance(block, ResidualBlock):
-                x = block(x, t_emb, c_emb)
+                x = block(x, cond_emb)
             else:
                 x = block(x)
 
@@ -341,7 +308,7 @@ class ConditionalUnet(nn.Module):
             x = torch.cat([x, skip], dim=1)
             for module in up_block_set:
                 if isinstance(module, ResidualBlock):
-                    x = module(x, t_emb, c_emb)
+                    x = module(x, cond_emb)
                 elif isinstance(module, AttentionBlock):
                     x = module(x)
                 else:

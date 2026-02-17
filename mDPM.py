@@ -1,17 +1,17 @@
-# mDPM.py — 在线 EM + π 固定 (T=1000)
+# mDPM.py — 在线 EM + π 固定 + 原始 0.6 架构 (T=1000)
 # ═══════════════════════════════════════════════════════════════
-# 在线 EM 框架 (验证过 Acc=0.5-0.6):
-#   每个 batch: E-step(算posterior) + M-step(训denoiser)
+# 还原原始 Acc=0.6 的完整配置:
 #
-# π 固定为 uniform 1/K:
-#   所有 π 更新方案均导致 component collapse (深度聚类已知问题):
-#   - 梯度更新 (label_loss): rich-get-richer → 坍缩
-#   - 闭式解 hard count + clamp: 坍缩
-#   - 论文式 soft resp 均值 + clamp: 坍缩
-#   - soft resp + EMA + 双向 clamp: 不坍缩但 Acc 仅 0.35
-#   文献支撑: Dilokthanakul 2016 (GMVAE cluster degeneracy),
-#             DPSL (MoE expert collapse), DCE (DPM posterior collapse)
-#   对 MNIST 等类别均匀数据, 固定 π=1/K 等价于强 Dirichlet 先验
+# 架构 (common_dpm.py):
+#   - get_time_weight: sin曲线, 中间t放大4x class信号
+#   - Combined AdaGN: cond_emb = t_emb + y_emb*w_t → 单路FiLM
+#   - 无 input-level concat, 无 Dual-FiLM
+#
+# E-step:
+#   - t ∈ [100, 900] (过滤极端时间步, 减少方差)
+#   - M=5, scale 5→20→134
+#
+# π 固定为 uniform 1/K (所有更新方案均 collapse)
 # ═══════════════════════════════════════════════════════════════
 
 import torch
@@ -81,7 +81,8 @@ class mDPM(nn.Module):
 
         with torch.no_grad():
             for _ in range(M):
-                t = torch.randint(1, cfg.timesteps, (B,), device=device).long()
+                # E-step 采样 t∈[100, 900]: 过滤极端时间步, 减少方差
+                t = torch.randint(100, 900, (B,), device=device).long()
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
 
@@ -149,7 +150,7 @@ def evaluate_model(model, loader, cfg):
     """
     model.eval()
     preds, ys_true = [], []
-    eval_t = cfg.timesteps // 2  # T=100 → t=50
+    eval_t = cfg.timesteps // 2  # T=1000 → t=500
     n_repeats = 3
 
     for x_0, y_true in loader:
@@ -495,8 +496,10 @@ def main():
     cfg.final_epochs = 60
 
     print("=" * 60)
-    print("🔓 Online EM + Fixed π (T=1000)")
+    print("🔓 Online EM + Fixed π + Time-weighted AdaGN (T=1000)")
     print(f"   T={cfg.timesteps}, M={cfg.posterior_sample_steps}")
+    print(f"   Architecture: get_time_weight + combined AdaGN (原始0.6版本)")
+    print(f"   E-step t∈[100,900], Eval t=500")
     print("=" * 60)
 
     os.makedirs(cfg.output_dir, exist_ok=True)
