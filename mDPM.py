@@ -311,6 +311,103 @@ def plot_dashboard(history, outpath):
 
 
 @torch.no_grad()
+def assign_pseudo_labels(model, loader, cfg, cluster_mapping=None):
+    """
+    用当前模型给所有数据打 pseudo-label (高 scale, 高置信度)
+    返回 {index: label} 字典
+    """
+    model.eval()
+    all_labels = {}
+    all_confs = {}
+    idx = 0
+    scale = 134.0  # 最高 scale → 最尖锐的 posterior
+
+    for x_batch, _ in loader:
+        x_batch = x_batch.to(cfg.device)
+        logits = model.estimate_posterior_logits(x_batch, cfg, scale_factor=scale)
+        resp = F.softmax(logits, dim=1)
+        confs, labels = resp.max(dim=1)
+        for i in range(x_batch.size(0)):
+            lbl = labels[i].item()
+            if cluster_mapping:
+                lbl = cluster_mapping.get(lbl, lbl)
+            all_labels[idx] = lbl
+            all_confs[idx] = confs[i].item()
+            idx += 1
+    return all_labels, all_confs
+
+
+def run_generation_finetune(model, optimizer, unlabeled_loader, cfg,
+                             pseudo_labels, pseudo_confs,
+                             finetune_epochs=40, conf_threshold=0.5):
+    """
+    阶段二: 生成质量微调
+    用聚类结果作为固定标签, 纯粹训练 conditional diffusion
+    不做 E-step, 不更新 pseudo-label → denoiser 在干净标签上专心学生成
+    只用高置信度样本 (conf > threshold)
+    """
+    print(f"\n{'='*60}")
+    print(f"🎨 Generation Fine-tuning ({finetune_epochs} epochs)")
+    print(f"   Conf threshold: {conf_threshold}")
+    n_total = len(pseudo_labels)
+    n_used = sum(1 for c in pseudo_confs.values() if c >= conf_threshold)
+    print(f"   Using {n_used}/{n_total} samples ({n_used/n_total*100:.1f}%)")
+    print(f"{'='*60}")
+
+    for epoch in range(1, finetune_epochs + 1):
+        model.train()
+        ep_loss = 0.0
+        n_batches = 0
+        sample_idx = 0
+
+        for x_batch, _ in unlabeled_loader:
+            B = x_batch.size(0)
+            x_batch = x_batch.to(cfg.device)
+
+            # 取该 batch 的 pseudo-label 和 confidence
+            labels = []
+            mask = []
+            for i in range(B):
+                gi = sample_idx + i
+                if gi in pseudo_labels:
+                    labels.append(pseudo_labels[gi])
+                    mask.append(1.0 if pseudo_confs.get(gi, 0) >= conf_threshold else 0.0)
+                else:
+                    labels.append(0)
+                    mask.append(0.0)
+            sample_idx += B
+
+            labels_t = torch.tensor(labels, dtype=torch.long, device=cfg.device)
+            mask_t = torch.tensor(mask, dtype=torch.float, device=cfg.device)
+
+            if mask_t.sum() < 1:
+                continue
+
+            # 标准 conditional diffusion 训练 (无 E-step)
+            y_target = F.one_hot(labels_t, cfg.num_classes).float()
+            t_train = torch.randint(0, cfg.timesteps, (B,), device=cfg.device).long()
+            noise = torch.randn_like(x_batch)
+            x_t = model.dpm_process.q_sample(x_batch, t_train, noise)
+            pred_noise = model.cond_denoiser(x_t, t_train, y_target)
+            loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
+            loss = (loss_per * mask_t).sum() / (mask_t.sum() + 1e-8)
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            ep_loss += loss.item()
+            n_batches += 1
+
+        avg_loss = ep_loss / max(n_batches, 1)
+        if epoch % 10 == 0 or epoch == 1:
+            print(f"   [GenFT Ep {epoch}/{finetune_epochs}] Loss={avg_loss:.5f}")
+
+    print(f"   ✅ Generation fine-tuning complete")
+
+
+@torch.no_grad()
 def sample_and_save(model, cfg, out_path, n_per_class=10, cluster_mapping=None):
     T = model.dpm_process.timesteps
     model.cond_denoiser.eval()
@@ -518,29 +615,40 @@ def main():
         'threshold_final': 0.036,
     }
 
-    print(f"\n🚀 Training:")
-    print(f"   LR=4.01e-05")
-    print(f"   Scale: 5→20 (warmup 10ep, soft) → 20→134 (refine, hard)")
-    print(f"   π = uniform 1/K (FIXED)")
-    print(f"   Epochs: {hyperparams['total_epochs']}")
-    print(f"   (π 更新实验结论: 所有方案均 collapse, 固定最优)")
+    print(f"\n🎨 Phase 2 ONLY: Generation fine-tune (40 ep, fixed labels, LR=1e-5)")
 
-    best_acc, best_mapping = run_training(
-        model, optimizer, unlabeled_loader, val_loader, cfg,
-        hyperparams=hyperparams, is_final=True)
-
-    print(f"\n✅ Done. Best Acc: {best_acc:.4f}")
-
-    # 加载 best model 生成 samples
+    # 跳过阶段一, 直接加载 best model
     best_ckpt = os.path.join(cfg.output_dir, "best_model.pt")
-    if os.path.exists(best_ckpt):
-        ckpt = torch.load(best_ckpt, map_location=cfg.device, weights_only=False)
-        model.load_state_dict(ckpt['model_state_dict'])
-        best_mapping = ckpt.get('cluster_mapping', best_mapping)
-        print(f"   Loaded best model (Acc={ckpt.get('acc', '?'):.4f})")
+    ckpt = torch.load(best_ckpt, map_location=cfg.device, weights_only=False)
+    model.load_state_dict(ckpt['model_state_dict'])
+    best_mapping = ckpt.get('cluster_mapping', {})
+    best_acc = ckpt.get('acc', 0)
+    print(f"   Loaded best model (Acc={best_acc:.4f})")
+    print(f"   Cluster mapping: {best_mapping}")
 
+    # 先保存聚类阶段的 samples (对比用)
+    sample_and_save(model, cfg, os.path.join(cfg.output_dir, "phase1_samples.png"),
+                    cluster_mapping=best_mapping)
+
+    # ── 阶段二: 生成质量微调 ──
+    # 用聚类结果作为固定标签, 纯训练 conditional diffusion
+    pseudo_labels, pseudo_confs = assign_pseudo_labels(
+        model, unlabeled_loader, cfg, cluster_mapping=best_mapping)
+
+    # 降低 LR 微调
+    ft_optimizer = torch.optim.Adam(model.parameters(), lr=1e-05)
+    run_generation_finetune(
+        model, ft_optimizer, unlabeled_loader, cfg,
+        pseudo_labels, pseudo_confs,
+        finetune_epochs=40, conf_threshold=0.5)
+
+    # 微调后的 samples
     sample_and_save(model, cfg, os.path.join(cfg.output_dir, "final_samples.png"),
                     cluster_mapping=best_mapping)
+
+    # 微调后再评估 Acc (应该不变或略变)
+    final_acc, _, final_nmi, _ = evaluate_model(model, val_loader, cfg)
+    print(f"\n📊 Final: Acc={final_acc:.4f} NMI={final_nmi:.4f} (聚类后微调生成)")
 
     # Save config
     cfg_dict = {k: v for k, v in vars(cfg).items()
