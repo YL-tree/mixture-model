@@ -354,8 +354,8 @@ def assign_pseudo_labels(model, loader, cfg, cluster_mapping=None):
 
         for i in range(B):
             lbl = pred_labels[i].item()
-            if cluster_mapping:
-                lbl = cluster_mapping.get(lbl, lbl)
+            # 注意: 不做 cluster_mapping! denoiser 内部用的是 raw cluster ID
+            # mapping 只在 sample_and_save 里用于显示排序
             all_labels[idx] = lbl
             all_confs[idx] = conf[i].item()
             idx += 1
@@ -678,13 +678,14 @@ def main():
         pseudo_labels, pseudo_confs,
         finetune_epochs=40, conf_threshold=adaptive_threshold)
 
-    # 微调后的 samples
-    sample_and_save(model, cfg, os.path.join(cfg.output_dir, "final_samples.png"),
-                    cluster_mapping=best_mapping)
+    # 微调后重新评估 (重算 cluster mapping, 因为 denoiser 权重变了)
+    final_acc, final_mapping, final_nmi, final_freq = evaluate_model(model, val_loader, cfg)
+    print(f"\n📊 Final: Acc={final_acc:.4f} NMI={final_nmi:.4f}")
+    print(f"   New cluster mapping: {final_mapping}")
 
-    # 微调后再评估 Acc (应该不变或略变)
-    final_acc, _, final_nmi, _ = evaluate_model(model, val_loader, cfg)
-    print(f"\n📊 Final: Acc={final_acc:.4f} NMI={final_nmi:.4f} (聚类后微调生成)")
+    # 用新 mapping 生成 samples
+    sample_and_save(model, cfg, os.path.join(cfg.output_dir, "final_samples.png"),
+                    cluster_mapping=final_mapping)
 
     # Save config
     cfg_dict = {k: v for k, v in vars(cfg).items()
