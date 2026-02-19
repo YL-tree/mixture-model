@@ -154,8 +154,16 @@ class mDPM(nn.Module):
                     total_steps += 1
 
             avg_neg_mse = accum_neg_mse / max(total_steps, 1)
+
+            # ★ Z-Score Normalization (你原始代码的核心!)
+            # 没有这个, 类间 MSE 差异极小 (~0.001), softmax 接近 uniform
+            # Z-score 把差异拉到 [-2, +2], 再乘 scale → 尖锐的 posterior
+            mean_lik = avg_neg_mse.mean(dim=1, keepdim=True)
+            std_lik = avg_neg_mse.std(dim=1, keepdim=True)
+            normalized_lik = (avg_neg_mse - mean_lik) / (std_lik + 1e-8)
+
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
-            logits = log_pi + avg_neg_mse * scale_factor
+            logits = log_pi + normalized_lik * scale_factor
         return logits
 
     def forward_unlabeled(self, x_0, cfg, scale_factor=1.0, **kwargs):
@@ -174,6 +182,10 @@ class mDPM(nn.Module):
         # E-step
         logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
         resp = F.softmax(logits, dim=1)  # (B, K)
+
+        # ★ 释放 E-step 的中间显存
+        if x_0.is_cuda:
+            torch.cuda.empty_cache()
 
         # M-step: 加权 soft-EM (原始方式)
         t_train = torch.randint(0, cfg.timesteps, (B,), device=x_0.device).long()
@@ -786,6 +798,8 @@ def main():
     parser.add_argument("--warmup_epochs", type=int, default=10)
     parser.add_argument("--threshold", type=float, default=0.036)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--batch_size", type=int, default=64,
+                        help="batch size (OOM时减到32)")
     parser.add_argument("--estep", default="fixed",
                         choices=["fixed", "multi", "random"],
                         help="E-step 模式: fixed=t=500×3(推荐) | multi=t=[300,500,700] | random=原始")
@@ -832,6 +846,7 @@ def main():
     # 设置半监督参数
     cfg.alpha_unlabeled = args.alpha_unlabeled
     cfg.estep_mode = args.estep
+    cfg.batch_size = args.batch_size
 
     hyperparams = {
         'total_epochs': args.epochs,
