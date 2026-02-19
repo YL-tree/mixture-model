@@ -82,53 +82,119 @@ class mDPM(nn.Module):
         self.register_buffer('pi', torch.ones(cfg.num_classes) / cfg.num_classes)
 
     def estimate_posterior_logits(self, x_0, cfg, scale_factor=1.0):
+        """
+        改进的 E-step — 对齐 evaluate_model 的做法
+        
+        原始问题:
+          random t∈[100,900], 每个样本 t 不同 → 方差大
+          同一张图在 t=150 和 t=850 的 MSE 差异 >> 不同 class 的 MSE 差异
+          → 被 t 的随机性淹没, posterior 质量差
+        
+        改进:
+          固定 t 值 (全 batch 同一个 t), 多次不同噪声取平均
+          和 evaluate_model 一样的做法, 但计算量更少
+        
+        可通过 cfg.estep_mode 切换:
+          'fixed'  = 固定 t=500, 3次噪声 (推荐, 和 evaluate 一致)
+          'multi'  = 固定 t=[300,500,700], 各1次噪声
+          'random' = 原始随机 t (fallback)
+        """
         B = x_0.size(0)
         K = self.K
-        M = getattr(cfg, 'posterior_sample_steps', 5)
         device = x_0.device
+        estep_mode = getattr(cfg, 'estep_mode', 'fixed')
+
         accum_neg_mse = torch.zeros(B, K, device=device)
+        total_steps = 0
+
         with torch.no_grad():
-            for _ in range(M):
-                t = torch.randint(100, 900, (B,), device=device).long()
-                noise = torch.randn_like(x_0)
-                x_t = self.dpm_process.q_sample(x_0, t, noise)
-                for k in range(K):
-                    y_oh = F.one_hot(torch.full((B,), k, device=device,
-                                                 dtype=torch.long), K).float()
-                    pred = self.cond_denoiser(x_t, t, y_oh)
-                    mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
-                    accum_neg_mse[:, k] += -mse
-            avg_neg_mse = accum_neg_mse / M
+            if estep_mode == 'fixed':
+                # ★ 推荐: 固定 t=T//2, 重复 n_repeats 次 (和 evaluate 一致)
+                eval_t = cfg.timesteps // 2
+                n_repeats = getattr(cfg, 'estep_repeats', 3)
+                for _ in range(n_repeats):
+                    t = torch.full((B,), eval_t, device=device, dtype=torch.long)
+                    noise = torch.randn_like(x_0)
+                    x_t = self.dpm_process.q_sample(x_0, t, noise)
+                    for k in range(K):
+                        y_oh = F.one_hot(torch.full((B,), k, device=device,
+                                                     dtype=torch.long), K).float()
+                        pred = self.cond_denoiser(x_t, t, y_oh)
+                        mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
+                        accum_neg_mse[:, k] += -mse
+                    total_steps += 1
+
+            elif estep_mode == 'multi':
+                # 多个固定 t, 每个 1 次
+                eval_ts = [300, 500, 700]
+                for eval_t in eval_ts:
+                    t = torch.full((B,), eval_t, device=device, dtype=torch.long)
+                    noise = torch.randn_like(x_0)
+                    x_t = self.dpm_process.q_sample(x_0, t, noise)
+                    for k in range(K):
+                        y_oh = F.one_hot(torch.full((B,), k, device=device,
+                                                     dtype=torch.long), K).float()
+                        pred = self.cond_denoiser(x_t, t, y_oh)
+                        mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
+                        accum_neg_mse[:, k] += -mse
+                    total_steps += 1
+
+            else:  # 'random' — 原始方式
+                M = getattr(cfg, 'posterior_sample_steps', 5)
+                for _ in range(M):
+                    t = torch.randint(100, 900, (B,), device=device).long()
+                    noise = torch.randn_like(x_0)
+                    x_t = self.dpm_process.q_sample(x_0, t, noise)
+                    for k in range(K):
+                        y_oh = F.one_hot(torch.full((B,), k, device=device,
+                                                     dtype=torch.long), K).float()
+                        pred = self.cond_denoiser(x_t, t, y_oh)
+                        mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
+                        accum_neg_mse[:, k] += -mse
+                    total_steps += 1
+
+            avg_neg_mse = accum_neg_mse / max(total_steps, 1)
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
             logits = log_pi + avg_neg_mse * scale_factor
         return logits
 
-    def forward_unlabeled(self, x_0, cfg, scale_factor=1.0,
-                          use_hard_label=False, threshold=0.0):
-        """无监督 forward: E-step + M-step (原始逻辑)"""
+    def forward_unlabeled(self, x_0, cfg, scale_factor=1.0, **kwargs):
+        """
+        无监督 forward: E-step + M-step
+        
+        M-step 使用加权 soft-EM (和原始 mDPM.py 一致):
+          对所有 K 个 class 做 forward, 用 posterior 加权求和
+          每个 batch = K 次 denoiser forward → 训练效率高
+        
+        kwargs: 兼容旧接口 (use_hard_label, threshold 等已不使用)
+        """
         B = x_0.size(0)
+        K = self.K
+
+        # E-step
         logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
-        resp = F.softmax(logits, dim=1)
+        resp = F.softmax(logits, dim=1)  # (B, K)
 
-        if use_hard_label:
-            max_probs, pseudo_labels = resp.max(dim=1)
-            mask = (max_probs >= threshold).float()
-            y_target = F.one_hot(pseudo_labels, num_classes=self.K).float()
-        else:
-            pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
-            y_target = F.one_hot(pseudo_labels, num_classes=self.K).float()
-            mask = torch.ones(B, device=x_0.device)
-
+        # M-step: 加权 soft-EM (原始方式)
         t_train = torch.randint(0, cfg.timesteps, (B,), device=x_0.device).long()
         noise = torch.randn_like(x_0)
         x_t = self.dpm_process.q_sample(x_0, t_train, noise)
-        pred_noise = self.cond_denoiser(x_t, t_train, y_target)
-        loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
-        dpm_loss = (loss_per * mask).sum() / (mask.sum() + 1e-8)
 
-        return dpm_loss, {
-            'dpm_loss': dpm_loss.item(),
-            'mask_rate': mask.mean().item(),
+        weighted_dpm_loss = 0.0
+        for k in range(K):
+            y_onehot_k = F.one_hot(
+                torch.full((B,), k, device=x_0.device, dtype=torch.long), K
+            ).float()
+            pred_noise_k = self.cond_denoiser(x_t, t_train, y_onehot_k)
+            dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(B, -1).mean(dim=1)
+            weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
+
+        # pseudo_labels 用于统计 (argmax)
+        pseudo_labels = resp.argmax(dim=1)
+
+        return weighted_dpm_loss, {
+            'dpm_loss': weighted_dpm_loss.item(),
+            'mask_rate': 1.0,
             'pseudo_labels': pseudo_labels.detach(),
         }
 
@@ -720,6 +786,9 @@ def main():
     parser.add_argument("--warmup_epochs", type=int, default=10)
     parser.add_argument("--threshold", type=float, default=0.036)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--estep", default="fixed",
+                        choices=["fixed", "multi", "random"],
+                        help="E-step 模式: fixed=t=500×3(推荐) | multi=t=[300,500,700] | random=原始")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -748,6 +817,7 @@ def main():
         print(f"  全监督: 所有数据使用真实标签")
     else:
         print(f"  无监督: Scale 5→20→{args.target_scale}, π=uniform")
+    print(f"  E-step: {args.estep} mode")
     print(f"  EMA: decay=0.9999 (纯采样侧)")
     print("=" * 60)
 
@@ -761,6 +831,7 @@ def main():
 
     # 设置半监督参数
     cfg.alpha_unlabeled = args.alpha_unlabeled
+    cfg.estep_mode = args.estep
 
     hyperparams = {
         'total_epochs': args.epochs,
