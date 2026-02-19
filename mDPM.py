@@ -527,14 +527,24 @@ def train_fullsup(model, optimizer, labeled_loader, val_loader, cfg,
 # ============================================================
 def train_semisup(model, optimizer, labeled_loader, unlabeled_loader, val_loader,
                   cfg, ema=None, hyperparams=None):
+    """
+    半监督训练 — 还原原始 mDPM.py 的行为:
+      Phase 1 (epoch 1~sup_warmup): 纯监督, alpha_un=0
+        → denoiser 先学会用 class condition
+      Phase 2 (epoch sup_warmup+1~total): 监督 + 无监督 (在线 EM)
+        → unlabeled 数据的 EXPLORE→REFINE 从 Phase 2 开始算
+    """
     if hyperparams is None:
         hyperparams = {}
 
     total_epochs = hyperparams.get('total_epochs', 60)
     target_scale = hyperparams.get('target_scale', 134.0)
-    warmup_epochs = hyperparams.get('warmup_epochs', 10)
+    warmup_epochs = hyperparams.get('warmup_epochs', 10)  # 无监督部分的 EXPLORE 长度
     threshold_final = hyperparams.get('threshold_final', 0.036)
     alpha_labeled = hyperparams.get('alpha_labeled', 1.0)
+
+    # ★ 关键: 前 N 个 epoch 纯监督 (和原始代码一致)
+    sup_warmup = hyperparams.get('sup_warmup', 10)
 
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
@@ -546,68 +556,97 @@ def train_semisup(model, optimizer, labeled_loader, unlabeled_loader, val_loader
                "cond_ratio": [], "freq": [], "pi_entropy": []}
 
     for epoch in range(1, total_epochs + 1):
-        if epoch <= warmup_epochs:
-            use_hard = False
-            p1 = epoch / warmup_epochs
-            dynamic_scale = 5.0 + (20.0 - 5.0) * p1
+
+        # ── 判断阶段 ──
+        if epoch <= sup_warmup:
+            # Phase 1: 纯监督, 不用 unlabeled
+            current_alpha_un = 0.0
+            dynamic_scale = 0.0
             dynamic_threshold = 0.0
-            status = "EXPLORE"
+            use_hard = False
+            status = "SUP_ONLY"
         else:
-            use_hard = True
-            p2 = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
-            dynamic_scale = 20.0 + (target_scale - 20.0) * p2
-            dynamic_threshold = threshold_final * p2
-            status = "REFINE"
+            # Phase 2: 监督 + 无监督
+            current_alpha_un = cfg.alpha_unlabeled
+            em_epoch = epoch - sup_warmup  # 无监督部分的 epoch 计数
+            em_total = total_epochs - sup_warmup
+
+            if em_epoch <= warmup_epochs:
+                use_hard = False
+                p1 = em_epoch / warmup_epochs
+                dynamic_scale = 5.0 + (20.0 - 5.0) * p1
+                dynamic_threshold = 0.0
+                status = "EXPLORE"
+            else:
+                use_hard = True
+                p2 = (em_epoch - warmup_epochs) / (em_total - warmup_epochs + 1e-8)
+                dynamic_scale = 20.0 + (target_scale - 20.0) * p2
+                dynamic_threshold = threshold_final * p2
+                status = "REFINE"
 
         print(f"🔥 [Ep {epoch}/{total_epochs}] [{status}] "
-              f"Scale={dynamic_scale:.1f} α_lab={alpha_labeled}")
+              f"Scale={dynamic_scale:.1f} α_un={current_alpha_un:.1f} α_lab={alpha_labeled}")
 
         model.train()
         ep_loss, ep_mask, n_batches = 0.0, 0.0, 0
         epoch_labels = []
 
-        # ★ labeled 循环复用 (和 mVAE 一样)
-        labeled_iter = iter(labeled_loader)
+        if current_alpha_un > 0 and unlabeled_loader is not None:
+            # Phase 2: 遍历 unlabeled, labeled 循环复用
+            labeled_iter = iter(labeled_loader)
 
-        for x_un, _ in unlabeled_loader:
-            # labeled 用完就重新开始
-            try:
-                x_lab, y_lab = next(labeled_iter)
-            except StopIteration:
-                labeled_iter = iter(labeled_loader)
-                x_lab, y_lab = next(labeled_iter)
+            for x_un, _ in unlabeled_loader:
+                try:
+                    x_lab, y_lab = next(labeled_iter)
+                except StopIteration:
+                    labeled_iter = iter(labeled_loader)
+                    x_lab, y_lab = next(labeled_iter)
 
-            x_un = x_un.to(cfg.device)
-            x_lab = x_lab.to(cfg.device)
-            y_lab = y_lab.to(cfg.device)
+                x_un = x_un.to(cfg.device)
+                x_lab = x_lab.to(cfg.device)
+                y_lab = y_lab.to(cfg.device)
 
-            optimizer.zero_grad()
+                optimizer.zero_grad()
 
-            # 无监督部分 (在线 EM)
-            loss_un, info_un = model.forward_unlabeled(
-                x_un, cfg, scale_factor=dynamic_scale,
-                use_hard_label=use_hard, threshold=dynamic_threshold)
+                loss_un, info_un = model.forward_unlabeled(
+                    x_un, cfg, scale_factor=dynamic_scale,
+                    use_hard_label=use_hard, threshold=dynamic_threshold)
+                loss_lab, info_lab = model.forward_labeled(x_lab, y_lab, cfg)
 
-            # 有监督部分 (真实标签)
-            loss_lab, info_lab = model.forward_labeled(x_lab, y_lab, cfg)
+                loss = current_alpha_un * loss_un + alpha_labeled * loss_lab
 
-            # 总损失
-            loss = loss_un + alpha_labeled * loss_lab
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+                if ema and epoch >= 5:
+                    ema.update(model)
 
-            if ema and epoch >= 5:
-                ema.update(model)
+                ep_loss += loss.item()
+                ep_mask += info_un['mask_rate']
+                epoch_labels.append(info_un['pseudo_labels'].cpu())
+                n_batches += 1
+        else:
+            # Phase 1: 纯监督
+            for x_lab, y_lab in labeled_loader:
+                x_lab = x_lab.to(cfg.device)
+                y_lab = y_lab.to(cfg.device)
 
-            ep_loss += loss.item()
-            ep_mask += info_un['mask_rate']
-            epoch_labels.append(info_un['pseudo_labels'].cpu())
-            n_batches += 1
+                optimizer.zero_grad()
+                loss, info = model.forward_labeled(x_lab, y_lab, cfg)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                if ema and epoch >= 5:
+                    ema.update(model)
+
+                ep_loss += loss.item()
+                epoch_labels.append(info['pseudo_labels'].cpu())
+                n_batches += 1
 
         avg_loss = ep_loss / max(n_batches, 1)
-        pass_pct = (ep_mask / max(n_batches, 1)) * 100
+        pass_pct = (ep_mask / max(n_batches, 1)) * 100 if ep_mask > 0 else 100.0
         all_labels = torch.cat(epoch_labels)
         label_freq = np.bincount(all_labels.numpy(), minlength=cfg.num_classes).astype(float)
         label_freq = label_freq / label_freq.sum()
@@ -673,6 +712,10 @@ def main():
                         help="semisup 模式下每类的标签数")
     parser.add_argument("--alpha_labeled", type=float, default=1.0,
                         help="semisup 模式下有监督损失的权重")
+    parser.add_argument("--alpha_unlabeled", type=float, default=1.0,
+                        help="semisup 模式下无监督损失的权重")
+    parser.add_argument("--sup_warmup", type=int, default=10,
+                        help="semisup 模式下前 N epoch 纯监督 (不用 unlabeled)")
     parser.add_argument("--target_scale", type=float, default=134.37)
     parser.add_argument("--warmup_epochs", type=int, default=10)
     parser.add_argument("--threshold", type=float, default=0.036)
@@ -700,6 +743,7 @@ def main():
     print(f"  LR={args.lr}, Epochs={args.epochs}")
     if args.mode == "semisup":
         print(f"  Labeled/class: {args.labeled}, α_labeled: {args.alpha_labeled}")
+        print(f"  α_unlabeled: {args.alpha_unlabeled}, sup_warmup: {args.sup_warmup}ep")
     elif args.mode == "fullsup":
         print(f"  全监督: 所有数据使用真实标签")
     else:
@@ -715,12 +759,16 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     ema = EMA(model, decay=0.9999)
 
+    # 设置半监督参数
+    cfg.alpha_unlabeled = args.alpha_unlabeled
+
     hyperparams = {
         'total_epochs': args.epochs,
         'target_scale': args.target_scale,
         'warmup_epochs': args.warmup_epochs,
         'threshold_final': args.threshold,
         'alpha_labeled': args.alpha_labeled,
+        'sup_warmup': args.sup_warmup,
     }
 
     # 训练
