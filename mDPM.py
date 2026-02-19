@@ -313,27 +313,58 @@ def plot_dashboard(history, outpath):
 @torch.no_grad()
 def assign_pseudo_labels(model, loader, cfg, cluster_mapping=None):
     """
-    用当前模型给所有数据打 pseudo-label (高 scale, 高置信度)
-    返回 {index: label} 字典
+    用 eval 方式给所有数据打 pseudo-label (固定 t=500, repeat=3)
+    这和评估时一样, Acc=0.69 的标签质量
+    同时输出每个样本的 "confidence" = 次低MSE - 最低MSE (间距越大越确定)
     """
     model.eval()
+    eval_t = cfg.timesteps // 2  # 500
+    n_repeats = 3
+    K = cfg.num_classes
+
     all_labels = {}
     all_confs = {}
     idx = 0
-    scale = 134.0  # 最高 scale → 最尖锐的 posterior
 
-    for x_batch, _ in loader:
-        x_batch = x_batch.to(cfg.device)
-        logits = model.estimate_posterior_logits(x_batch, cfg, scale_factor=scale)
-        resp = F.softmax(logits, dim=1)
-        confs, labels = resp.max(dim=1)
-        for i in range(x_batch.size(0)):
-            lbl = labels[i].item()
+    for x_0, _ in loader:
+        x_0 = x_0.to(cfg.device)
+        B = x_0.size(0)
+        cumulative_mse = torch.zeros(B, K, device=cfg.device)
+
+        for _ in range(n_repeats):
+            noise = torch.randn_like(x_0)
+            t = torch.full((B,), eval_t, device=cfg.device, dtype=torch.long)
+            x_t = model.dpm_process.q_sample(x_0, t, noise)
+            for k in range(K):
+                y_oh = F.one_hot(torch.full((B,), k, device=cfg.device,
+                                             dtype=torch.long), K).float()
+                pred = model.cond_denoiser(x_t, t, y_oh)
+                mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
+                cumulative_mse[:, k] += mse
+
+        # argmin MSE = predicted class
+        avg_mse = cumulative_mse / n_repeats
+        sorted_mse, _ = avg_mse.sort(dim=1)
+        pred_labels = torch.argmin(avg_mse, dim=1)
+        # confidence = gap between best and second best (越大越确定)
+        gaps = sorted_mse[:, 1] - sorted_mse[:, 0]  # second_best - best
+        # 归一化: gap / avg_mse → 相对间距
+        avg_all = avg_mse.mean(dim=1)
+        conf = gaps / (avg_all + 1e-8)
+
+        for i in range(B):
+            lbl = pred_labels[i].item()
             if cluster_mapping:
                 lbl = cluster_mapping.get(lbl, lbl)
             all_labels[idx] = lbl
-            all_confs[idx] = confs[i].item()
+            all_confs[idx] = conf[i].item()
             idx += 1
+
+    # 统计置信度分布
+    confs = list(all_confs.values())
+    print(f"   Confidence stats: min={min(confs):.4f} median={np.median(confs):.4f} "
+          f"max={max(confs):.4f} mean={np.mean(confs):.4f}")
+
     return all_labels, all_confs
 
 
@@ -637,10 +668,15 @@ def main():
 
     # 降低 LR 微调
     ft_optimizer = torch.optim.Adam(model.parameters(), lr=1e-05)
+    # 自适应阈值: 取 top 70% 置信度的样本 (和 Acc≈0.7 吻合)
+    confs_sorted = sorted(pseudo_confs.values())
+    adaptive_threshold = confs_sorted[int(len(confs_sorted) * 0.3)]  # 30th percentile = bottom 30% 被过滤
+    print(f"   Adaptive conf threshold (top 70%): {adaptive_threshold:.4f}")
+
     run_generation_finetune(
         model, ft_optimizer, unlabeled_loader, cfg,
         pseudo_labels, pseudo_confs,
-        finetune_epochs=40, conf_threshold=0.5)
+        finetune_epochs=40, conf_threshold=adaptive_threshold)
 
     # 微调后的 samples
     sample_and_save(model, cfg, os.path.join(cfg.output_dir, "final_samples.png"),
