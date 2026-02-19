@@ -46,8 +46,9 @@ class Config:
         self.timesteps = 1000
         self.image_channels = 1
 
-        # [MOD] 增大模型容量: 32→64
-        self.unet_base_channels = 64
+        # [FIX] 保持 32 — 容量太大会让模型忽略 class condition
+        # 生成质量主要靠 EMA + CFG, 不靠容量
+        self.unet_base_channels = 32
         self.unet_time_emb_dim = 256
 
         # [NEW] EMA 参数

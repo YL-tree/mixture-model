@@ -24,7 +24,7 @@ from sklearn.metrics import normalized_mutual_info_score as NMI
 from torchvision.utils import save_image
 
 # ★ 导入改进版
-from common_dpm_improved import *
+from common_dpm import *
 
 
 # ============================================================
@@ -92,10 +92,14 @@ class mDPM(nn.Module):
         return logits
 
     def forward(self, x_0, cfg, scale_factor=1.0,
-                use_hard_label=False, threshold=0.0):
+                use_hard_label=False, threshold=0.0,
+                enable_cfg_dropout=False):
         """
-        在线 EM + [NEW] CFG dropout
-        M-step 中随机 10% 的样本 drop class → 训练 unconditional 分支
+        在线 EM + CFG dropout (仅 REFINE 阶段启用)
+        
+        关键: EXPLORE 阶段伪标签是噪声, 此时 drop class 会让模型
+        学到 "class = 无用信息" → conditioning 死亡 → 聚类坍缩
+        只有 REFINE 阶段伪标签有意义后, 才开启 CFG dropout
         """
         B = x_0.size(0)
 
@@ -117,10 +121,11 @@ class mDPM(nn.Module):
         noise = torch.randn_like(x_0)
         x_t = self.dpm_process.q_sample(x_0, t_train, noise)
 
-        # [NEW] CFG dropout: 随机 10% 的样本用全零 one-hot (unconditional)
-        if self.training and self.cfg_dropout_prob > 0:
+        # [FIX] CFG dropout 仅在 REFINE 阶段 + enable_cfg_dropout=True 时启用
+        # EXPLORE 阶段绝不 drop, 保护 conditioning 建立
+        if self.training and enable_cfg_dropout and self.cfg_dropout_prob > 0:
             drop_mask = torch.rand(B, device=x_0.device) < self.cfg_dropout_prob
-            y_target[drop_mask] = 0.0  # 全零 = unconditional
+            y_target[drop_mask] = 0.0
 
         pred_noise = self.cond_denoiser(x_t, t_train, y_target)
         loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
@@ -530,7 +535,8 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
             loss, info = model(x_batch, cfg,
                                scale_factor=dynamic_scale,
                                use_hard_label=use_hard,
-                               threshold=dynamic_threshold)
+                               threshold=dynamic_threshold,
+                               enable_cfg_dropout=use_hard)  # [FIX] 仅 REFINE 阶段开 CFG dropout
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -635,19 +641,21 @@ def main():
     cfg.output_dir = "./mDPM_results_improved"
     cfg.final_epochs = 80  # [MOD] 多训一些
 
-    # [NEW] 生成质量参数
-    cfg.unet_base_channels = 64       # 容量翻倍
+    # [FIX] 保持 base_channels=32 (原始聚类验证值)
+    # 容量太大会让模型忽略 class condition → 聚类坍缩
+    # 生成质量主要靠 EMA + CFG, 不靠容量
+    cfg.unet_base_channels = 32
     cfg.ema_decay = 0.9999
     cfg.ema_start_epoch = 5
-    cfg.cfg_dropout_prob = 0.1        # 10% drop class for CFG
+    cfg.cfg_dropout_prob = 0.1        # 10% drop class (仅 REFINE 阶段)
     cfg.cfg_guidance_scale = 2.0      # 采样 guidance 强度
 
     print("=" * 60)
     print("🔓 Improved: Online EM + EMA + CFG + DDIM")
     print(f"   T={cfg.timesteps}, M={cfg.posterior_sample_steps}")
-    print(f"   base_channels={cfg.unet_base_channels} (was 32)")
+    print(f"   base_channels={cfg.unet_base_channels} (保持原始值)")
     print(f"   EMA decay={cfg.ema_decay}, start_epoch={cfg.ema_start_epoch}")
-    print(f"   CFG dropout={cfg.cfg_dropout_prob}, guidance={cfg.cfg_guidance_scale}")
+    print(f"   CFG dropout={cfg.cfg_dropout_prob} (仅REFINE阶段), guidance={cfg.cfg_guidance_scale}")
     print("=" * 60)
 
     os.makedirs(cfg.output_dir, exist_ok=True)
