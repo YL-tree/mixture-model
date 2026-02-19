@@ -1,6 +1,14 @@
-# common_dpm.py — Time-weighted AdaGN 架构 (原始 Acc=0.6 版本)
-# 核心: get_time_weight() sin 曲线, 中间时间步放大 class 信号 4x
+# common_dpm_improved.py — 改进版: 增加 EMA + CFG + 更大容量
+# 
+# 改动总结:
+#   1. [NEW] EMA 类 — 生成质量的关键
+#   2. [NEW] CFG 支持 — 训练时随机 drop class (10%), 采样时做 guidance
+#   3. [MOD] base_channels 32→64, 增加模型容量
+#   4. [MOD] ResidualBlock 增加 Dropout 防过拟合
+#   5. [保留] get_time_weight sin 曲线 (聚类核心, 不动)
+
 import os
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,64 +19,81 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import normalized_mutual_info_score as NMI
 
+
 # -----------------------------------------------------
 # A. 配置类
 # -----------------------------------------------------
-
 class Config:
-    """
-    mDPM_SemiSup 模型的配置参数
-    """
     def __init__(self):
-        # ---------------------
-        # 训练和硬件设置
-        # ---------------------
-        # 自动检测可用设备
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.output_dir = "./mDPM_results_unsupervised_optuna"
+        self.output_dir = "./mDPM_results"
         self.batch_size = 64
         self.final_epochs = 100
-        self.optuna_epochs = 10 
-        self.lr = 1e-5                  # 学习率
-        self.labeled_per_class = 0      # 每类用于监督学习的样本数 (无监督)
-        
-        # ---------------------
-        # PVEM 框架权重
-        # ---------------------
-        self.alpha_unlabeled = 1        # 无标签数据损失的权重
-        # self.lambda_entropy = 0.05         # 熵惩罚项的权重 (Minimization)
-        
-        # [NEW] 论文中的 M (Monte Carlo steps for posterior estimation)
-        # 建议设置为 4 到 10。越大越准，但训练越慢。
-        self.posterior_sample_steps = 5
-        
-        # ---------------------
-        # Gumbel Softmax 退火参数
-        # ---------------------
-        self.initial_gumbel_temp = 1.0    
-        self.min_gumbel_temp = 0.5   
+        self.optuna_epochs = 10
+        self.lr = 1e-5
+        self.labeled_per_class = 0
 
-        self.gumbel_anneal_rate = 0.99  
-        self.current_gumbel_temp = self.initial_gumbel_temp 
-        
-        # ---------------------
-        # 模型结构和 DPM 参数
-        # ---------------------
-        self.num_classes = 10             # MNIST
-        self.timesteps = 1000             # 扩散总时间步 T (原始验证过的值)
-        self.image_channels = 1           # MNIST
-        
-        # U-Net 参数
-        self.unet_base_channels = 32      
-        self.unet_time_emb_dim = 256      
-        
+        self.alpha_unlabeled = 1
+        self.posterior_sample_steps = 5
+
+        # Gumbel Softmax
+        self.initial_gumbel_temp = 1.0
+        self.min_gumbel_temp = 0.5
+        self.gumbel_anneal_rate = 0.99
+        self.current_gumbel_temp = self.initial_gumbel_temp
+
+        self.num_classes = 10
+        self.timesteps = 1000
+        self.image_channels = 1
+
+        # [MOD] 增大模型容量: 32→64
+        self.unet_base_channels = 64
+        self.unet_time_emb_dim = 256
+
+        # [NEW] EMA 参数
+        self.ema_decay = 0.9999          # EMA 衰减率
+        self.ema_start_epoch = 5         # 前几个 epoch 不用 EMA (让模型先学)
+
+        # [NEW] CFG 参数
+        self.cfg_dropout_prob = 0.1      # 训练时 10% 概率 drop class condition
+        self.cfg_guidance_scale = 2.0    # 采样时 guidance 强度 (1.0=无, 2.0=温和, 3.0+=强)
+
         os.makedirs(self.output_dir, exist_ok=True)
 
+
 # -----------------------------------------------------
-# B. DPM 前向过程
+# [NEW] EMA — 指数移动平均
+# -----------------------------------------------------
+class EMA:
+    """
+    指数移动平均: 维护模型参数的平滑版本
+    采样时用 EMA 权重, 训练时用原始权重
+    这是扩散模型生成质量的 #1 关键因素
+    """
+    def __init__(self, model, decay=0.9999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        # 冻结 shadow 的梯度
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        """每个 training step 后调用"""
+        for s_param, m_param in zip(self.shadow.parameters(), model.parameters()):
+            s_param.data.mul_(self.decay).add_(m_param.data, alpha=1 - self.decay)
+
+    def get_model(self):
+        """返回 EMA 模型 (用于采样和评估)"""
+        return self.shadow
+
+
+# -----------------------------------------------------
+# B. DPM 前向过程 (无改动)
 # -----------------------------------------------------
 class DPMForwardProcess(nn.Module):
-    def __init__(self, timesteps: int = 1000, schedule: str = 'linear', image_channels: int = 1):
+    def __init__(self, timesteps=1000, schedule='linear', image_channels=1):
         super().__init__()
         self.timesteps = timesteps
         self.image_channels = image_channels
@@ -80,8 +105,6 @@ class DPMForwardProcess(nn.Module):
 
         self.register_buffer('alphas', 1.0 - self.betas)
         self.register_buffer('alphas_cumprod', torch.cumprod(self.alphas, dim=0))
-        
-        # 辅助变量
         self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(self.alphas_cumprod))
         self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - self.alphas_cumprod))
         self.register_buffer('alphas_cumprod_prev', F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0))
@@ -90,14 +113,15 @@ class DPMForwardProcess(nn.Module):
     def q_sample(self, x_0, t, noise=None):
         if noise is None:
             noise = torch.randn_like(x_0)
-        sqrt_alphas_cumprod_t = self._extract_t(self.sqrt_alphas_cumprod, t, x_0.shape)
-        sqrt_one_minus_alphas_cumprod_t = self._extract_t(self.sqrt_one_minus_alphas_cumprod, t, x_0.shape)
-        return sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
+        sqrt_ac = self._extract_t(self.sqrt_alphas_cumprod, t, x_0.shape)
+        sqrt_omc = self._extract_t(self.sqrt_one_minus_alphas_cumprod, t, x_0.shape)
+        return sqrt_ac * x_0 + sqrt_omc * noise
 
     def _extract_t(self, a, t, x_shape):
         batch_size = t.shape[0]
-        out = a.gather(-1, t.to(a.device)) 
+        out = a.gather(-1, t.to(a.device))
         return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+
 
 # -----------------------------------------------------
 # C. U-Net 组件
@@ -111,16 +135,13 @@ class SinusoidalPositionalEmbedding(nn.Module):
     def forward(self, t):
         device = t.device
         half_dim = self.dim // 2
-        embeddings = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = t.float().unsqueeze(1) * embeddings.unsqueeze(0)
-        embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=-1)
-        return embeddings
+        emb = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = t.float().unsqueeze(1) * emb.unsqueeze(0)
+        return torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
 
-# ── 核心创新: 时间步动态权重 ──
-# sin 曲线: t=500 权重最大(4x), t=0/1000 权重最小(1x)
-# 中间时间步噪声适中, class 信号最有用 → 放大
-# 极端时间步 (太清晰/太噪) → 抑制
+
+# 保留原始 sin 曲线时间权重 (聚类核心)
 def get_time_weight(t, max_steps=1000):
     t_norm = t.float() / max_steps
     base = 1.0
@@ -131,11 +152,11 @@ def get_time_weight(t, max_steps=1000):
 
 class ResidualBlock(nn.Module):
     """
-    Combined AdaGN ResidualBlock (原始 Acc=0.6 版本):
-    - 接收 combined embedding (t_emb + weighted y_emb)
-    - 单路 FiLM: scale/shift 同时编码时间和类别
+    Combined AdaGN ResidualBlock
+    [MOD] 增加 Dropout (防止大模型过拟合)
     """
-    def __init__(self, in_channels, out_channels, time_embed_dim, class_embed_dim=None, kernel_size=3):
+    def __init__(self, in_channels, out_channels, time_embed_dim, class_embed_dim=None,
+                 kernel_size=3, dropout=0.1):
         super().__init__()
         padding = kernel_size // 2
 
@@ -147,7 +168,9 @@ class ResidualBlock(nn.Module):
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.act2 = nn.SiLU()
 
-        # Combined FiLM: t+y → scale + shift
+        # [MOD] Dropout
+        self.dropout = nn.Dropout(dropout)
+
         self.time_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_embed_dim, out_channels * 2)
@@ -156,19 +179,14 @@ class ResidualBlock(nn.Module):
         self.residual_conv = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x, cond_emb, c_emb=None):
-        """
-        x: (B, C, H, W)
-        cond_emb: (B, time_embed_dim) - combined t+y embedding
-        c_emb: ignored (保持接口兼容)
-        """
         h = self.conv1(x)
         h = self.norm1(h)
 
-        # Combined AdaGN
         style = self.time_mlp(cond_emb)[:, :, None, None]
         scale, shift = style.chunk(2, dim=1)
         h = h * (1 + scale) + shift
         h = self.act1(h)
+        h = self.dropout(h)  # [MOD]
 
         h = self.conv2(h)
         h = self.norm2(h)
@@ -176,12 +194,13 @@ class ResidualBlock(nn.Module):
 
         return h + self.residual_conv(x)
 
+
 class AttentionBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.norm = nn.GroupNorm(8, channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, padding=0, bias=False)
-        self.proj_out = nn.Conv2d(channels, channels, kernel_size=1, padding=0)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1, bias=False)
+        self.proj_out = nn.Conv2d(channels, channels, kernel_size=1)
 
     def forward(self, x, cond_emb=None):
         h = self.norm(x)
@@ -195,12 +214,12 @@ class AttentionBlock(nn.Module):
         out = out.transpose(1, 2).reshape(x.shape)
         return x + self.proj_out(out)
 
+
 class ConditionalUnet(nn.Module):
     """
-    Time-weighted AdaGN Conditional UNet (原始 Acc=0.6 架构):
-    - get_time_weight: sin 曲线, 中间 t 放大 class 信号 4x
-    - cond_emb = t_emb + y_emb * w_t → 单路 AdaGN
-    - 无 input-level concat (Dual-FiLM 实验证明不如此方案)
+    改进版 UNet:
+    [MOD] base_channels 默认 64 (从32翻倍)
+    [NEW] CFG: 支持 uncond_flag, 当 y_cond 全零时 = unconditional
     """
     def __init__(self, in_channels=1, base_channels=64, num_classes=10, time_emb_dim=256):
         super().__init__()
@@ -208,18 +227,15 @@ class ConditionalUnet(nn.Module):
         self.num_classes = num_classes
         self.in_channels = in_channels
 
-        # Time 通路
         self.time_mlp = nn.Sequential(
             SinusoidalPositionalEmbedding(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim),
             nn.SiLU(),
             nn.Linear(time_emb_dim, time_emb_dim),
         )
-        # Class 通路: Embedding → 256 维
         self.label_emb = nn.Embedding(num_classes, time_emb_dim)
 
         ch = [base_channels, base_channels * 2, base_channels * 4]
-        # 输入: 纯图像通道 (无 class concat)
         self.init_conv = nn.Conv2d(in_channels, ch[0], 3, padding=1)
 
         self.downs = nn.ModuleList([
@@ -258,10 +274,12 @@ class ConditionalUnet(nn.Module):
         )
 
     def forward(self, x, t, y_cond):
-        # 1. Time embedding
+        """
+        y_cond: LongTensor, one-hot FloatTensor, 或全零 (unconditional)
+        全零 one-hot → y_emb 全零 → 纯 time conditioning = unconditional
+        """
         t_emb = self.time_mlp(t)
 
-        # 2. Class → one-hot → embedding
         if y_cond.dim() == 1:
             y_onehot = F.one_hot(y_cond, self.num_classes).float()
         elif y_cond.dim() == 2 and y_cond.size(1) == self.num_classes:
@@ -269,17 +287,15 @@ class ConditionalUnet(nn.Module):
         else:
             raise ValueError("y_cond format error")
 
-        y_emb = y_onehot @ self.label_emb.weight  # [B, 256]
+        y_emb = y_onehot @ self.label_emb.weight
 
-        # 3. ★ 核心: 时间步动态权重
-        #    中间 t (≈500) 放大 4x, 极端 t (≈0, ≈1000) 保持 1x
-        w_t = get_time_weight(t, max_steps=1000)  # [B, 1]
+        # 时间步动态权重 (保留)
+        w_t = get_time_weight(t, max_steps=1000)
         y_emb = y_emb * w_t
 
-        # 4. 融合: combined embedding
         cond_emb = t_emb + y_emb
 
-        # 5. UNet (纯图像输入, 无 class concat)
+        # UNet forward
         x = self.init_conv(x)
         skips = [x]
 
@@ -315,6 +331,8 @@ class ConditionalUnet(nn.Module):
                     x = module(x)
 
         return self.final_conv(x)
+
+
 # -----------------------------------------------------
 # D. 辅助函数
 # -----------------------------------------------------
@@ -325,68 +343,51 @@ def gumbel_softmax_sample(logits, temperature):
     return F.softmax((logits + gumbel) / (temperature + 1e-9), dim=-1)
 
 
-
-# common_dpm.py
-
 def get_semi_loaders(cfg, labeled_per_class=None):
-    if labeled_per_class is None: 
+    if labeled_per_class is None:
         labeled_per_class = cfg.labeled_per_class
 
-    # 1. 预处理
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,)) 
+        transforms.Normalize((0.5,), (0.5,))
     ])
-    
+
     dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     labels = np.array(dataset.targets)
-    
-    # 2. 划分数据索引
+
     labeled_idx, unlabeled_idx = [], []
-    
-    # 特殊情况：如果 labeled_per_class 为 -1，表示全监督（所有数据都有标签）
+
     if labeled_per_class == -1:
-        print("Dataset Mode: Fully Supervised (All Data Labeled)")
+        print("Dataset Mode: Fully Supervised")
         labeled_idx = list(range(len(dataset)))
-        unlabeled_idx = [] # 无标签为空
+        unlabeled_idx = []
     else:
-        # 正常半监督或无监督逻辑
         for c in range(cfg.num_classes):
             idx_c = np.where(labels == c)[0]
-            
-            # 如果 labeled_per_class 是 0，这里 count 就是 0
             count = min(labeled_per_class, len(idx_c))
-            
             labeled_idx.extend(idx_c[:count])
             unlabeled_idx.extend(idx_c[count:])
 
-    # 3. 构造 DataLoader
-    
-    # --- 处理有标签数据 ---
     if len(labeled_idx) > 0:
         labeled_set = Subset(dataset, labeled_idx)
         labeled_loader = DataLoader(labeled_set, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
     else:
-        # 关键修改：如果没有标签数据，直接返回 None
-        # 这会触发 run_training_session 进入 "UNSUPERVISED" 模式
         labeled_loader = None
-        
-    # --- 处理无标签数据 ---
+
     if len(unlabeled_idx) > 0:
         unlabeled_set = Subset(dataset, unlabeled_idx)
         unlabeled_loader = DataLoader(unlabeled_set, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
     else:
         unlabeled_loader = None
-        
-    # --- 处理验证集 ---
+
     val_indices = list(range(len(dataset)))[:int(0.1 * len(dataset))]
     val_set = Subset(dataset, val_indices)
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False)
-    
-    # 打印数据集统计信息，防止配错
+
     print(f"Dataset Split -> Labeled: {len(labeled_idx)} | Unlabeled: {len(unlabeled_idx)}")
-    
+
     return labeled_loader, unlabeled_loader, val_loader
+
 
 def plot_training_curves(metrics, outpath):
     plt.figure(figsize=(12, 5))
@@ -401,56 +402,46 @@ def plot_training_curves(metrics, outpath):
     if "PosteriorAcc" in metrics: ax2.plot(metrics["PosteriorAcc"], label="Acc", color='tab:red', linestyle='--')
     ax2.set_ylabel("Metric")
     ax2.legend(loc='upper right')
-    
+
     plt.tight_layout()
     plt.savefig(outpath)
     plt.close()
 
-if __name__ == "__main__":
-    print("==== Running ConditionalUnet shape check (Fixed) ====")
 
-    # 确保运行环境中的 data 目录存在
+if __name__ == "__main__":
+    print("==== Shape check (Improved) ====")
     os.makedirs('./data', exist_ok=True)
-    
     device = "cpu"
-    
-    # 实例化配置，用于获取 DPM 参数
     cfg = Config()
-    
+
     model = ConditionalUnet(
         in_channels=cfg.image_channels,
-        base_channels=32,   # 小一点速度更快
+        base_channels=cfg.unet_base_channels,
         num_classes=cfg.num_classes,
         time_emb_dim=cfg.unet_time_emb_dim
     ).to(device)
 
-    # 随机输入，符合你 MNIST 的 (B=4, C=1, H=28, W=28)
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"Model params: {n_params:.2f}M")
+
     x = torch.randn(4, 1, 28, 28).to(device)
     t = torch.randint(0, cfg.timesteps, (4,), device=device)
-    
-    # y_cond 可以是 one-hot 或 long label —— 两个都测
+
+    # Test conditional
     y_long = torch.randint(0, cfg.num_classes, (4,), device=device)
-    y_onehot = F.one_hot(y_long, num_classes=cfg.num_classes).float()
+    out1 = model(x, t, y_long)
+    assert out1.shape == (4, 1, 28, 28)
+    print("✓ Conditional forward OK")
 
-    print("\nTest 1: Using LongTensor labels (y_cond = Long)")
-    try:
-        out1 = model(x, t, y_long)
-        # 预期的输出形状：(B, C, H, W)
-        expected_shape = torch.Size([4, 1, 28, 28])
-        assert out1.shape == expected_shape, f"Expected {expected_shape}, but got {out1.shape}"
-        print(" ✓ Passed. Output shape:", out1.shape)
-    except Exception as e:
-        print(" ✗ FAILED with LongTensor labels!")
-        raise e
+    # Test unconditional (全零 one-hot = no class info)
+    y_uncond = torch.zeros(4, cfg.num_classes, device=device)
+    out2 = model(x, t, y_uncond)
+    assert out2.shape == (4, 1, 28, 28)
+    print("✓ Unconditional forward OK")
 
-    print("\nTest 2: Using one-hot labels (y_cond = Float)")
-    try:
-        out2 = model(x, t, y_onehot)
-        expected_shape = torch.Size([4, 1, 28, 28])
-        assert out2.shape == expected_shape, f"Expected {expected_shape}, but got {out2.shape}"
-        print(" ✓ Passed. Output shape:", out2.shape)
-    except Exception as e:
-        print(" ✗ FAILED with one-hot labels!")
-        raise e
+    # Test EMA
+    ema = EMA(model, decay=0.9999)
+    ema.update(model)
+    print("✓ EMA OK")
 
-    print("\n==== Shape check finished successfully! The ConditionalUnet structure is now correct. ====")
+    print("==== All checks passed! ====")
