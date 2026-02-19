@@ -1,19 +1,21 @@
-# mDPM_patched.py — 只加 EMA + 改进采样, 训练逻辑零改动
+# mDPM_aligned.py — 统一入口: unsup / semisup / fullsup
 # ═══════════════════════════════════════════════════════════════
-# 基于你的原始 mDPM.py, 只有 3 处 [PATCH] 标记的改动:
-#   1. 导入 sampling_patch
-#   2. 训练循环加 ema.update() (一行)
-#   3. 采样时用 EMA + DDIM
+# 用法:
+#   python mDPM_aligned.py --mode unsup                    # 无监督 (原始)
+#   python mDPM_aligned.py --mode semisup --labeled 100    # 半监督, 每类100标签
+#   python mDPM_aligned.py --mode fullsup                  # 全监督
+#   python mDPM_aligned.py --mode unsup --epochs 80        # 自定义 epoch
 #
-# 依赖: 你原始的 common_dpm.py (不改!) + sampling_patch.py
+# 架构完全不改, 训练逻辑不改, 只加:
+#   - argparse 统一入口
+#   - fullsup / semisup 训练分支
+#   - EMA (纯采样侧, 不影响训练)
 # ═══════════════════════════════════════════════════════════════
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os
-import json
-import random
+import os, json, copy, argparse, random
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -22,15 +24,32 @@ from scipy.optimize import linear_sum_assignment
 from sklearn.metrics import normalized_mutual_info_score as NMI
 from torchvision.utils import save_image
 
-# 用你原始的 common_dpm.py (不改!)
+# 用你原始的 common_dpm.py (一个字不改)
 from common_dpm import *
-
-# [PATCH 1] 导入采样补丁
-from sampling_patch import EMA, sample_and_save_improved
 
 
 # ============================================================
-# 0. Utilities (原始, 不改)
+# 0. EMA (纯采样侧, 不影响训练)
+# ============================================================
+class EMA:
+    def __init__(self, model, decay=0.9999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        self.shadow.eval()
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model):
+        for s_param, m_param in zip(self.shadow.parameters(), model.parameters()):
+            s_param.data.mul_(self.decay).add_(m_param.data, alpha=1 - self.decay)
+
+    def get_model(self):
+        return self.shadow
+
+
+# ============================================================
+# 1. Seed
 # ============================================================
 def set_seed(seed=2026):
     random.seed(seed)
@@ -43,7 +62,7 @@ def set_seed(seed=2026):
 
 
 # ============================================================
-# 1. Model (原始, 不改)
+# 2. Model (原始在线 EM, 不改)
 # ============================================================
 class mDPM(nn.Module):
     def __init__(self, cfg):
@@ -67,32 +86,27 @@ class mDPM(nn.Module):
         K = self.K
         M = getattr(cfg, 'posterior_sample_steps', 5)
         device = x_0.device
-
         accum_neg_mse = torch.zeros(B, K, device=device)
-
         with torch.no_grad():
             for _ in range(M):
                 t = torch.randint(100, 900, (B,), device=device).long()
                 noise = torch.randn_like(x_0)
                 x_t = self.dpm_process.q_sample(x_0, t, noise)
-
                 for k in range(K):
                     y_oh = F.one_hot(torch.full((B,), k, device=device,
                                                  dtype=torch.long), K).float()
                     pred = self.cond_denoiser(x_t, t, y_oh)
                     mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
                     accum_neg_mse[:, k] += -mse
-
             avg_neg_mse = accum_neg_mse / M
             log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
             logits = log_pi + avg_neg_mse * scale_factor
-
         return logits
 
-    def forward(self, x_0, cfg, scale_factor=1.0,
-                use_hard_label=False, threshold=0.0):
+    def forward_unlabeled(self, x_0, cfg, scale_factor=1.0,
+                          use_hard_label=False, threshold=0.0):
+        """无监督 forward: E-step + M-step (原始逻辑)"""
         B = x_0.size(0)
-
         logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
         resp = F.softmax(logits, dim=1)
 
@@ -112,17 +126,32 @@ class mDPM(nn.Module):
         loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
         dpm_loss = (loss_per * mask).sum() / (mask.sum() + 1e-8)
 
-        mask_rate = mask.mean().item()
+        return dpm_loss, {
+            'dpm_loss': dpm_loss.item(),
+            'mask_rate': mask.mean().item(),
+            'pseudo_labels': pseudo_labels.detach(),
+        }
+
+    def forward_labeled(self, x_0, y_true, cfg):
+        """有监督 forward: 用真实标签训练 denoiser"""
+        B = x_0.size(0)
+        y_target = F.one_hot(y_true, num_classes=self.K).float()
+
+        t_train = torch.randint(0, cfg.timesteps, (B,), device=x_0.device).long()
+        noise = torch.randn_like(x_0)
+        x_t = self.dpm_process.q_sample(x_0, t_train, noise)
+        pred_noise = self.cond_denoiser(x_t, t_train, y_target)
+        dpm_loss = F.mse_loss(pred_noise, noise)
 
         return dpm_loss, {
             'dpm_loss': dpm_loss.item(),
-            'mask_rate': mask_rate,
-            'pseudo_labels': pseudo_labels.detach(),
+            'mask_rate': 1.0,
+            'pseudo_labels': y_true.detach(),
         }
 
 
 # ============================================================
-# 2. Evaluation (原始, 不改)
+# 3. Evaluation (原始, 不改)
 # ============================================================
 @torch.no_grad()
 def evaluate_model(model, loader, cfg):
@@ -130,12 +159,10 @@ def evaluate_model(model, loader, cfg):
     preds, ys_true = [], []
     eval_t = cfg.timesteps // 2
     n_repeats = 3
-
     for x_0, y_true in loader:
         x_0 = x_0.to(cfg.device)
         B = x_0.size(0)
         cumulative_mse = torch.zeros(B, cfg.num_classes, device=cfg.device)
-
         for _ in range(n_repeats):
             noise = torch.randn_like(x_0)
             t = torch.full((B,), eval_t, device=cfg.device, dtype=torch.long)
@@ -146,34 +173,29 @@ def evaluate_model(model, loader, cfg):
                 pred = model.cond_denoiser(x_t, t, y_oh)
                 mse = F.mse_loss(pred, noise, reduction='none').view(B, -1).mean(dim=1)
                 cumulative_mse[:, k] += mse
-
         pred_cluster = torch.argmin(cumulative_mse, dim=1).cpu().numpy()
         preds.append(pred_cluster)
         ys_true.append(y_true.numpy())
 
     preds = np.concatenate(preds)
     ys_true = np.concatenate(ys_true)
-
     K = cfg.num_classes
     cost_matrix = np.zeros((K, K))
     for i in range(K):
         for j in range(K):
             cost_matrix[i, j] = -np.sum((ys_true == i) & (preds == j))
     row_ind, col_ind = linear_sum_assignment(cost_matrix)
-
     cluster2label = {int(c): int(l) for c, l in zip(col_ind, row_ind)}
     aligned_preds = np.array([cluster2label.get(p, 0) for p in preds])
     acc = np.mean(aligned_preds == ys_true)
     nmi_score = NMI(ys_true, preds)
-
     freq = np.bincount(preds, minlength=K).astype(float)
     freq = freq / freq.sum()
-
     return acc, cluster2label, nmi_score, freq
 
 
 # ============================================================
-# 3. Conditioning Diagnostic (原始, 不改)
+# 4. Conditioning Diagnostic (原始, 不改)
 # ============================================================
 @torch.no_grad()
 def conditioning_diagnostic(model, loader, cfg, n_batches=3):
@@ -181,21 +203,17 @@ def conditioning_diagnostic(model, loader, cfg, n_batches=3):
     T = cfg.timesteps
     test_timesteps = [T // 10, T * 3 // 10, T * 6 // 10, T * 8 // 10]
     K = cfg.num_classes
-
     results = {}
     batches_seen = 0
-
     for x_0, _ in loader:
         if batches_seen >= n_batches:
             break
         x_0 = x_0.to(cfg.device)
         B = x_0.size(0)
-
         for t_val in test_timesteps:
             t = torch.full((B,), t_val, device=cfg.device, dtype=torch.long)
             noise = torch.randn_like(x_0)
             x_t = model.dpm_process.q_sample(x_0, t, noise)
-
             mse_per_k = []
             for k in range(K):
                 y_oh = F.one_hot(torch.full((B,), k, device=cfg.device,
@@ -203,35 +221,67 @@ def conditioning_diagnostic(model, loader, cfg, n_batches=3):
                 pred = model.cond_denoiser(x_t, t, y_oh)
                 mse = (pred - noise).pow(2).view(B, -1).mean(1).mean().item()
                 mse_per_k.append(mse)
-
             mse_arr = np.array(mse_per_k)
             diff = mse_arr.max() - mse_arr.min()
             avg = mse_arr.mean()
             ratio = diff / (avg + 1e-9)
-
             if t_val not in results:
                 results[t_val] = []
             results[t_val].append(ratio)
-
         batches_seen += 1
-
     avg_ratios = {}
     for t_val, ratios in results.items():
         avg_ratios[t_val] = np.mean(ratios)
-
     return avg_ratios
 
 
 # ============================================================
-# 4. Dashboard (原始, 不改)
+# 5. Sampling
 # ============================================================
-def plot_dashboard(history, outpath):
+@torch.no_grad()
+def sample_and_save(model, cfg, out_path, n_per_class=10,
+                    cluster_mapping=None, use_denoiser=None):
+    """用指定的 denoiser (原始或 EMA) 采样"""
+    denoiser = use_denoiser if use_denoiser is not None else model.cond_denoiser
+    T = model.dpm_process.timesteps
+    denoiser.eval()
+    K = cfg.num_classes
+    imgs = []
+    for k in range(K):
+        gen_k = k
+        if cluster_mapping:
+            for ck, tk in cluster_mapping.items():
+                if tk == k:
+                    gen_k = ck
+                    break
+        y_oh = F.one_hot(torch.full((n_per_class,), gen_k,
+                                     dtype=torch.long), K).float().to(cfg.device)
+        x = torch.randn(n_per_class, cfg.image_channels, 28, 28, device=cfg.device)
+        for t_idx in reversed(range(T)):
+            t_ = torch.full((n_per_class,), t_idx, device=cfg.device, dtype=torch.long)
+            pred = denoiser(x, t_, y_oh)
+            beta = model.dpm_process.betas[t_idx]
+            alpha = model.dpm_process.alphas[t_idx]
+            alpha_bar = model.dpm_process.alphas_cumprod[t_idx]
+            x = (1.0 / alpha.sqrt()) * (x - beta / (1 - alpha_bar).sqrt() * pred)
+            if t_idx > 0:
+                x = x + beta.sqrt() * torch.randn_like(x)
+        imgs.append(x.cpu())
+    imgs = torch.cat(imgs, dim=0)
+    save_image(imgs, out_path, nrow=n_per_class, normalize=True, value_range=(-1, 1))
+    print(f"  ✓ samples → {out_path}")
+
+
+# ============================================================
+# 6. Dashboard
+# ============================================================
+def plot_dashboard(history, outpath, mode="unsup"):
     n = len(history.get("loss", []))
     if n == 0:
         return
     epochs = range(1, n + 1)
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle(f'Online EM + Fixed π + EMA (Ep {n})', fontsize=18)
+    fig.suptitle(f'mDPM [{mode}] (Ep {n})', fontsize=18)
 
     ax = axes[0, 0]
     ax.plot(epochs, history["loss"], 'b-')
@@ -268,8 +318,8 @@ def plot_dashboard(history, outpath):
     ax = axes[1, 2]
     if "freq" in history and len(history["freq"]) > 0:
         freq_arr = np.array(history["freq"])
-        for k in range(freq_arr.shape[1]):
-            ax.plot(range(1, len(history["freq"])+1), freq_arr[:, k], alpha=0.6)
+        for kk in range(freq_arr.shape[1]):
+            ax.plot(range(1, len(history["freq"])+1), freq_arr[:, kk], alpha=0.6)
         ax.axhline(y=0.1, color='gray', linestyle='--', alpha=0.5)
         ax.set_title('Class Frequencies'); ax.set_ylim(0, 0.5)
     else:
@@ -281,43 +331,11 @@ def plot_dashboard(history, outpath):
     plt.close()
 
 
-# 原始的 sample_and_save (保留, 用于对比)
-@torch.no_grad()
-def sample_and_save_original(model, cfg, out_path, n_per_class=10, cluster_mapping=None):
-    T = model.dpm_process.timesteps
-    model.cond_denoiser.eval()
-    K = cfg.num_classes
-    imgs = []
-    for k in range(K):
-        gen_k = k
-        if cluster_mapping:
-            for ck, tk in cluster_mapping.items():
-                if tk == k:
-                    gen_k = ck
-                    break
-        y_oh = F.one_hot(torch.full((n_per_class,), gen_k,
-                                     dtype=torch.long), K).float().to(cfg.device)
-        x = torch.randn(n_per_class, cfg.image_channels, 28, 28, device=cfg.device)
-        for t_idx in reversed(range(T)):
-            t_ = torch.full((n_per_class,), t_idx, device=cfg.device, dtype=torch.long)
-            pred = model.cond_denoiser(x, t_, y_oh)
-            beta = model.dpm_process.betas[t_idx]
-            alpha = model.dpm_process.alphas[t_idx]
-            alpha_bar = model.dpm_process.alphas_cumprod[t_idx]
-            x = (1.0 / alpha.sqrt()) * (x - beta / (1 - alpha_bar).sqrt() * pred)
-            if t_idx > 0:
-                x = x + beta.sqrt() * torch.randn_like(x)
-        imgs.append(x.cpu())
-    imgs = torch.cat(imgs, dim=0)
-    save_image(imgs, out_path, nrow=n_per_class, normalize=True, value_range=(-1, 1))
-    print(f"  ✓ [original] samples → {out_path}")
-
-
 # ============================================================
-# 5. Training — 原始逻辑 + [PATCH] EMA
+# 7. Training: Unsupervised (原始在线 EM, 不改)
 # ============================================================
-def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
-                 hyperparams=None, is_final=True):
+def train_unsupervised(model, optimizer, unlabeled_loader, val_loader, cfg,
+                       ema=None, hyperparams=None):
     if hyperparams is None:
         hyperparams = {}
 
@@ -329,20 +347,13 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
     sample_dir = os.path.join(cfg.output_dir, "sample_progress")
     os.makedirs(sample_dir, exist_ok=True)
 
-    # [PATCH 2] 初始化 EMA
-    ema = EMA(model, decay=0.9999)
-    ema_start = 5  # 前 5 个 epoch 不更新 EMA
-
     best_val_acc = 0.0
     best_cluster_mapping = None
-
     history = {"loss": [], "acc": [], "nmi": [],
                "pass_rate": [], "scale": [],
                "cond_ratio": [], "freq": [], "pi_entropy": []}
 
     for epoch in range(1, total_epochs + 1):
-
-        # ── Scale 调度 (原始, 不改) ──
         if epoch <= warmup_epochs:
             use_hard = False
             p1 = epoch / warmup_epochs
@@ -356,32 +367,24 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
             dynamic_threshold = threshold_final * p2
             status = "REFINE"
 
-        if is_final:
-            print(f"🔥 [Ep {epoch}/{total_epochs}] [{status}] "
-                  f"Scale={dynamic_scale:.1f} Thres={dynamic_threshold:.3f}")
+        print(f"🔥 [Ep {epoch}/{total_epochs}] [{status}] "
+              f"Scale={dynamic_scale:.1f} Thres={dynamic_threshold:.3f}")
 
-        # ── Training (原始在线 EM, 不改) ──
         model.train()
-        ep_loss = 0.0
-        ep_mask = 0.0
-        n_batches = 0
+        ep_loss, ep_mask, n_batches = 0.0, 0.0, 0
         epoch_labels = []
 
         for x_batch, _ in unlabeled_loader:
             x_batch = x_batch.to(cfg.device)
             optimizer.zero_grad()
-
-            loss, info = model(x_batch, cfg,
-                               scale_factor=dynamic_scale,
-                               use_hard_label=use_hard,
-                               threshold=dynamic_threshold)
-
+            loss, info = model.forward_unlabeled(
+                x_batch, cfg, scale_factor=dynamic_scale,
+                use_hard_label=use_hard, threshold=dynamic_threshold)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
-            # [PATCH 2] 更新 EMA — 就这一行, 不影响任何训练逻辑
-            if epoch >= ema_start:
+            if ema and epoch >= 5:
                 ema.update(model)
 
             ep_loss += loss.item()
@@ -389,54 +392,37 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
             epoch_labels.append(info['pseudo_labels'].cpu())
             n_batches += 1
 
-        # ── Epoch 统计 (原始, 不改) ──
         avg_loss = ep_loss / max(n_batches, 1)
         pass_pct = (ep_mask / max(n_batches, 1)) * 100
-
         all_labels = torch.cat(epoch_labels)
         label_freq = np.bincount(all_labels.numpy(), minlength=cfg.num_classes).astype(float)
         label_freq = label_freq / label_freq.sum()
         pi_entropy = -np.sum(label_freq * np.log(label_freq + 1e-9))
 
-        if is_final:
-            freq_str = ", ".join([f"{f:.3f}" for f in label_freq])
-            print(f"   freq=[{freq_str}] H={pi_entropy:.3f}")
+        freq_str = ", ".join([f"{f:.3f}" for f in label_freq])
+        print(f"   freq=[{freq_str}] H={pi_entropy:.3f}")
 
-        # ── Validation (原始, 不改) ──
-        val_acc, cluster_mapping, val_nmi, val_freq = evaluate_model(
-            model, val_loader, cfg)
-
+        val_acc, cluster_mapping, val_nmi, val_freq = evaluate_model(model, val_loader, cfg)
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_cluster_mapping = cluster_mapping
-            save_dict = {
-                'epoch': epoch, 'model_state_dict': model.state_dict(),
-                'acc': val_acc, 'nmi': val_nmi,
-                'cluster_mapping': cluster_mapping,
-            }
-            # [PATCH] 也保存 EMA 权重
-            if epoch >= ema_start:
+            save_dict = {'epoch': epoch, 'model_state_dict': model.state_dict(),
+                         'acc': val_acc, 'nmi': val_nmi, 'cluster_mapping': cluster_mapping}
+            if ema:
                 save_dict['ema_state_dict'] = ema.get_model().state_dict()
             torch.save(save_dict, os.path.join(cfg.output_dir, "best_model.pt"))
-            if is_final:
-                print(f"   ★ New Best! Acc={best_val_acc:.4f}")
+            print(f"   ★ New Best! Acc={best_val_acc:.4f}")
 
-        # ── Conditioning Diagnostic (原始, 不改) ──
         if epoch % 5 == 0 or epoch == 1:
             cond_ratios = conditioning_diagnostic(model, val_loader, cfg)
             avg_ratio = np.mean(list(cond_ratios.values()))
             history["cond_ratio"].append(avg_ratio)
-
-            if is_final:
-                ratio_str = " | ".join([f"t={t}: {r:.4f}" for t, r in sorted(cond_ratios.items())])
-                print(f"   [Cond] {ratio_str} | avg={avg_ratio:.4f}")
+            ratio_str = " | ".join([f"t={t}: {r:.4f}" for t, r in sorted(cond_ratios.items())])
+            print(f"   [Cond] {ratio_str} | avg={avg_ratio:.4f}")
         else:
-            if len(history["cond_ratio"]) > 0:
-                history["cond_ratio"].append(history["cond_ratio"][-1])
-            else:
-                history["cond_ratio"].append(0.0)
+            history["cond_ratio"].append(
+                history["cond_ratio"][-1] if history["cond_ratio"] else 0.0)
 
-        # ── History (原始, 不改) ──
         history["loss"].append(avg_loss)
         history["acc"].append(val_acc)
         history["nmi"].append(val_nmi)
@@ -445,80 +431,317 @@ def run_training(model, optimizer, unlabeled_loader, val_loader, cfg,
         history["freq"].append(label_freq.tolist())
         history["pi_entropy"].append(pi_entropy)
 
-        if is_final:
-            freq_str = ", ".join([f"{f:.3f}" for f in label_freq])
-            print(f"  → Loss={avg_loss:.4f} | Acc={val_acc:.4f} NMI={val_nmi:.4f} "
-                  f"| Pass={pass_pct:.1f}% | freq=[{freq_str}]")
+        print(f"  → Loss={avg_loss:.4f} | Acc={val_acc:.4f} NMI={val_nmi:.4f} "
+              f"| Pass={pass_pct:.1f}%")
 
-            plot_dashboard(history, os.path.join(cfg.output_dir, "dashboard.png"))
+        plot_dashboard(history, os.path.join(cfg.output_dir, "dashboard.png"), "unsup")
+        if epoch % 5 == 0:
+            ema_den = ema.get_model().cond_denoiser if ema else None
+            sample_and_save(model, cfg,
+                            os.path.join(sample_dir, f"epoch_{epoch:03d}.png"),
+                            cluster_mapping=cluster_mapping,
+                            use_denoiser=ema_den)
 
-            # [PATCH 3] 采样用 EMA + DDIM
-            if epoch % 5 == 0:
-                ema_den = ema.get_model().cond_denoiser if epoch >= ema_start else None
-                sample_and_save_improved(
-                    model, cfg,
-                    os.path.join(sample_dir, f"epoch_{epoch:03d}_ema_ddim.png"),
-                    cluster_mapping=cluster_mapping,
-                    use_ema_denoiser=ema_den,
-                    method='ddim', ddim_steps=100
-                )
-                # 也保存原始采样做对比
-                sample_and_save_original(
-                    model, cfg,
-                    os.path.join(sample_dir, f"epoch_{epoch:03d}_original.png"),
-                    cluster_mapping=cluster_mapping
-                )
-
-    return best_val_acc, best_cluster_mapping, ema
+    return best_val_acc, best_cluster_mapping
 
 
 # ============================================================
-# 6. Main
+# 8. Training: Fully Supervised
+# ============================================================
+def train_fullsup(model, optimizer, labeled_loader, val_loader, cfg,
+                  ema=None, total_epochs=60):
+    sample_dir = os.path.join(cfg.output_dir, "sample_progress")
+    os.makedirs(sample_dir, exist_ok=True)
+
+    best_val_acc = 0.0
+    best_cluster_mapping = None
+    history = {"loss": [], "acc": [], "nmi": [],
+               "pass_rate": [], "scale": [],
+               "cond_ratio": [], "freq": [], "pi_entropy": []}
+
+    for epoch in range(1, total_epochs + 1):
+        print(f"🔥 [Ep {epoch}/{total_epochs}] [FULLSUP]")
+
+        model.train()
+        ep_loss, n_batches = 0.0, 0
+        epoch_labels = []
+
+        for x_batch, y_batch in labeled_loader:
+            x_batch = x_batch.to(cfg.device)
+            y_batch = y_batch.to(cfg.device)
+            optimizer.zero_grad()
+            loss, info = model.forward_labeled(x_batch, y_batch, cfg)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            if ema and epoch >= 5:
+                ema.update(model)
+
+            ep_loss += loss.item()
+            epoch_labels.append(info['pseudo_labels'].cpu())
+            n_batches += 1
+
+        avg_loss = ep_loss / max(n_batches, 1)
+        all_labels = torch.cat(epoch_labels)
+        label_freq = np.bincount(all_labels.numpy(), minlength=cfg.num_classes).astype(float)
+        label_freq = label_freq / label_freq.sum()
+        pi_entropy = -np.sum(label_freq * np.log(label_freq + 1e-9))
+
+        val_acc, cluster_mapping, val_nmi, val_freq = evaluate_model(model, val_loader, cfg)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_cluster_mapping = cluster_mapping
+            save_dict = {'epoch': epoch, 'model_state_dict': model.state_dict(),
+                         'acc': val_acc, 'nmi': val_nmi, 'cluster_mapping': cluster_mapping}
+            if ema:
+                save_dict['ema_state_dict'] = ema.get_model().state_dict()
+            torch.save(save_dict, os.path.join(cfg.output_dir, "best_model.pt"))
+            print(f"   ★ New Best! Acc={best_val_acc:.4f}")
+
+        history["loss"].append(avg_loss)
+        history["acc"].append(val_acc)
+        history["nmi"].append(val_nmi)
+        history["pass_rate"].append(100.0)
+        history["scale"].append(0.0)
+        history["freq"].append(label_freq.tolist())
+        history["pi_entropy"].append(pi_entropy)
+        history["cond_ratio"].append(0.0)
+
+        print(f"  → Loss={avg_loss:.4f} | Acc={val_acc:.4f} NMI={val_nmi:.4f}")
+
+        plot_dashboard(history, os.path.join(cfg.output_dir, "dashboard.png"), "fullsup")
+        if epoch % 5 == 0:
+            ema_den = ema.get_model().cond_denoiser if ema else None
+            sample_and_save(model, cfg,
+                            os.path.join(sample_dir, f"epoch_{epoch:03d}.png"),
+                            cluster_mapping=cluster_mapping,
+                            use_denoiser=ema_den)
+
+    return best_val_acc, best_cluster_mapping
+
+
+# ============================================================
+# 9. Training: Semi-supervised
+#    labeled 循环复用 (和你 mVAE 一样的模式)
+# ============================================================
+def train_semisup(model, optimizer, labeled_loader, unlabeled_loader, val_loader,
+                  cfg, ema=None, hyperparams=None):
+    if hyperparams is None:
+        hyperparams = {}
+
+    total_epochs = hyperparams.get('total_epochs', 60)
+    target_scale = hyperparams.get('target_scale', 134.0)
+    warmup_epochs = hyperparams.get('warmup_epochs', 10)
+    threshold_final = hyperparams.get('threshold_final', 0.036)
+    alpha_labeled = hyperparams.get('alpha_labeled', 1.0)
+
+    sample_dir = os.path.join(cfg.output_dir, "sample_progress")
+    os.makedirs(sample_dir, exist_ok=True)
+
+    best_val_acc = 0.0
+    best_cluster_mapping = None
+    history = {"loss": [], "acc": [], "nmi": [],
+               "pass_rate": [], "scale": [],
+               "cond_ratio": [], "freq": [], "pi_entropy": []}
+
+    for epoch in range(1, total_epochs + 1):
+        if epoch <= warmup_epochs:
+            use_hard = False
+            p1 = epoch / warmup_epochs
+            dynamic_scale = 5.0 + (20.0 - 5.0) * p1
+            dynamic_threshold = 0.0
+            status = "EXPLORE"
+        else:
+            use_hard = True
+            p2 = (epoch - warmup_epochs) / (total_epochs - warmup_epochs + 1e-8)
+            dynamic_scale = 20.0 + (target_scale - 20.0) * p2
+            dynamic_threshold = threshold_final * p2
+            status = "REFINE"
+
+        print(f"🔥 [Ep {epoch}/{total_epochs}] [{status}] "
+              f"Scale={dynamic_scale:.1f} α_lab={alpha_labeled}")
+
+        model.train()
+        ep_loss, ep_mask, n_batches = 0.0, 0.0, 0
+        epoch_labels = []
+
+        # ★ labeled 循环复用 (和 mVAE 一样)
+        labeled_iter = iter(labeled_loader)
+
+        for x_un, _ in unlabeled_loader:
+            # labeled 用完就重新开始
+            try:
+                x_lab, y_lab = next(labeled_iter)
+            except StopIteration:
+                labeled_iter = iter(labeled_loader)
+                x_lab, y_lab = next(labeled_iter)
+
+            x_un = x_un.to(cfg.device)
+            x_lab = x_lab.to(cfg.device)
+            y_lab = y_lab.to(cfg.device)
+
+            optimizer.zero_grad()
+
+            # 无监督部分 (在线 EM)
+            loss_un, info_un = model.forward_unlabeled(
+                x_un, cfg, scale_factor=dynamic_scale,
+                use_hard_label=use_hard, threshold=dynamic_threshold)
+
+            # 有监督部分 (真实标签)
+            loss_lab, info_lab = model.forward_labeled(x_lab, y_lab, cfg)
+
+            # 总损失
+            loss = loss_un + alpha_labeled * loss_lab
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            if ema and epoch >= 5:
+                ema.update(model)
+
+            ep_loss += loss.item()
+            ep_mask += info_un['mask_rate']
+            epoch_labels.append(info_un['pseudo_labels'].cpu())
+            n_batches += 1
+
+        avg_loss = ep_loss / max(n_batches, 1)
+        pass_pct = (ep_mask / max(n_batches, 1)) * 100
+        all_labels = torch.cat(epoch_labels)
+        label_freq = np.bincount(all_labels.numpy(), minlength=cfg.num_classes).astype(float)
+        label_freq = label_freq / label_freq.sum()
+        pi_entropy = -np.sum(label_freq * np.log(label_freq + 1e-9))
+
+        freq_str = ", ".join([f"{f:.3f}" for f in label_freq])
+        print(f"   freq=[{freq_str}] H={pi_entropy:.3f}")
+
+        val_acc, cluster_mapping, val_nmi, val_freq = evaluate_model(model, val_loader, cfg)
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_cluster_mapping = cluster_mapping
+            save_dict = {'epoch': epoch, 'model_state_dict': model.state_dict(),
+                         'acc': val_acc, 'nmi': val_nmi, 'cluster_mapping': cluster_mapping}
+            if ema:
+                save_dict['ema_state_dict'] = ema.get_model().state_dict()
+            torch.save(save_dict, os.path.join(cfg.output_dir, "best_model.pt"))
+            print(f"   ★ New Best! Acc={best_val_acc:.4f}")
+
+        if epoch % 5 == 0 or epoch == 1:
+            cond_ratios = conditioning_diagnostic(model, val_loader, cfg)
+            avg_ratio = np.mean(list(cond_ratios.values()))
+            history["cond_ratio"].append(avg_ratio)
+            ratio_str = " | ".join([f"t={t}: {r:.4f}" for t, r in sorted(cond_ratios.items())])
+            print(f"   [Cond] {ratio_str} | avg={avg_ratio:.4f}")
+        else:
+            history["cond_ratio"].append(
+                history["cond_ratio"][-1] if history["cond_ratio"] else 0.0)
+
+        history["loss"].append(avg_loss)
+        history["acc"].append(val_acc)
+        history["nmi"].append(val_nmi)
+        history["pass_rate"].append(pass_pct)
+        history["scale"].append(dynamic_scale)
+        history["freq"].append(label_freq.tolist())
+        history["pi_entropy"].append(pi_entropy)
+
+        print(f"  → Loss={avg_loss:.4f} | Acc={val_acc:.4f} NMI={val_nmi:.4f} "
+              f"| Pass={pass_pct:.1f}%")
+
+        plot_dashboard(history, os.path.join(cfg.output_dir, "dashboard.png"), "semisup")
+        if epoch % 5 == 0:
+            ema_den = ema.get_model().cond_denoiser if ema else None
+            sample_and_save(model, cfg,
+                            os.path.join(sample_dir, f"epoch_{epoch:03d}.png"),
+                            cluster_mapping=cluster_mapping,
+                            use_denoiser=ema_den)
+
+    return best_val_acc, best_cluster_mapping
+
+
+# ============================================================
+# 10. Main
 # ============================================================
 def main():
-    set_seed(2026)
+    parser = argparse.ArgumentParser(description="mDPM — Unified Entry")
+    parser.add_argument("--mode", default="unsup",
+                        choices=["unsup", "semisup", "fullsup"],
+                        help="unsup: 无监督聚类 | semisup: 半监督 | fullsup: 全监督")
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--lr", type=float, default=4.01e-05)
+    parser.add_argument("--labeled", type=int, default=100,
+                        help="semisup 模式下每类的标签数")
+    parser.add_argument("--alpha_labeled", type=float, default=1.0,
+                        help="semisup 模式下有监督损失的权重")
+    parser.add_argument("--target_scale", type=float, default=134.37)
+    parser.add_argument("--warmup_epochs", type=int, default=10)
+    parser.add_argument("--threshold", type=float, default=0.036)
+    parser.add_argument("--seed", type=int, default=2026)
+    args = parser.parse_args()
+
+    set_seed(args.seed)
 
     cfg = Config()
-    cfg.labeled_per_class = 0
     cfg.posterior_sample_steps = 5
-    cfg.output_dir = "./mDPM_results_patched"
-    cfg.final_epochs = 60
-
-    print("=" * 60)
-    print("🔓 Original Training + EMA/DDIM Sampling Patch")
-    print(f"   T={cfg.timesteps}, M={cfg.posterior_sample_steps}")
-    print(f"   Architecture: 原始 common_dpm.py (零改动)")
-    print(f"   Training: 原始在线 EM (零改动)")
-    print(f"   NEW: EMA (decay=0.9999) + DDIM (100步) 采样")
-    print("=" * 60)
-
+    cfg.output_dir = f"./mDPM_{args.mode}"
     os.makedirs(cfg.output_dir, exist_ok=True)
-    _, unlabeled_loader, val_loader = get_semi_loaders(cfg)
 
+    # 根据 mode 设置 labeled_per_class
+    if args.mode == "unsup":
+        cfg.labeled_per_class = 0
+    elif args.mode == "semisup":
+        cfg.labeled_per_class = args.labeled
+    elif args.mode == "fullsup":
+        cfg.labeled_per_class = -1
+
+    print("=" * 60)
+    print(f"mDPM — Mode: {args.mode}")
+    print(f"  T={cfg.timesteps}, M={cfg.posterior_sample_steps}")
+    print(f"  LR={args.lr}, Epochs={args.epochs}")
+    if args.mode == "semisup":
+        print(f"  Labeled/class: {args.labeled}, α_labeled: {args.alpha_labeled}")
+    elif args.mode == "fullsup":
+        print(f"  全监督: 所有数据使用真实标签")
+    else:
+        print(f"  无监督: Scale 5→20→{args.target_scale}, π=uniform")
+    print(f"  EMA: decay=0.9999 (纯采样侧)")
+    print("=" * 60)
+
+    # 数据
+    labeled_loader, unlabeled_loader, val_loader = get_semi_loaders(cfg)
+
+    # 模型
     model = mDPM(cfg).to(cfg.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=4.01e-05)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    ema = EMA(model, decay=0.9999)
 
     hyperparams = {
-        'total_epochs': 60,
-        'target_scale': 134.37,
-        'warmup_epochs': 10,
-        'threshold_final': 0.036,
+        'total_epochs': args.epochs,
+        'target_scale': args.target_scale,
+        'warmup_epochs': args.warmup_epochs,
+        'threshold_final': args.threshold,
+        'alpha_labeled': args.alpha_labeled,
     }
 
-    print(f"\n🚀 Training (和原始完全一样的训练):")
-    print(f"   LR=4.01e-05")
-    print(f"   Scale: 5→20 (warmup 10ep) → 20→134 (refine)")
-    print(f"   π = uniform 1/K (FIXED)")
-    print(f"   Epochs: {hyperparams['total_epochs']}")
-    print(f"   [PATCH] EMA updates after epoch 5")
+    # 训练
+    if args.mode == "unsup":
+        best_acc, best_mapping = train_unsupervised(
+            model, optimizer, unlabeled_loader, val_loader, cfg,
+            ema=ema, hyperparams=hyperparams)
 
-    best_acc, best_mapping, ema = run_training(
-        model, optimizer, unlabeled_loader, val_loader, cfg,
-        hyperparams=hyperparams, is_final=True)
+    elif args.mode == "fullsup":
+        best_acc, best_mapping = train_fullsup(
+            model, optimizer, labeled_loader, val_loader, cfg,
+            ema=ema, total_epochs=args.epochs)
+
+    elif args.mode == "semisup":
+        best_acc, best_mapping = train_semisup(
+            model, optimizer, labeled_loader, unlabeled_loader, val_loader,
+            cfg, ema=ema, hyperparams=hyperparams)
 
     print(f"\n✅ Done. Best Acc: {best_acc:.4f}")
 
-    # 加载 best model
+    # 加载 best model 生成最终 samples
     best_ckpt = os.path.join(cfg.output_dir, "best_model.pt")
     if os.path.exists(best_ckpt):
         ckpt = torch.load(best_ckpt, map_location=cfg.device, weights_only=False)
@@ -530,49 +753,24 @@ def main():
             ema.get_model().load_state_dict(ckpt['ema_state_dict'])
             print("   Loaded EMA weights")
 
+    # 最终采样: 原始 + EMA
     ema_den = ema.get_model().cond_denoiser
 
-    print("\n📸 Generating comparison samples...")
-
-    # 1. 原始采样 (和你之前完全一样)
-    sample_and_save_original(
-        model, cfg,
-        os.path.join(cfg.output_dir, "final_1_original.png"),
-        cluster_mapping=best_mapping)
-
-    # 2. EMA + 原始 DDPM 1000步
-    sample_and_save_improved(
-        model, cfg,
-        os.path.join(cfg.output_dir, "final_2_ema_ddpm.png"),
-        cluster_mapping=best_mapping,
-        use_ema_denoiser=ema_den,
-        method='ddpm')
-
-    # 3. EMA + DDIM 100步 (推荐)
-    sample_and_save_improved(
-        model, cfg,
-        os.path.join(cfg.output_dir, "final_3_ema_ddim.png"),
-        cluster_mapping=best_mapping,
-        use_ema_denoiser=ema_den,
-        method='ddim', ddim_steps=100)
-
-    # 4. EMA + DDIM + 伪 CFG (不同强度)
-    for gs in [1.5, 2.0, 3.0]:
-        sample_and_save_improved(
-            model, cfg,
-            os.path.join(cfg.output_dir, f"final_4_ema_ddim_cfg{gs:.1f}.png"),
-            cluster_mapping=best_mapping,
-            use_ema_denoiser=ema_den,
-            method='ddim_cfg', guidance_scale=gs, ddim_steps=100)
+    sample_and_save(model, cfg,
+                    os.path.join(cfg.output_dir, "final_samples.png"),
+                    cluster_mapping=best_mapping)
+    sample_and_save(model, cfg,
+                    os.path.join(cfg.output_dir, "final_samples_ema.png"),
+                    cluster_mapping=best_mapping,
+                    use_denoiser=ema_den)
 
     # Save config
     cfg_dict = {k: v for k, v in vars(cfg).items()
                 if not k.startswith('_') and isinstance(v, (int, float, str, bool))}
+    cfg_dict['mode'] = args.mode
     cfg_dict['hyperparams'] = hyperparams
     cfg_dict['best_acc'] = best_acc
     json.dump(cfg_dict, open(os.path.join(cfg.output_dir, "config.json"), "w"), indent=2)
-
-    print("\n🎉 Done! 对比 final_1 vs final_2 vs final_3 vs final_4 看效果")
 
 
 if __name__ == "__main__":
