@@ -155,29 +155,37 @@ class mDPM(nn.Module):
 
             avg_neg_mse = accum_neg_mse / max(total_steps, 1)
 
-            # ★ Z-Score Normalization (你原始代码的核心!)
-            # 没有这个, 类间 MSE 差异极小 (~0.001), softmax 接近 uniform
-            # Z-score 把差异拉到 [-2, +2], 再乘 scale → 尖锐的 posterior
-            mean_lik = avg_neg_mse.mean(dim=1, keepdim=True)
-            std_lik = avg_neg_mse.std(dim=1, keepdim=True)
-            normalized_lik = (avg_neg_mse - mean_lik) / (std_lik + 1e-8)
+            # Z-Score Normalization (可选)
+            # 原始 0.69 版本: 无 Z-score, 直接 raw MSE * scale
+            # 半监督版本: 有 Z-score, 拉开类间差异
+            use_zscore = getattr(cfg, 'use_zscore', True)
 
-            log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
-            logits = log_pi + normalized_lik * scale_factor
+            if use_zscore:
+                mean_lik = avg_neg_mse.mean(dim=1, keepdim=True)
+                std_lik = avg_neg_mse.std(dim=1, keepdim=True)
+                normalized_lik = (avg_neg_mse - mean_lik) / (std_lik + 1e-8)
+                log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
+                logits = log_pi + normalized_lik * scale_factor
+            else:
+                log_pi = torch.log(self.pi.clamp(min=1e-6)).unsqueeze(0)
+                logits = log_pi + avg_neg_mse * scale_factor
         return logits
 
     def forward_unlabeled(self, x_0, cfg, scale_factor=1.0, **kwargs):
         """
         无监督 forward: E-step + M-step
         
-        M-step 使用加权 soft-EM (和原始 mDPM.py 一致):
-          对所有 K 个 class 做 forward, 用 posterior 加权求和
-          每个 batch = K 次 denoiser forward → 训练效率高
+        M-step 两种模式 (通过 cfg.mstep_mode 控制):
+          'single'  = 原始 0.69 版本: EXPLORE multinomial 软采样 / REFINE argmax 硬采样
+          'weighted' = 加权 soft-EM: 10 次 forward, resp 加权求和
         
-        kwargs: 兼容旧接口 (use_hard_label, threshold 等已不使用)
+        kwargs 接收 use_hard_label, threshold (仅 single 模式使用)
         """
         B = x_0.size(0)
         K = self.K
+        mstep_mode = getattr(cfg, 'mstep_mode', 'single')
+        use_hard_label = kwargs.get('use_hard_label', False)
+        threshold = kwargs.get('threshold', 0.0)
 
         # E-step
         logits = self.estimate_posterior_logits(x_0, cfg, scale_factor=scale_factor)
@@ -187,28 +195,49 @@ class mDPM(nn.Module):
         if x_0.is_cuda:
             torch.cuda.empty_cache()
 
-        # M-step: 加权 soft-EM (原始方式)
+        # M-step
         t_train = torch.randint(0, cfg.timesteps, (B,), device=x_0.device).long()
         noise = torch.randn_like(x_0)
         x_t = self.dpm_process.q_sample(x_0, t_train, noise)
 
-        weighted_dpm_loss = 0.0
-        for k in range(K):
-            y_onehot_k = F.one_hot(
-                torch.full((B,), k, device=x_0.device, dtype=torch.long), K
-            ).float()
-            pred_noise_k = self.cond_denoiser(x_t, t_train, y_onehot_k)
-            dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(B, -1).mean(dim=1)
-            weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
+        if mstep_mode == 'single':
+            # ── 原始 0.69 版本: 单次采样 ──
+            if use_hard_label:
+                max_probs, pseudo_labels = resp.max(dim=1)
+                mask = (max_probs >= threshold).float()
+                y_target = F.one_hot(pseudo_labels, num_classes=K).float()
+            else:
+                pseudo_labels = torch.multinomial(resp, 1).squeeze(1)
+                y_target = F.one_hot(pseudo_labels, num_classes=K).float()
+                mask = torch.ones(B, device=x_0.device)
 
-        # pseudo_labels 用于统计 (argmax)
-        pseudo_labels = resp.argmax(dim=1)
+            pred_noise = self.cond_denoiser(x_t, t_train, y_target)
+            loss_per = F.mse_loss(pred_noise, noise, reduction='none').view(B, -1).mean(dim=1)
+            dpm_loss = (loss_per * mask).sum() / (mask.sum() + 1e-8)
 
-        return weighted_dpm_loss, {
-            'dpm_loss': weighted_dpm_loss.item(),
-            'mask_rate': 1.0,
-            'pseudo_labels': pseudo_labels.detach(),
-        }
+            return dpm_loss, {
+                'dpm_loss': dpm_loss.item(),
+                'mask_rate': mask.mean().item(),
+                'pseudo_labels': pseudo_labels.detach(),
+            }
+
+        else:
+            # ── 加权 soft-EM: 10 次 forward ──
+            weighted_dpm_loss = 0.0
+            for k in range(K):
+                y_onehot_k = F.one_hot(
+                    torch.full((B,), k, device=x_0.device, dtype=torch.long), K
+                ).float()
+                pred_noise_k = self.cond_denoiser(x_t, t_train, y_onehot_k)
+                dpm_loss_k = F.mse_loss(pred_noise_k, noise, reduction='none').view(B, -1).mean(dim=1)
+                weighted_dpm_loss += (resp[:, k].detach() * dpm_loss_k).mean()
+
+            pseudo_labels = resp.argmax(dim=1)
+            return weighted_dpm_loss, {
+                'dpm_loss': weighted_dpm_loss.item(),
+                'mask_rate': 1.0,
+                'pseudo_labels': pseudo_labels.detach(),
+            }
 
     def forward_labeled(self, x_0, y_true, cfg):
         """有监督 forward: 用真实标签训练 denoiser"""
@@ -803,6 +832,12 @@ def main():
     parser.add_argument("--estep", default="fixed",
                         choices=["fixed", "multi", "random"],
                         help="E-step 模式: fixed=t=500×3(推荐) | multi=t=[300,500,700] | random=原始")
+    parser.add_argument("--mstep", default="single",
+                        choices=["single", "weighted"],
+                        help="M-step 模式: single=原始单次采样(0.69版) | weighted=加权soft-EM")
+    parser.add_argument("--zscore", default="auto",
+                        choices=["on", "off", "auto"],
+                        help="E-step Z-score: on=启用 | off=关闭 | auto=weighted时on,single时off")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -831,7 +866,8 @@ def main():
         print(f"  全监督: 所有数据使用真实标签")
     else:
         print(f"  无监督: Scale 5→20→{args.target_scale}, π=uniform")
-    print(f"  E-step: {args.estep} mode")
+    print(f"  E-step: {args.estep} mode, Z-score: {'on' if cfg.use_zscore else 'off'}")
+    print(f"  M-step: {args.mstep} mode")
     print(f"  EMA: decay=0.9999 (纯采样侧)")
     print("=" * 60)
 
@@ -846,7 +882,14 @@ def main():
     # 设置半监督参数
     cfg.alpha_unlabeled = args.alpha_unlabeled
     cfg.estep_mode = args.estep
+    cfg.mstep_mode = args.mstep
     cfg.batch_size = args.batch_size
+
+    # Z-score: auto 模式下, weighted 开, single 关
+    if args.zscore == "auto":
+        cfg.use_zscore = (args.mstep == "weighted")
+    else:
+        cfg.use_zscore = (args.zscore == "on")
 
     hyperparams = {
         'total_epochs': args.epochs,
