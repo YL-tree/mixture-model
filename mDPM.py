@@ -838,13 +838,15 @@ def main():
     parser.add_argument("--zscore", default="auto",
                         choices=["on", "off", "auto"],
                         help="E-step Z-score: on=启用 | off=关闭 | auto=weighted时on,single时off")
+    parser.add_argument("--output_dir", default=None,
+                        help="输出目录 (默认: ./mDPM_{mode})")
     args = parser.parse_args()
 
     set_seed(args.seed)
 
     cfg = Config()
     cfg.posterior_sample_steps = 5
-    cfg.output_dir = f"./mDPM_{args.mode}"
+    cfg.output_dir = args.output_dir or f"./mDPM_{args.mode}"
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     # 根据 mode 设置 labeled_per_class
